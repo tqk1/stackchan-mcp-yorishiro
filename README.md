@@ -127,7 +127,7 @@ PNG → RGB565 配列の変換スクリプトは LVGL 公式の [Online Image Co
 
 ### upstream
 
-`firmware/` は [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) (MIT) のフォーク ([shomochisaku/xiaozhi-esp32](https://github.com/shomochisaku/xiaozhi-esp32)) を git subtree で取り込んでいます。SCServo_lib は公式 [stack-chan](https://github.com/mongonta0716/stack-chan) (タカヲさん) から移植したファームウェアコンポーネントです。
+`firmware/` は [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) (MIT) のフォーク ([kisaragi-mochi/xiaozhi-esp32](https://github.com/kisaragi-mochi/xiaozhi-esp32)) を git subtree で取り込んでいます。SCServo_lib は公式 [stack-chan](https://github.com/mongonta0716/stack-chan) (タカヲさん) から移植したファームウェアコンポーネントです。
 
 ## 関連プロジェクト
 

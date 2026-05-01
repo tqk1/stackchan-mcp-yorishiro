@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "shomochisaku" },
+    { name = "kisaragi-mochi" },
 ]
 keywords = ["mcp", "stackchan", "esp32", "xiaozhi", "robotics", "llm"]
 classifiers = [
@@ -32,9 +32,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/shomochisaku/stackchan-mcp"
-Repository = "https://github.com/shomochisaku/stackchan-mcp"
-Issues = "https://github.com/shomochisaku/stackchan-mcp/issues"
+Homepage = "https://github.com/kisaragi-mochi/stackchan-mcp"
+Repository = "https://github.com/kisaragi-mochi/stackchan-mcp"
+Issues = "https://github.com/kisaragi-mochi/stackchan-mcp/issues"
 
 [dependency-groups]
 dev = [
