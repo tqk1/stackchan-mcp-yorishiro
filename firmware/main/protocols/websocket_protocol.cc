@@ -88,6 +88,22 @@ bool WebsocketProtocol::OpenAudioChannel() {
     // this firmware always speaks to a stackchan-mcp gateway directly.
     std::string url = settings.GetString("url");
 #ifdef CONFIG_DEFAULT_WEBSOCKET_URL
+#ifdef CONFIG_FORCE_DEFAULT_WEBSOCKET_URL
+    // Force mode: Kconfig URL always wins over NVS. Used when NVS contains
+    // a stale upstream URL (e.g. wss://api.tenclass.net/...) that no
+    // runtime tool can currently overwrite. Only forces when the Kconfig
+    // value is non-empty so an unset Kconfig still falls through to NVS.
+    if (CONFIG_DEFAULT_WEBSOCKET_URL[0] != '\0') {
+        if (!url.empty() && url != CONFIG_DEFAULT_WEBSOCKET_URL) {
+            ESP_LOGI(TAG,
+                     "FORCE: overriding NVS websocket.url with Kconfig: NVS=%s -> %s",
+                     url.c_str(), CONFIG_DEFAULT_WEBSOCKET_URL);
+        } else if (url.empty()) {
+            ESP_LOGI(TAG, "FORCE: using Kconfig websocket URL: %s", CONFIG_DEFAULT_WEBSOCKET_URL);
+        }
+        url = CONFIG_DEFAULT_WEBSOCKET_URL;
+    }
+#else
     if (url.empty()) {
         url = CONFIG_DEFAULT_WEBSOCKET_URL;
         if (!url.empty()) {
@@ -95,7 +111,29 @@ bool WebsocketProtocol::OpenAudioChannel() {
         }
     }
 #endif
+#endif
     std::string token = settings.GetString("token");
+#ifdef CONFIG_DEFAULT_WEBSOCKET_TOKEN
+#ifdef CONFIG_FORCE_DEFAULT_WEBSOCKET_URL
+    // Same force-mode treatment for the token (same Kconfig switch
+    // controls both, since URL and token are typically configured together).
+    if (CONFIG_DEFAULT_WEBSOCKET_TOKEN[0] != '\0') {
+        if (!token.empty() && token != CONFIG_DEFAULT_WEBSOCKET_TOKEN) {
+            ESP_LOGI(TAG, "FORCE: overriding NVS websocket.token with Kconfig value");
+        } else if (token.empty()) {
+            ESP_LOGI(TAG, "FORCE: using Kconfig websocket token");
+        }
+        token = CONFIG_DEFAULT_WEBSOCKET_TOKEN;
+    }
+#else
+    if (token.empty()) {
+        token = CONFIG_DEFAULT_WEBSOCKET_TOKEN;
+        if (!token.empty()) {
+            ESP_LOGI(TAG, "NVS websocket.token empty; using build-time default from Kconfig");
+        }
+    }
+#endif
+#endif
     int version = settings.GetInt("version");
     if (version != 0) {
         version_ = version;

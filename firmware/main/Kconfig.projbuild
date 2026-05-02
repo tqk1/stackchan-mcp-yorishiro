@@ -21,6 +21,37 @@ config DEFAULT_WEBSOCKET_URL
         Leave empty to require explicit NVS configuration (the original
         behavior).
 
+config DEFAULT_WEBSOCKET_TOKEN
+    string "Default WebSocket auth token (fallback when NVS is empty)"
+    default ""
+    help
+        Bearer token used when NVS websocket.token is empty. Set this if
+        your stackchan-mcp gateway requires authentication
+        (STACKCHAN_TOKEN / BEARER_TOKEN env var on the gateway side).
+        Leave empty if your gateway accepts unauthenticated connections.
+
+        The same precedence rules as CONFIG_DEFAULT_WEBSOCKET_URL apply:
+        NVS websocket.token wins by default, unless
+        CONFIG_FORCE_DEFAULT_WEBSOCKET_URL forces the Kconfig values.
+
+config FORCE_DEFAULT_WEBSOCKET_URL
+    bool "Force CONFIG_DEFAULT_WEBSOCKET_URL/TOKEN to override NVS"
+    default n
+    help
+        When enabled, the Kconfig defaults
+        (CONFIG_DEFAULT_WEBSOCKET_URL / CONFIG_DEFAULT_WEBSOCKET_TOKEN)
+        always take priority over the NVS websocket.url / websocket.token
+        values. Useful when:
+
+        - The device's NVS still contains a stale upstream xiaozhi URL
+          (e.g., wss://api.tenclass.net/...) from prior use, and there
+          is currently no runtime tool to clear that namespace
+        - You want the firmware to always talk to the same gateway
+          regardless of NVS state (common for development / CI builds)
+
+        Default disabled to preserve NVS-priority semantics for end users
+        who configure the URL/token via runtime tooling.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

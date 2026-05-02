@@ -74,23 +74,61 @@ esptool.py --chip esp32s3 --port /dev/cu.usbmodem1101 -b 460800 \
 
 WiFi 設定は ESP32 が起動後にスマホで設定 UI に接続して行う (xiaozhi-esp32 標準フロー)。
 
-### Configuring the WebSocket gateway URL
+### Configuring the WebSocket gateway URL and auth token
 
-The firmware reads the gateway URL from NVS key `websocket.url`. For
-development, there are three practical ways to provide it:
+The firmware reads two NVS keys for gateway connection:
 
-1. **Build-time default via Kconfig (recommended for developers)**:
-   run `idf.py menuconfig`, then open `Component config` → `Xiaozhi Assistant`
-   → `Default WebSocket gateway URL (fallback when NVS is empty)` and enter a
-   URL such as `ws://192.168.1.100:8765/`. This sets
-   `CONFIG_DEFAULT_WEBSOCKET_URL` in the build. If NVS `websocket.url` is
-   empty, the firmware automatically falls back to this value.
-2. **Write `websocket.url` directly to NVS**: this is the intended persistent
-   runtime configuration path, eventually via the WiFi config UI. The UI field
-   is not implemented yet and is tracked as a follow-up to Issue #17.
+- `websocket.url` — the gateway WebSocket URL (e.g. `ws://192.168.1.100:8765/`)
+- `websocket.token` — the bearer token sent as `Authorization: Bearer <token>`,
+  matched against `STACKCHAN_TOKEN` / `BEARER_TOKEN` on the gateway side
+  (leave both empty to skip authentication entirely)
+
+There are three practical ways to provide them:
+
+1. **Build-time defaults via Kconfig (recommended for developers)**: run
+   `idf.py menuconfig` → `Component config` → `Xiaozhi Assistant`, and set:
+   - `Default WebSocket gateway URL (fallback when NVS is empty)` →
+     `CONFIG_DEFAULT_WEBSOCKET_URL` (e.g. `ws://192.168.1.100:8765/`)
+   - `Default WebSocket auth token (fallback when NVS is empty)` →
+     `CONFIG_DEFAULT_WEBSOCKET_TOKEN` (leave empty if your gateway accepts
+     unauthenticated connections)
+
+   By default these only apply when the corresponding NVS key is empty.
+   For first-time flashes onto a fresh device this is exactly what you want.
+
+2. **Write `websocket.url` / `websocket.token` directly to NVS**: this is the
+   intended persistent runtime configuration path, eventually via the WiFi
+   config UI. The UI fields are not implemented yet and are tracked under
+   Issue #17 follow-ups.
+
 3. **Temporary source hardcode (not recommended)**: editing
    `websocket_protocol.cc` can unblock local experiments, but keep it out of
    commits.
+
+#### Existing devices with stale NVS — `CONFIG_FORCE_DEFAULT_WEBSOCKET_URL`
+
+If you are flashing onto a device that previously ran upstream xiaozhi-esp32
+firmware, NVS will already contain `websocket.url=wss://api.tenclass.net/...`
+written by the upstream OTA-config path. In this case the empty-NVS fallback
+in option 1 above will **not** trigger, and the device will keep trying to
+talk to tenclass instead of your local gateway. There is currently no
+runtime tool to clear the `websocket` NVS namespace selectively.
+
+To work around this without erasing all of NVS (which would also drop WiFi
+credentials), enable the force-override switch:
+
+- `Force CONFIG_DEFAULT_WEBSOCKET_URL/TOKEN to override NVS` →
+  `CONFIG_FORCE_DEFAULT_WEBSOCKET_URL=y`
+
+When set, the build-time Kconfig URL/token always win over whatever NVS
+holds. The boot log will show
+`FORCE: overriding NVS websocket.url with Kconfig: NVS=... -> ...` so you
+can verify the override fired. This switch is the recommended way to bring
+ex-xiaozhi hardware onto a local stackchan-mcp gateway, and to lock CI/dev
+images to a known gateway URL.
+
+The switch is opt-in so end-user devices configured at runtime keep their
+NVS-priority semantics.
 
 ### 2. ゲートウェイ起動
 
