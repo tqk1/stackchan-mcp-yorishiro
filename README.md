@@ -133,6 +133,24 @@ images to a known gateway URL.
 The switch is opt-in so end-user devices configured at runtime keep their
 NVS-priority semantics.
 
+#### Developer-local overrides — `sdkconfig.defaults.local`
+
+For local hardware testing, do not put personal gateway URLs or tokens in the
+tracked `firmware/sdkconfig.defaults`. Instead, create a gitignored local file:
+
+```bash
+cd firmware
+cat > sdkconfig.defaults.local <<'EOF'
+CONFIG_DEFAULT_WEBSOCKET_URL="ws://<your-lan-ip>:8765/"
+CONFIG_DEFAULT_WEBSOCKET_TOKEN="<your-dev-token>"
+CONFIG_FORCE_DEFAULT_WEBSOCKET_URL=y
+EOF
+```
+
+Both `python ./scripts/release.py <board>` and plain `idf.py build` will read
+this file when it exists. The file is ignored by git, so personal settings
+cannot be added accidentally with `git add -A`.
+
 ### 2. Start the gateway
 
 ```bash
@@ -206,3 +224,5 @@ The `gateway/` runs as an independent Python process and only talks to the ESP32
 ## Contributing
 
 Issues and PRs are welcome. We aim to provide something the StackChan community can use as-is.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the development flow.

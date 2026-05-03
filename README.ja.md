@@ -110,6 +110,25 @@ NVS を全消去 (WiFi 認証も飛ぶ) せずにこれを回避するには、f
 
 スイッチは opt-in なので、ランタイムで設定するエンドユーザーデバイスは NVS-priority のままです。
 
+#### 開発者ローカル設定 — `sdkconfig.defaults.local`
+
+ローカル実機テスト用の個人 gateway URL や token は、追跡対象の
+`firmware/sdkconfig.defaults` には入れないでください。代わりに gitignore
+済みのローカルファイルを作ります:
+
+```bash
+cd firmware
+cat > sdkconfig.defaults.local <<'EOF'
+CONFIG_DEFAULT_WEBSOCKET_URL="ws://<your-lan-ip>:8765/"
+CONFIG_DEFAULT_WEBSOCKET_TOKEN="<your-dev-token>"
+CONFIG_FORCE_DEFAULT_WEBSOCKET_URL=y
+EOF
+```
+
+このファイルが存在する場合、`python ./scripts/release.py <board>` と通常の
+`idf.py build` の両方で読み込まれます。gitignore 済みなので、`git add -A`
+で個人設定を誤って追加する事故を防げます。
+
 ### 2. ゲートウェイ起動
 
 ```bash
@@ -183,3 +202,5 @@ PNG → RGB565 配列の変換スクリプトは LVGL 公式の [Online Image Co
 ## コントリビューション
 
 Issue / PR 歓迎です。StackChan コミュニティで使える形を目指しています。
+
+開発手順は [`CONTRIBUTING.md`](CONTRIBUTING.md) を参照してください。

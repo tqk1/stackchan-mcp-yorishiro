@@ -290,6 +290,43 @@ def _apply_auto_selects(sdkconfig_append: list[str]) -> list[str]:
 
     return items
 
+
+def _read_local_sdkconfig_defaults(path: Path = Path("sdkconfig.defaults.local")) -> list[str]:
+    """Read gitignored local CONFIG_* overrides, if present."""
+    if not path.exists():
+        return []
+
+    lines: list[str] = []
+    with path.open(encoding="utf-8") as f:
+        for lineno, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.startswith("CONFIG_") or "=" not in line:
+                print(
+                    f"[WARN] Ignoring {path}:{lineno}: expected CONFIG_* assignment",
+                    file=sys.stderr,
+                )
+                continue
+            lines.append(line)
+    return lines
+
+
+def _merge_sdkconfig_overrides(*groups: list[str]) -> list[str]:
+    """Merge sdkconfig entries, letting later groups override earlier keys."""
+    result: list[Optional[str]] = []
+    positions: dict[str, int] = {}
+
+    for group in groups:
+        for entry in group:
+            key = entry.split("=", 1)[0].strip()
+            if key in positions:
+                result[positions[key]] = None
+            positions[key] = len(result)
+            result.append(entry)
+
+    return [entry for entry in result if entry is not None]
+
 ################################################################################
 # Check board_type in CMakeLists
 ################################################################################
@@ -358,6 +395,8 @@ def release(board_type: str, config_filename: str = "config.json", *, filter_nam
             board_type_config = _resolve_board_config(board_type, target, build_sdkconfig_append)
             sdkconfig_append = [f"{board_type_config}=y"]
             sdkconfig_append.extend(build_sdkconfig_append)
+        local_sdkconfig_append = _read_local_sdkconfig_defaults()
+        sdkconfig_append = _merge_sdkconfig_overrides(sdkconfig_append, local_sdkconfig_append)
         sdkconfig_append = _apply_auto_selects(sdkconfig_append)
 
         print("-" * 80)
@@ -365,6 +404,8 @@ def release(board_type: str, config_filename: str = "config.json", *, filter_nam
         print(f"target: {target}")
         if manufacturer:
             print(f"manufacturer: {manufacturer}")
+        if local_sdkconfig_append:
+            print("local_sdkconfig_defaults: sdkconfig.defaults.local")
         for item in sdkconfig_append:
             print(f"sdkconfig_append: {item}")
 
