@@ -14,6 +14,7 @@ import uuid
 from typing import Any
 
 import websockets
+import websockets.exceptions
 from websockets.asyncio.server import ServerConnection
 
 from .protocol import HelloResponse, make_mcp_message, parse_jsonrpc_response
@@ -36,6 +37,13 @@ class ESP32Connection:
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._connected = True
         self._initialized = False
+        # Device-declared WebSocket protocol version (from the hello
+        # message). Defaults to 1, which matches the firmware's default
+        # (firmware/main/protocols/websocket_protocol.h: ``version_ = 1``)
+        # and the audio framing this gateway emits today (raw Opus
+        # payload). v2/v3 add a BinaryProtocol header that this gateway
+        # does not yet wrap — see Issue follow-up to #70.
+        self.protocol_version: int = 1
 
     @property
     def connected(self) -> bool:
@@ -142,6 +150,62 @@ class ESP32Connection:
             method = payload.get("method", "")
             logger.info("ESP32 notification: %s", method)
 
+    async def _ws_send(self, payload: bytes | str) -> None:
+        """Send a payload, translating websockets errors to ConnectionError.
+
+        The ``websockets`` library raises its own exception hierarchy
+        (``ConnectionClosed`` and friends), which is *not* a subclass
+        of the built-in :class:`ConnectionError`. Without translation
+        the orchestrator's ``except ConnectionError`` filter — and the
+        MCP handler's ``except RuntimeError`` filter — would let those
+        errors leak as raw tracebacks into the MCP transport, breaking
+        the say() tool's clean error JSON contract on mid-stream
+        disconnect.
+        """
+        try:
+            await self._ws.send(payload)
+        except (
+            websockets.exceptions.ConnectionClosed,
+            OSError,
+        ) as exc:
+            # Mark the connection dead so subsequent calls fail fast
+            # rather than each one re-discovering the broken socket.
+            self.disconnect()
+            raise ConnectionError(f"WebSocket send failed: {exc}") from exc
+
+    async def send_audio_frame(self, opus_frame: bytes) -> None:
+        """Send a single Opus frame to the ESP32 as a WebSocket binary frame.
+
+        The device's ``OnData`` handler (firmware/main/protocols/
+        websocket_protocol.cc) treats every binary frame as an Opus
+        audio payload to feed into its decoder, so this method is the
+        TTS pipeline's egress point.
+        """
+        if not self._connected:
+            raise ConnectionError("ESP32 not connected")
+        await self._ws_send(opus_frame)
+
+    async def send_tts_state(self, state: str) -> None:
+        """Send a TTS state notification (``start`` / ``stop`` / ...).
+
+        The device's :func:`Application::OnIncomingJson` translates
+        ``{"type":"tts","state":"start"}`` into
+        :data:`kDeviceStateSpeaking`, which is the gate for
+        :func:`OnIncomingAudio` pushing packets into the decode queue
+        (see ``firmware/main/application.cc``). Without bracketing the
+        audio frames in start/stop, the device drops them on the floor
+        and the speaker stays silent — the TTS tool returns success
+        without anything actually playing.
+        """
+        if not self._connected:
+            raise ConnectionError("ESP32 not connected")
+        message = {
+            "session_id": self.session_id,
+            "type": "tts",
+            "state": state,
+        }
+        await self._ws_send(json.dumps(message))
+
     def disconnect(self) -> None:
         """Mark connection as disconnected."""
         self._connected = False
@@ -167,6 +231,17 @@ class ESP32Manager:
         self._init_tasks: list[asyncio.Task] = []
         self._vision_url: str = ""
         self._vision_token: str = ""
+        # Per-device serialisation for TTS send sequences. Acquired by
+        # the orchestrator around the entire start → frames → stop
+        # block so concurrent ``say()`` invocations cannot interleave
+        # their Opus frames on the same WebSocket or overlap their
+        # ``tts.start``/``tts.stop`` notifications (which would yank
+        # the firmware out of ``kDeviceStateSpeaking`` mid-utterance
+        # and silently drop the remaining audio). The lock is scoped
+        # to the manager because the manager owns the device today —
+        # if multi-device support lands later, the lock should move
+        # onto :class:`ESP32Connection` instead.
+        self._tts_lock = asyncio.Lock()
 
     @property
     def device_connected(self) -> bool:
@@ -175,6 +250,15 @@ class ESP32Manager:
     @property
     def connection(self) -> ESP32Connection | None:
         return self._connection
+
+    @property
+    def tts_lock(self) -> asyncio.Lock:
+        """Per-device lock guarding the TTS send sequence.
+
+        See :attr:`_tts_lock` for the rationale; the orchestrator wraps
+        the start → frames → stop block in ``async with`` on this lock.
+        """
+        return self._tts_lock
 
     async def start(
         self,
@@ -265,6 +349,27 @@ class ESP32Manager:
                         await ws.close()
                         return
 
+                    # Capture the device's WebSocket protocol version
+                    # so callers (e.g. the TTS pipeline) can decide
+                    # whether their wire format is compatible. The
+                    # firmware accepts raw Opus only on v1; v2/v3 wrap
+                    # the payload in a BinaryProtocol header.
+                    raw_version = data.get("version", 1)
+                    try:
+                        connection.protocol_version = int(raw_version)
+                    except (TypeError, ValueError):
+                        connection.protocol_version = 1
+                    if connection.protocol_version != 1:
+                        logger.warning(
+                            "ESP32 negotiated WebSocket protocol "
+                            "version=%s; the gateway emits raw Opus "
+                            "binary frames matching v1 only. TTS "
+                            "calls (say) will be blocked at the "
+                            "orchestrator until v2/v3 BinaryProtocol "
+                            "header wrapping is implemented",
+                            connection.protocol_version,
+                        )
+
                     # Send hello response
                     resp = HelloResponse(session_id=session_id)
                     await ws.send(resp.model_dump_json())
@@ -322,6 +427,29 @@ class ESP32Manager:
         if not self._connection.initialized:
             return None, {"code": -32000, "message": "ESP32 not initialized"}
         return await self._connection.call_tool(name, arguments)
+
+    async def send_audio_frame(self, opus_frame: bytes) -> None:
+        """Push a single Opus frame to the connected device.
+
+        Used by the TTS pipeline to deliver synthesised audio. Raises
+        :class:`ConnectionError` if no device is currently attached so
+        the orchestrator can surface a clean error to the MCP client
+        instead of silently dropping audio.
+        """
+        if not self._connection or not self._connection.connected:
+            raise ConnectionError("No ESP32 device connected")
+        await self._connection.send_audio_frame(opus_frame)
+
+    async def send_tts_state(self, state: str) -> None:
+        """Send a TTS state notification (``start`` / ``stop`` / ...).
+
+        Required around audio frame egress so the device transitions
+        into ``kDeviceStateSpeaking`` and back; see
+        :meth:`ESP32Connection.send_tts_state` for the full rationale.
+        """
+        if not self._connection or not self._connection.connected:
+            raise ConnectionError("No ESP32 device connected")
+        await self._connection.send_tts_state(state)
 
     def get_status(self) -> dict[str, Any]:
         """Get current connection status."""

@@ -118,27 +118,27 @@ async def test_list_tools_includes_say():
 
 
 @pytest.mark.asyncio
-async def test_say_returns_clean_error_when_no_engine_registered():
-    """say without a registered engine surfaces NotImplementedError as JSON.
+async def test_say_unknown_voice_returns_clean_error():
+    """say with an unknown voice returns a clean error JSON, not a traceback.
 
-    The default registry has no engines in PR1, so we don't even need a
-    fake gateway: the say handler short-circuits before touching ESP32.
+    This invariant holds regardless of which engines happen to be
+    registered at the default level — the orchestrator must surface a
+    NotImplementedError to the caller as MCP error JSON.
     """
-    # Sanity-check the assumption: default registry must be empty here so
-    # the test reflects PR1's published surface.
-    assert get_registry().names() == []
-
     server = create_server()
     result = await server.request_handlers[CallToolRequest](
         CallToolRequest(
             method="tools/call",
-            params={"name": "say", "arguments": {"text": "hello"}},
+            params={
+                "name": "say",
+                "arguments": {"text": "hello", "voice": "nonexistent_engine"},
+            },
         )
     )
 
     payload = json.loads(result.root.content[0].text)
     assert "error" in payload
-    assert "voicevox" in payload["error"]
+    assert "nonexistent_engine" in payload["error"]
 
 
 @pytest.mark.asyncio
@@ -158,13 +158,13 @@ async def test_say_rejects_empty_text_with_clean_error():
 
 
 @pytest.mark.asyncio
-async def test_say_runs_without_esp32_connection(monkeypatch):
-    """say does not require an ESP32 device to surface its 'no engine' error.
+async def test_say_returns_clean_error_when_device_disconnected(monkeypatch):
+    """say without a connected ESP32 surfaces a clean MCP error JSON.
 
-    Phase 4 PR1 ships the framework only; the say handler needs to give a
-    useful error before any concrete engine is wired up, even when no
-    device is connected. This guards against accidentally moving the
-    handler below the device_connected gate during refactors.
+    Validation passes (text + registered engine), the orchestrator
+    needs to push frames somewhere, and the device gate fires. The
+    handler must turn that into ``{"error": "..."}`` rather than
+    leaking a stack trace through the MCP transport.
     """
 
     class FakeESP32:
@@ -189,10 +189,140 @@ async def test_say_runs_without_esp32_connection(monkeypatch):
     )
 
     payload = json.loads(result.root.content[0].text)
-    # Should be the engine-not-registered error, not the
-    # device_connected guard's "No ESP32 device connected" error.
     assert "error" in payload
-    assert "engine" in payload["error"].lower()
+    msg = payload["error"].lower()
+    assert "esp32" in msg or "device" in msg
+
+
+@pytest.mark.asyncio
+async def test_default_registry_includes_voicevox():
+    """The default registry registers VOICEVOX at import time.
+
+    PR2 of Issue #70 wires VOICEVOX in via ``tts/__init__.py`` so users
+    who install the ``[tts]`` extra can call ``say`` without needing
+    to register an engine themselves. This test pins that contract.
+    """
+    assert "voicevox" in get_registry().names()
+
+
+# ---------------------------------------------------------------------------
+# say handler regression tests — degraded VOICEVOX / mid-stream disconnect
+# must produce error JSON, not stack traces. Codex adversarial review
+# flagged that this contract was previously only verified at the
+# orchestrator level; these tests close the loop through create_server().
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_say_returns_error_json_when_voicevox_returns_5xx(monkeypatch):
+    """A 503 from VOICEVOX surfaces as ``{"error": ...}``, not a traceback."""
+    httpx = pytest.importorskip("httpx")
+
+    from stackchan_mcp.tts import EngineRegistry, TTSEngine
+    import stackchan_mcp.tts.orchestrator as orchestrator
+    import stackchan_mcp.stdio_server as stdio_server
+
+    class _HttpFailEngine(TTSEngine):
+        name = "voicevox"
+
+        async def synthesize(self, text, **opts):
+            request = httpx.Request("POST", "http://test/audio_query")
+            response = httpx.Response(503, request=request, text="overloaded")
+            raise httpx.HTTPStatusError(
+                "503", request=request, response=response
+            )
+
+    reg = EngineRegistry()
+    reg.register(_HttpFailEngine())
+
+    class FakeESP32:
+        device_connected = True
+
+        def get_status(self):
+            return {"connected": True}
+
+        async def send_audio_frame(self, frame):
+            raise AssertionError("synthesise should have failed before push")
+
+        async def send_tts_state(self, state):  # noqa: ARG002 - test stub
+            return None
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    monkeypatch.setattr(orchestrator, "get_registry", lambda: reg)
+
+    server = create_server()
+    result = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={"name": "say", "arguments": {"text": "hello"}},
+        )
+    )
+    payload = json.loads(result.root.content[0].text)
+    assert "error" in payload
+    assert "voicevox" in payload["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_say_returns_error_json_when_device_disconnects_mid_stream(
+    monkeypatch,
+):
+    """A mid-stream disconnect surfaces as ``{"error": ...}``."""
+    from stackchan_mcp.tts import EngineRegistry, TTSEngine
+    import stackchan_mcp.tts.orchestrator as orchestrator
+    import stackchan_mcp.stdio_server as stdio_server
+
+    pcm = b"\x01\x00" * 1440  # ~ 1.5 frames
+
+    class _PCMEngine(TTSEngine):
+        name = "voicevox"
+
+        async def synthesize(self, text, **opts):
+            return pcm
+
+    reg = EngineRegistry()
+    reg.register(_PCMEngine())
+
+    def fake_encode(_pcm, **kwargs):
+        return iter([b"opus_a", b"opus_b"])
+
+    class FailingESP32:
+        device_connected = True
+
+        def __init__(self):
+            self.frames: list[bytes] = []
+
+        def get_status(self):
+            return {"connected": True}
+
+        async def send_audio_frame(self, frame):
+            if self.frames:
+                raise ConnectionError("simulated disconnect")
+            self.frames.append(frame)
+
+        async def send_tts_state(self, state):  # noqa: ARG002 - test stub
+            return None
+
+    class FakeGateway:
+        esp32 = FailingESP32()
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    monkeypatch.setattr(orchestrator, "get_registry", lambda: reg)
+    monkeypatch.setattr(orchestrator, "encode_opus_frames", fake_encode)
+
+    server = create_server()
+    result = await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={"name": "say", "arguments": {"text": "hello"}},
+        )
+    )
+    payload = json.loads(result.root.content[0].text)
+    assert "error" in payload
+    msg = payload["error"].lower()
+    assert "disconnect" in msg or "frame" in msg
 
 
 @pytest.mark.asyncio

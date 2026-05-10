@@ -7,7 +7,7 @@ import pytest
 import pytest_asyncio
 import websockets
 
-from stackchan_mcp.esp32_client import ESP32Manager
+from stackchan_mcp.esp32_client import ESP32Connection, ESP32Manager
 
 
 @pytest_asyncio.fixture
@@ -221,6 +221,160 @@ async def test_auth_rejection(manager):
                 await ws.recv()
     finally:
         del os.environ["STACKCHAN_TOKEN"]
+
+
+# ---------------------------------------------------------------------------
+# send_audio_frame (TTS pipeline egress, Issue #70 PR2)
+# ---------------------------------------------------------------------------
+
+
+class _FakeWebSocket:
+    """Minimal stand-in for websockets.ServerConnection used in unit tests."""
+
+    def __init__(self) -> None:
+        self.sent: list[bytes | str] = []
+
+    async def send(self, data):
+        self.sent.append(data)
+
+
+@pytest.mark.asyncio
+async def test_connection_send_audio_frame_sends_binary():
+    """ESP32Connection.send_audio_frame writes the bytes to the underlying WS."""
+    ws = _FakeWebSocket()
+    conn = ESP32Connection(ws, session_id="session-1")  # type: ignore[arg-type]
+
+    await conn.send_audio_frame(b"opus_payload_bytes")
+
+    assert ws.sent == [b"opus_payload_bytes"]
+
+
+@pytest.mark.asyncio
+async def test_connection_send_audio_frame_raises_after_disconnect():
+    """A disconnected connection refuses to send rather than silently dropping."""
+    ws = _FakeWebSocket()
+    conn = ESP32Connection(ws, session_id="session-1")  # type: ignore[arg-type]
+
+    conn.disconnect()
+
+    with pytest.raises(ConnectionError):
+        await conn.send_audio_frame(b"opus_payload_bytes")
+    assert ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_manager_send_audio_frame_no_device():
+    """ESP32Manager.send_audio_frame raises when no device is attached.
+
+    The orchestrator turns this into a clean MCP error JSON; without
+    this guard the call would AttributeError on a None connection.
+    """
+    mgr = ESP32Manager()
+
+    with pytest.raises(ConnectionError):
+        await mgr.send_audio_frame(b"opus_payload_bytes")
+
+
+@pytest.mark.asyncio
+async def test_connection_send_tts_state_sends_json():
+    """ESP32Connection.send_tts_state writes a tts state JSON message."""
+    ws = _FakeWebSocket()
+    conn = ESP32Connection(ws, session_id="session-tts")  # type: ignore[arg-type]
+
+    await conn.send_tts_state("start")
+
+    assert len(ws.sent) == 1
+    payload = json.loads(ws.sent[0])
+    assert payload == {
+        "session_id": "session-tts",
+        "type": "tts",
+        "state": "start",
+    }
+
+
+@pytest.mark.asyncio
+async def test_connection_send_tts_state_raises_after_disconnect():
+    """A disconnected connection refuses to send TTS notifications."""
+    ws = _FakeWebSocket()
+    conn = ESP32Connection(ws, session_id="session-tts")  # type: ignore[arg-type]
+
+    conn.disconnect()
+
+    with pytest.raises(ConnectionError):
+        await conn.send_tts_state("stop")
+    assert ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_manager_send_tts_state_no_device():
+    """ESP32Manager.send_tts_state raises when no device is attached."""
+    mgr = ESP32Manager()
+
+    with pytest.raises(ConnectionError):
+        await mgr.send_tts_state("start")
+
+
+class _FailingWebSocket:
+    """WebSocket that raises a websockets-specific error on send()."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.send_calls = 0
+
+    async def send(self, data):
+        self.send_calls += 1
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_send_audio_frame_translates_websockets_close_to_connection_error():
+    """websockets.ConnectionClosed becomes ConnectionError + marks dead.
+
+    Without translation the websockets-specific exception would
+    bypass the orchestrator's ``except ConnectionError`` filter and
+    leak as a stack trace through the MCP transport.
+    """
+    import websockets.exceptions
+
+    closed = websockets.exceptions.ConnectionClosed(rcvd=None, sent=None)
+    ws = _FailingWebSocket(closed)
+    conn = ESP32Connection(ws, session_id="session-1")  # type: ignore[arg-type]
+
+    with pytest.raises(ConnectionError, match="WebSocket send"):
+        await conn.send_audio_frame(b"opus")
+
+    # After the translated failure, the connection is marked dead so
+    # subsequent sends fail fast without re-touching the dead socket.
+    assert not conn.connected
+    with pytest.raises(ConnectionError):
+        await conn.send_audio_frame(b"more")
+    assert ws.send_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_send_tts_state_translates_oserror_to_connection_error():
+    """OSError on send (e.g. broken pipe) is translated to ConnectionError."""
+    ws = _FailingWebSocket(OSError("broken pipe"))
+    conn = ESP32Connection(ws, session_id="session-1")  # type: ignore[arg-type]
+
+    with pytest.raises(ConnectionError, match="WebSocket send"):
+        await conn.send_tts_state("start")
+    assert not conn.connected
+
+
+def test_connection_default_protocol_version_is_one():
+    """Fresh ESP32Connection defaults to WebSocket protocol v1.
+
+    v1 is what the gateway's audio framing currently targets (raw
+    Opus binary frames). v2/v3 wrap payloads in a BinaryProtocol
+    header which this gateway does not yet emit; the hello handler
+    logs a warning when a non-v1 device negotiates so operators know
+    the TTS path may not work for them.
+    """
+    ws = _FakeWebSocket()
+    conn = ESP32Connection(ws, session_id="session-1")  # type: ignore[arg-type]
+
+    assert conn.protocol_version == 1
 
 
 # ---------------------------------------------------------------------------
