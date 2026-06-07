@@ -42,9 +42,9 @@ STACKCHAN_EVENT_INSTRUCTIONS = (
 )
 STACKCHAN_CHANNEL_INSTRUCTIONS = (
     'Stack-chan physical events arrive as Channels notifications under '
-    '<channel source="stackchan-mcp" action="..." subtype="..." '
-    'duration_ms="...">. React naturally using existing tools '
-    '(set_avatar, say, set_mouth, set_leds, move_head).'
+    '<channel source="plugin:stackchanmcp:stackchanmcp" action="..." '
+    'subtype="..." duration_ms="...">. React naturally using existing '
+    'tools (set_avatar, say, set_mouth, set_leds, move_head).'
 )
 STACKCHAN_JSONL_INSTRUCTIONS = (
     "Stack-chan physical events are persisted to the JSONL log; host "
@@ -236,7 +236,7 @@ def _create_initialization_options(
     notify_config: NotifyConfig,
 ) -> InitializationOptions:
     return InitializationOptions(
-        server_name="stackchan-mcp",
+        server_name="stackchanmcp",
         server_version=__version__,
         capabilities=server.get_capabilities(
             notification_options=NotificationOptions(),
@@ -594,7 +594,7 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
     _verify_mcp_sdk_compatibility()
     if notify_config is None:
         notify_config = load_notify_config()
-    server = StackChanServer("stackchan-mcp", notify_config=notify_config)
+    server = StackChanServer("stackchanmcp", notify_config=notify_config)
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
