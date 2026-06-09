@@ -1,0 +1,38 @@
+# StackChan MCP gateway (yorishiro) — systemd unit
+#
+# インストール:
+#   sudo install -m 644 docs/deploy/stackchan-gateway.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now stackchan-gateway
+#
+# 1 プロセスで 3 つの待ち受けを持つ:
+#   - WebSocket :8765      … ESP32 (StackChan 実機) が常時接続
+#   - HTTP      :8766      … /capture (カメラ) /pcm /voice_turn (会話1往復)
+#   - MCP HTTP  :8767      … Hermes 等の MCP クライアント向け (127.0.0.1 bind)
+#
+# 秘匿値 (HERMES_API_KEY 等) は ~/.yorishiro/secrets.env に分離。
+
+[Unit]
+Description=StackChan MCP gateway (yorishiro) - WS:8765 / capture:8766 / MCP HTTP:8767
+After=network-online.target voicevox.service
+Wants=network-online.target voicevox.service
+
+[Service]
+Type=simple
+User=kenji
+Group=kenji
+WorkingDirectory=/home/kenji/dev/yorishiro-workspace/stackchan-mcp-yorishiro/gateway
+ExecStart=/home/kenji/dev/yorishiro-workspace/stackchan-mcp-yorishiro/gateway/.venv/bin/stackchan-mcp serve --transport streamable-http
+# ESP32 がカメラ画像を POST する先 (LAN IP)
+Environment="VISION_HOST=192.168.0.19"
+# mDNS では LAN IP だけ広告する (Tailscale/docker IP を名乗らない)
+Environment="STACKCHAN_MDNS_ADVERTISE_ADDR=192.168.0.19"
+# タッチ録音を自分自身の /voice_turn へ回して会話ループを閉じる
+Environment="STACKCHAN_AUDIO_HOOK_URL=http://127.0.0.1:8766/voice_turn"
+EnvironmentFile=-/home/kenji/.yorishiro/secrets.env
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
