@@ -466,4 +466,10 @@ def create_capture_app(
     app.router.add_post("/capture", handle_capture)
     app.router.add_get("/avatar_set/{short_id}", handle_avatar_set_fetch)
     app.router.add_post("/pcm", handle_pcm)
+    # yorishiro fork: voice-turn bridge (tap → STT → Hermes → TTS).
+    # The handler lazy-imports its stt/tts dependencies, so registering
+    # the route costs nothing for capture-only deployments.
+    from .hermes_bridge import handle_voice_turn
+
+    app.router.add_post("/voice_turn", handle_voice_turn)
     return app
