@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+import os
 import socket
 from dataclasses import dataclass
 from typing import Any
@@ -251,7 +252,16 @@ def _resolve_addresses_for_host(host: str) -> list[str]:
     HOST in a multi-NIC / Tailscale environment would see every poll as an
     "address change" against an unrelated extra interface and churn the
     registration on every refresh interval.
+
+    ``STACKCHAN_MDNS_ADVERTISE_ADDR`` overrides the advertised address
+    without touching the bind host: on a multi-homed machine (Tailscale,
+    docker bridges) a wildcard HOST otherwise advertises every interface,
+    and the firmware burns a TCP connect timeout on each unreachable
+    candidate before it tries the LAN one.
     """
+    override = os.environ.get("STACKCHAN_MDNS_ADVERTISE_ADDR", "").strip()
+    if override:
+        return _resolve_concrete_host_ipv4_addresses(override)
     return (
         _enumerate_usable_ipv4_addresses()
         if _is_wildcard_host(host)
