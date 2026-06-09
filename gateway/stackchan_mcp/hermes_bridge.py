@@ -62,9 +62,25 @@ DEFAULT_VOICE_SYSTEM_PROMPT = (
 #: beyond this the voice interaction is dead anyway.
 HERMES_TIMEOUT_S = 120.0
 
+#: Upper bound for one uploaded capture. Device-driven recordings are
+#: capped at 30 s on the firmware side; Opus at 16 kHz mono runs well
+#: under 4 KiB/s, so 2 MiB is an order of magnitude above any real
+#: voice turn. The capture server disables aiohttp's global body cap
+#: (``client_max_size=0`` for /pcm streaming), so this route enforces
+#: its own.
+MAX_OGG_BYTES = 2 * 1024 * 1024
+
+#: Upper bound for the decoded PCM (decompression-bomb guard): 120 s of
+#: 16 kHz mono s16 audio. A malicious Ogg can expand far beyond its
+#: wire size; abort the decode loop once past this.
+MAX_PCM_BYTES = 120 * 16000 * 2
+
 
 def _ogg_opus_to_pcm16k(data: bytes) -> bytes:
-    """Decode an Ogg/Opus capture to 16 kHz mono s16 PCM via PyAV."""
+    """Decode an Ogg/Opus capture to 16 kHz mono s16 PCM via PyAV.
+
+    Raises ValueError if the decoded audio exceeds :data:`MAX_PCM_BYTES`.
+    """
     import av
     from av.audio.resampler import AudioResampler
 
@@ -74,9 +90,15 @@ def _ogg_opus_to_pcm16k(data: bytes) -> bytes:
         for frame in container.decode(audio=0):
             for rframe in resampler.resample(frame):
                 out.extend(bytes(rframe.planes[0])[: rframe.samples * 2])
+            if len(out) > MAX_PCM_BYTES:
+                raise ValueError(
+                    f"decoded audio exceeds {MAX_PCM_BYTES} bytes PCM"
+                )
         # Flush the resampler's internal FIFO.
         for rframe in resampler.resample(None):
             out.extend(bytes(rframe.planes[0])[: rframe.samples * 2])
+    if len(out) > MAX_PCM_BYTES:
+        raise ValueError(f"decoded audio exceeds {MAX_PCM_BYTES} bytes PCM")
     return bytes(out)
 
 
@@ -112,26 +134,37 @@ async def ask_hermes(text: str) -> str:
         ) as resp:
             body = await resp.text()
             if resp.status != 200:
+                # Log the upstream body server-side only; the HTTP
+                # caller gets a generic message (no provider internals).
+                logger.error(
+                    "Hermes API status=%d body=%s", resp.status, body[:500]
+                )
                 raise RuntimeError(
-                    f"Hermes API returned status={resp.status}: {body[:300]}"
+                    f"Hermes API returned status={resp.status}"
                 )
     data = json.loads(body)
     try:
         reply = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(
-            f"Hermes API response missing choices: {body[:300]}"
-        ) from exc
+        logger.error("Hermes API response missing choices: %s", body[:500])
+        raise RuntimeError("Hermes API response missing choices") from exc
     if not isinstance(reply, str) or not reply.strip():
         raise RuntimeError("Hermes API returned an empty reply")
     return reply.strip()
 
 
 def _check_token(request: web.Request) -> bool:
-    """Verify the shared audio-hook bearer token, if one is configured."""
+    """Authorise a /voice_turn caller.
+
+    With ``STACKCHAN_AUDIO_HOOK_TOKEN`` configured, require the matching
+    bearer token. Without a token, fail closed for everything except
+    loopback peers: the capture server binds non-loopback interfaces
+    (the ESP32 POSTs /capture over the LAN), and this route invokes an
+    agent — it must not be open to the whole LAN by default.
+    """
     expected = os.getenv("STACKCHAN_AUDIO_HOOK_TOKEN", "")
     if not expected:
-        return True
+        return request.remote in ("127.0.0.1", "::1")
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return False
@@ -157,7 +190,17 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
         )
 
     session_id = request.headers.get("X-StackChan-Session", "")
-    ogg = await request.read()
+    if (request.content_length or 0) > MAX_OGG_BYTES:
+        return web.json_response(
+            {"ok": False, "error": "payload too large"}, status=413
+        )
+    # content_length can be absent/lied about (chunked transfer), so
+    # also enforce the cap on the actual stream.
+    ogg = await request.content.read(MAX_OGG_BYTES + 1)
+    if len(ogg) > MAX_OGG_BYTES:
+        return web.json_response(
+            {"ok": False, "error": "payload too large"}, status=413
+        )
     if not ogg:
         return web.json_response({"ok": False, "error": "empty body"}, status=400)
 
