@@ -2103,7 +2103,14 @@ private:
     };
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // yorishiro: shutdown disabled (-1). The vessel must stay
+        // powered through long gateway outages — with the upstream
+        // 300 s value the AXP2101 powers the board off 5 minutes
+        // after a WebSocket disconnect, even on USB power, and only
+        // a physical long-press can bring it back. Reconnect already
+        // retries forever, so staying on is enough to self-heal.
+        // Display dimming (60 s) is kept.
+        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(10);
