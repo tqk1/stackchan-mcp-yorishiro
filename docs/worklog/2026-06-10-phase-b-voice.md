@@ -228,3 +228,16 @@ systemd サービス（マシン起動時に自動で立ち上がる）
 - Phase B 正式クローズ → learning-report 作成の検討
 - さらに縮めたい場合の候補: 文分割ストリーミング TTS（最初の一文を先に再生）、
   faster-whisper のモデルプリロード
+
+---
+
+## 10. 追記（翌朝）: STACKCHAN_TOKEN 認証 + 学習レポート2本
+
+- **STACKCHAN_TOKEN 設定完了** — firmware は `sdkconfig.defaults.local` の
+  `CONFIG_DEFAULT_WEBSOCKET_TOKEN`（リビルド+flash）、gateway は
+  `~/.yorishiro/secrets.env`。実機は認証付き接続成功、誤トークンは HTTP 401 拒否を
+  テストで確認。**これで Phase B 全クローズ**。
+- **学習レポートを作成**: `docs/phase-a-report.md`（基盤構築編）と
+  `docs/phase-b-report.md`（音声会話編）。初学者向け・喩え多め・質問例付き。
+  AI に貼り付けて深掘りする用。
+- feature/phase-b-voice を origin へ push 済み。
