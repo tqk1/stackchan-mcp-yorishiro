@@ -26,6 +26,10 @@ Environment variables:
 - ``STACKCHAN_AUDIO_HOOK_TOKEN`` — shared bearer token; when set, the
   ``/voice_turn`` endpoint rejects requests without it (the sender side
   in :mod:`audio_input_hook` attaches the same token).
+- ``STACKCHAN_LOCAL_LLM_MODEL`` (and friends) — opt-in fast path that
+  routes short/simple utterances to a local Ollama model instead of
+  Hermes; see :mod:`stackchan_mcp.local_llm`. Unset = every turn goes
+  to Hermes, exactly as before.
 """
 
 from __future__ import annotations
@@ -41,6 +45,8 @@ from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from aiohttp import web
+
+from . import local_llm
 
 if TYPE_CHECKING:
     from .gateway import Gateway
@@ -153,6 +159,33 @@ async def ask_hermes(text: str) -> str:
     return reply.strip()
 
 
+async def generate_reply(text: str) -> tuple[str, str]:
+    """Produce the reply for one transcript, returning ``(reply, route)``.
+
+    With local routing opted in (``STACKCHAN_LOCAL_LLM_MODEL`` set) and
+    :func:`local_llm.decide_route` classifying the turn as short/simple,
+    the local Ollama model answers; on any local failure (timeout,
+    connection refused, bad response) the turn falls back to Hermes so
+    routing can never kill a conversation. ``route`` is ``"local"`` or
+    ``"hermes"``.
+    """
+    if (
+        local_llm.is_enabled()
+        and local_llm.decide_route(text) == local_llm.ROUTE_LOCAL
+    ):
+        system_prompt = os.getenv(
+            "HERMES_VOICE_SYSTEM_PROMPT", DEFAULT_VOICE_SYSTEM_PROMPT
+        )
+        try:
+            reply = await local_llm.ask_local(text, system_prompt=system_prompt)
+            return reply, local_llm.ROUTE_LOCAL
+        except Exception as exc:
+            logger.warning(
+                "voice_turn: local LLM failed (%s); falling back to Hermes", exc
+            )
+    return await ask_hermes(text), local_llm.ROUTE_HERMES
+
+
 def _check_token(request: web.Request) -> bool:
     """Authorise a /voice_turn caller.
 
@@ -252,14 +285,14 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
 
     logger.info("voice_turn: transcript=%r session=%s", transcript[:120], session_id)
     try:
-        reply = await ask_hermes(transcript)
+        reply, route = await generate_reply(transcript)
     except Exception as exc:
         logger.exception("voice_turn: Hermes call failed")
         return web.json_response(
             {"ok": False, "error": f"hermes failed: {exc}", "transcript": transcript},
             status=502,
         )
-    t_hermes = time.monotonic()
+    t_llm = time.monotonic()
 
     logger.info("voice_turn: reply=%r session=%s", reply[:120], session_id)
     try:
@@ -280,17 +313,24 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
     timings_ms = {
         "decode": int((t_decode - t0) * 1000),
         "stt": int((t_stt - t_decode) * 1000),
-        "hermes": int((t_hermes - t_stt) * 1000),
-        "tts": int((t_done - t_hermes) * 1000),
+        # "llm" covers whichever brain answered; "route" says which.
+        "llm": int((t_llm - t_stt) * 1000),
+        "tts": int((t_done - t_llm) * 1000),
         "total": int((t_done - t0) * 1000),
     }
-    logger.info("voice_turn: done session=%s timings_ms=%s", session_id, timings_ms)
+    logger.info(
+        "voice_turn: done session=%s route=%s timings_ms=%s",
+        session_id,
+        route,
+        timings_ms,
+    )
     return web.json_response(
         {
             "ok": True,
             "session_id": session_id,
             "transcript": transcript,
             "reply": reply,
+            "route": route,
             "tts": tts_result,
             "timings_ms": timings_ms,
         }
