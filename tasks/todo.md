@@ -1,3 +1,27 @@
+# Phase C-0 — レイテンシ短縮: VAD 無音自動停止（2026-06-10 ユーザー承認: 案1+案3）
+
+## 前提（調査済み）
+- 体感遅延の主因は録音の 30s タイムアウト待ち。タップ停止 (`stackchan.cc:2330`) は実装済みだが、無音検出で自動停止できればタップ2回目も不要
+- 案3（返答文字数制限）は **既に実装済み** — `hermes_bridge.py` の `DEFAULT_VOICE_SYSTEM_PROMPT`（1〜3文指定）が毎ターン注入されている → 追加作業なし
+- AFE VAD は稼働中（`AudioService::IsVoiceDetected()` 公開済み、`application.h:67` に転送 accessor）だが停止には未結線
+
+## 設計（firmware 最小変更、board ローカル）
+- `PollTouchpad()` の既存タイムアウト管理と同じ場所に VAD 監視を追加:
+  - `VAD_WARMUP_MS = 800` — listening 突入直後はポップアップ音の自己拾音を避けるため VAD 無視
+  - 発話を一度でも検知 (`speech_seen`) した後、無音が `VAD_SILENCE_STOP_MS = 1200` 続いたら `StopListening()`
+  - 発話未検知のまま無音でも止めない（VAD 不感への保険。30s タイムアウトが backstop）
+- gateway 側変更なし。リスクが顕在化したら定数調整のみで済む構造
+
+## チェックリスト
+- [x] C0-1: `stackchan.cc` PollTouchpad に VAD 無音自動停止を実装 (2026-06-10) — speech_seen + 無音 1200ms で StopListening、warmup 800ms、未検知時は止めない（30s backstop 維持）
+- [x] C0-2: Docker ビルド成功 (22:42、v2.2.6、mDNS 設定マージ確認)
+- [x] C0-3: app flash + 再接続確認 (22:43、tools=30)
+- [x] C0-4: 実機テスト合格 (2026-06-10 23:03) — 録音が発話分+1.2s で自動停止（38〜57 frames = 2〜3.4s、従来 498）。**STT 精度も回復**（「お元気ですか」を正確に転写。従来の転写崩壊は 30s の無音尾が whisper を劣化させていたのが原因で、マイクは正常）。ターン全体 9.8s（stt 0.6 / hermes 2.6 / tts 6.6 ※再生込み）。ユーザー所感「とても流暢」
+  - 注意: 声が小さい/遠いと VAD が発話を検知せず 30s タイムアウト側に落ちる（22:56 のターンがこれ。設計通りの保険動作）。その場合も再タップで即送信可能
+- [x] C0-5: コミット済み — firmware 682c38f (VAD auto-stop) / gateway 8c59987 (STACKCHAN_VOICE_DUMP_DIR 診断ダンプ、env 未設定なら no-op。systemd drop-in は未適用のまま=無効)
+
+---
+
 # Phase B — 音声最小往復: タップ → 録音 → STT → Hermes → TTS → 再生
 
 着手日: 2026-06-10
@@ -19,15 +43,17 @@
 ## チェックリスト
 - [x] B1: 足回り確認 (2026-06-10) — gateway に `tts` + `stt-faster-whisper` extras 導入。VOICEVOX は旧 yuno 残骸 `~/trash/` 行きだったエンジン本体 (2.1GB) を `~/apps/voicevox/` へ救出し、unit を drop-in (`voicevox.service.d/override.conf`) でパス修正して復旧 (v0.25.2, :50021)
 - [x] B2: TTS 単体 (2026-06-10) — `say` → VOICEVOX → Opus 91 frames 実機送信成功（初回 8.6s、VOICEVOX ウォームアップ込み）。**スピーカーからの実音確認はユーザー帰宅後**
-- [ ] B3: STT 単体 — 画面タップ → `listen.start` → 転写確認【実機操作が必要・ユーザー帰宅後】
+- [x] B3: STT 単体 (2026-06-10 実機確認) — 画面タップ → 録音 → faster-whisper 転写動作確認。※転写品質に課題: 30s 録音中の発話が 'ん'/'うっ' としか転写されないターンあり（録音窓が長すぎる影響の可能性、タップ停止運用で再評価）
 - [x] B4: Hermes APIServerAdapter 有効化 (2026-06-10) — drop-in (`hermes-gateway.service.d/api-server.conf`) で `API_SERVER_ENABLED=true` → 127.0.0.1:8642 で /health OK、実モデルと 1 ターン疎通成功
 - [x] B5: voice-turn receiver 実装 (2026-06-10) — `stackchan_mcp/hermes_bridge.py` 新規 + `capture_server.py` に `/voice_turn` ルート 1 箇所追加（fork 独自・upstream 非送付）。`STACKCHAN_AUDIO_HOOK_URL=http://127.0.0.1:8766/voice_turn` で自分自身に向ける構成
 - [x] B6 (シミュレート版): E2E 成功 (2026-06-10) — VOICEVOX 合成音声を firmware と同形式の Ogg/Opus で `/voice_turn` に POST（`scratch/test_voice_turn.py`）→ STT「好きな食べ物はある?」→ Hermes「ラーメンかな」→ TTS 164 frames 実機送信。**ウォーム時 18.3s（STT 0.7s / Hermes 3.1s / TTS 14.6s ※音声 9.8s のリアルタイム送出込み、合成自体 ~5s）。発話終了→声出し ~8.6s**
-- [ ] B6 (実機版): タップ→会話成立の確認【ユーザー帰宅後】
+- [x] B6 (実機版): タップ→会話成立をユーザー確認 (2026-06-10 夜) ✅ **Phase B 完了条件達成**。実測 timings: total 20.1s / 13.7s（録音 30s タイムアウト分は除く）
+- [x] **レイテンシ分析 (2026-06-10)** — 体感 10〜30s の主因は**録音が毎回 30s タイムアウトまで継続**（498 frames）していたこと。タップ停止は firmware 実装済み（`stackchan.cc:2330` listening 中の短タップ → StopListening）だが運用されていなかった。処理自体は STT 1.4〜2.3s + Hermes 2.6〜3.4s + VOICEVOX 合成 2〜4s = 6〜9s。上限定数: firmware `stackchan.cc:2251 LISTEN_TIMEOUT_MS=30000` / gateway `stt/orchestrator.py:63 MAX_DURATION_MS=30000`。AFE VAD は稼働中だが自動停止には未結線（LED 表示のみ、`application.cc:232`）→ 短縮策は Phase C 候補
 - [x] B7: Hermes→gateway MCP 接続 (2026-06-10、**方式(b) 常駐+HTTP MCP で稼働確認済み**) — Streamable HTTP サーバーは upstream 実装済み (`stackchan-mcp serve --transport streamable-http`、:8767) で追加コード不要。`stackchan-gateway.service` 稼働中（`docs/deploy/` に unit、enable 済み）、`~/.hermes/config.yaml` に mcp_servers.stackchan 登録（バックアップ: config.yaml.bak-20260610）。**Hermes が say ツールを MCP 経由で呼び出し、結果を報告するところまで確認済み**（ESP32 未接続のため発話自体は未達）
 - [x] B8 (API_SERVER_KEY): 生成・適用済み — gateway 側 `~/.yorishiro/secrets.env` (HERMES_API_KEY)、Hermes 側 drop-in。キー認証 + `X-Hermes-Session-Id: stackchan-voice` でセッション継続通信を確認。**STACKCHAN_TOKEN は実機確認後に別途**
 - [x] **ESP32 オフラインの原因特定** (2026-06-10) — firmware の `PowerSaveTimer(-1, 60, 300)` が「WS 切断のまま 5 分」で AXP2101 PowerOff を発動（USB 給電でも切れる）。gateway 入れ替え時の切断 >5 分で発動した。タッチでは復帰不可、**電源ボタン（長押し）で起動**
-- [x] **firmware 修正: 自動電源オフ無効化** (2026-06-10, コミット 8490088) — `boards/stackchan/stackchan.cc` を `PowerSaveTimer(-1, 60, -1)` に変更（画面減光は維持、shutdown のみ無効）。**ビルド成功済み**（`build/xiaozhi.bin` 13:47、v2.2.6、mDNS 設定マージ確認済み）。**残: 実機への flash**
+- [x] **firmware 修正: 自動電源オフ無効化** (2026-06-10, コミット 8490088) — `boards/stackchan/stackchan.cc` を `PowerSaveTimer(-1, 60, -1)` に変更（画面減光は維持、shutdown のみ無効）。**ビルド成功済み**（`build/xiaozhi.bin` 13:47、v2.2.6、mDNS 設定マージ確認済み）
+- [x] **実機 flash 完了** (2026-06-10 22:04) — app のみ書き込み（`Hash of data verified.`）、リブート後 gateway へ自動再接続確認（tools=30）。直後に MCP HTTP (:8767) 経由で `say` 実行 → 83 frames 送信成功（B2 実機版、**実音はユーザー確認待ち**）
 
 ## 次セッション再開手順（2026-06-10 clear 時点）
 
