@@ -2246,9 +2246,14 @@ private:
         static int64_t last_release_ms = 0;       // デバウンス用 (= 直前 release 時刻)
         static int64_t listening_started_ms = 0;  // タイムアウト用 (= listening 突入時刻)
         static bool was_listening = false;        // listening 突入のエッジ検出
+        static bool speech_seen = false;          // この listen 中に VAD が一度でも発話検知したか
+        static int64_t last_voice_ms = 0;         // 最後に VAD が発話を報告した時刻
         const int64_t TOUCH_THRESHOLD_MS = 500;   // 触摸时长阈值，超过500ms视为长按
         const int64_t DEBOUNCE_MS = 300;          // 直前 release から N ms 以内の press は無視
         const int64_t LISTEN_TIMEOUT_MS = 30000;  // listening 状態に N ms 以上滞在で auto stop
+        const int64_t VAD_WARMUP_MS = 800;        // listen 突入直後はポップアップ音の自己拾音で
+                                                  // VAD が立つことがあるため判定を保留する
+        const int64_t VAD_SILENCE_STOP_MS = 1200; // 発話検知後、 無音が N ms 続いたら auto stop
 
         auto& app = Application::GetInstance();
         int64_t now_ms = esp_timer_get_time() / 1000;
@@ -2261,6 +2266,8 @@ private:
         bool is_listening = (app.GetDeviceState() == kDeviceStateListening);
         if (is_listening && !was_listening) {
             listening_started_ms = now_ms;
+            speech_seen = false;
+            last_voice_ms = 0;
             ESP_LOGI(TAG, "Listening entered at %d ms (timeout in %d ms)",
                      (int)now_ms, (int)LISTEN_TIMEOUT_MS);
         }
@@ -2272,6 +2279,27 @@ private:
             SetAllRgbLeds(0, 0, 0);
             app.StopListening();
             listening_started_ms = 0;
+        }
+
+        // --- VAD 無音検出による auto stop (再タップ不要化) ---
+        // AFE の VAD (AudioService::voice_detected_) をポーリングし、 発話を
+        // 一度でも検知した後に無音が VAD_SILENCE_STOP_MS 続いたら自動送信する。
+        // 発話を一度も検知していない間は止めない (VAD が不感だった場合に
+        // ユーザーの発話を切り捨てないための保険。 上の 30s タイムアウトが
+        // backstop として残る)。
+        if (is_listening && listening_started_ms != 0 &&
+            (now_ms - listening_started_ms) > VAD_WARMUP_MS) {
+            if (app.IsVoiceDetected()) {
+                speech_seen = true;
+                last_voice_ms = now_ms;
+            } else if (speech_seen &&
+                       (now_ms - last_voice_ms) > VAD_SILENCE_STOP_MS) {
+                ESP_LOGI(TAG, "VAD silence auto-stop (%d ms after last voice)",
+                         (int)(now_ms - last_voice_ms));
+                SetAllRgbLeds(0, 0, 0);
+                app.StopListening();
+                listening_started_ms = 0;
+            }
         }
 
         ft6336_->UpdateTouchPoint();
