@@ -1,3 +1,42 @@
+# Phase C 本体 — C1 近接視線追従 + C2 SwitchBot + C3 応答ルーティング（2026-06-11 着手、ユーザー承認: 3 本並行）
+
+## 調査済みの前提（2026-06-11 サブエージェント調査）
+- **C1**: firmware に近接センサードライバは無い（Si12T は背面タッチ専用、近接モード未使用）。Grove Port A の外部 I2C は MCP ツール `self.i2c.*` 実装済み（`stackchan.cc:5837`）。サーボは `WriteHeadAngles(yaw, pitch, ms)`（`stackchan.cc:3679`）、表情は `SetAvatarExpressionIfActive()`（`stackchan.cc:4381`）、周期反射の実装パターンは Si12T タッチポーリング（100ms esp_timer、`stackchan.cc:4017`）を踏襲可能
+- **C2**: HA はこのマシンにも LAN にも存在しない → **SwitchBot API v1.1 直結の薄い MCP サーバー自作**が現実的。前提は Hub Mini/Hub 2 + 開発者トークン。Hermes には HA REST 直叩きツール（`tools/homeassistant_tool.py`、HASS_TOKEN で有効化）も眠っており、将来 HA を立てれば流用可
+- **Hermes MCP 登録形式**: `~/.hermes/config.yaml` の `mcp_servers.<name>` に url/headers（`${VAR}` 環境変数展開対応、`mcp_tool.py:2234`）
+
+## C-fix: Hermes→gateway MCP 認証修復（回帰・最優先）
+今朝の STACKCHAN_TOKEN 有効化で /mcp が 401 になり、Hermes が 5 回リトライ後 giving up（05:02 ログ確認済み）。
+- [x] Cfix-1: `~/.hermes/config.yaml` バックアップ (config.yaml.bak-20260611) + `mcp_servers.stackchan.headers` に `Authorization: Bearer ${STACKCHAN_TOKEN}` 追加（Hermes は `${VAR}` 展開対応 mcp_tool.py:2234、`~/.hermes/.env` を起動時ロード）
+- [x] Cfix-2: ユーザーが token を `~/.hermes/.env` へ追記（grep で値非表示のまま転記）
+- [x] Cfix-3: 再起動後 /mcp 200 OK、Hermes が MCP ツール呼び出し成功を E2E で確認 (2026-06-11 06:45)
+
+## C1-0: 近接センサー内蔵有無の確認（C1 の分岐点）
+- [x] `mcp_repl.py` で `i2c_scan`（外部 Grove バス）→ 空。**ただしユーザー指摘で CoreS3 内蔵の LTR-553ALS-WA（内部バス 0x23、近接+照度）を発見**（公式 docs.m5stack.com で確認。firmware は未ドライブだった）
+- [x] 方針決定（ユーザー承認）: LTR-553 で「手かざしリフレックス」として実装（有効距離 数cm〜10cm。部屋スケールの視線追従は将来 ToF Unit で拡張可）
+
+## C1: 近接リフレックス（firmware、LTR-553 手かざし）
+- [x] C1-1/C1-2: LTR-553 ドライバ + 検知→首+表情リフレックス実装（stackchan.cc、Si12T パターン踏襲）— 実装済み
+- [ ] C1-3: Docker ビルド検証（実行中）→ app flash → 実機テスト（手をかざすと反応）
+- 設計原則 2 遵守: Hermes/gateway を介さない board ローカル実装
+
+## C2: SwitchBot 家電操作（gateway 内 fork 専用モジュール）
+前提: Hub Mini ×2（リビング・寝室）確認済み、トークンは `~/.yorishiro/secrets.env` に設定済み
+- [x] C2-1: `stackchan_mcp/switchbot.py`（API v1.1、HMAC 署名）+ stdio/HTTP MCP に 3 ツール公開（list_devices / get_status / send_command）。ESP32 キューはバイパス。テスト 19 件
+- [x] C2-2: 新サービス不要 — 既存 :8767 MCP HTTP に同居（Hermes 再登録も不要）。secrets.env は既存 EnvironmentFile で自動ロード
+- [x] C2-3: E2E 成功 (2026-06-11 06:45-06:48) — 音声「デバイスを教えて」→ Hermes が switchbot_list_devices → 実デバイス一覧を音声報告。「リビングの電気をつけて」→ turnOn 実行（実灯確認: ユーザー回答待ち）
+
+## C3: 応答ルーティング層（gateway `hermes_bridge.py` + `local_llm.py`）
+- [x] C3-1: モデル選定 — LFM2.5-1.2B-JP Q4_K_M（warm 0.5s、0.7GB、日本語特化）。gemma3:4b は 1.5-2s で次点
+- [x] C3-2: `decide_route()` 純関数（マーカー語 or >30 文字 → Hermes、短文 → local）+ Ollama 直行パス（keep_alive 30m）。**追加修正: 家電操作ワード（つけて/消して/電気/エアコン等）を Hermes マーカーに追加**（ローカルモデルはツールを呼べないため。C2 との整合）
+- [x] C3-3: フォールバック実装（local 失敗 → Hermes）+ E2E 確認 — route=local で挨拶応答 OK（初回 3.4s はコールドスタート、以降 ~0.5s）。timings キーは hermes → llm に改名、route フィールド追加
+- デプロイ: drop-in `docs/deploy/stackchan-gateway.service.d/local-llm.conf` を /etc に配備済み（外せばロールバック）
+
+## フェーズ完了時
+- [ ] worklog 更新（毎セッション）+ learning-report 作成（ユーザー承認済み）
+
+---
+
 # Phase C-0 — レイテンシ短縮: VAD 無音自動停止（2026-06-10 ユーザー承認: 案1+案3）
 
 ## 前提（調査済み）
