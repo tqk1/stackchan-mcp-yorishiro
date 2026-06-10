@@ -24,8 +24,11 @@
 - [x] B5: voice-turn receiver 実装 (2026-06-10) — `stackchan_mcp/hermes_bridge.py` 新規 + `capture_server.py` に `/voice_turn` ルート 1 箇所追加（fork 独自・upstream 非送付）。`STACKCHAN_AUDIO_HOOK_URL=http://127.0.0.1:8766/voice_turn` で自分自身に向ける構成
 - [x] B6 (シミュレート版): E2E 成功 (2026-06-10) — VOICEVOX 合成音声を firmware と同形式の Ogg/Opus で `/voice_turn` に POST（`scratch/test_voice_turn.py`）→ STT「好きな食べ物はある?」→ Hermes「ラーメンかな」→ TTS 164 frames 実機送信。**ウォーム時 18.3s（STT 0.7s / Hermes 3.1s / TTS 14.6s ※音声 9.8s のリアルタイム送出込み、合成自体 ~5s）。発話終了→声出し ~8.6s**
 - [ ] B6 (実機版): タップ→会話成立の確認【ユーザー帰宅後】
-- [ ] B7: `hermes mcp add stackchan` — Hermes から MCP stdio で say / move_head / take_photo 等を利用可能に（Discord から「StackChan で喋って」が通る）
-- [ ] B8: STACKCHAN_TOKEN + `API_SERVER_KEY`（Hermes セッション継続=会話文脈の維持に必要と判明）の本設定 + ドキュメント更新
+- [x] B7: Hermes→gateway MCP 接続 (2026-06-10、**方式(b) 常駐+HTTP MCP で稼働確認済み**) — Streamable HTTP サーバーは upstream 実装済み (`stackchan-mcp serve --transport streamable-http`、:8767) で追加コード不要。`stackchan-gateway.service` 稼働中（`docs/deploy/` に unit、enable 済み）、`~/.hermes/config.yaml` に mcp_servers.stackchan 登録（バックアップ: config.yaml.bak-20260610）。**Hermes が say ツールを MCP 経由で呼び出し、結果を報告するところまで確認済み**（ESP32 未接続のため発話自体は未達）
+- [x] B8 (API_SERVER_KEY): 生成・適用済み — gateway 側 `~/.yorishiro/secrets.env` (HERMES_API_KEY)、Hermes 側 drop-in。キー認証 + `X-Hermes-Session-Id: stackchan-voice` でセッション継続通信を確認。**STACKCHAN_TOKEN は実機確認後に別途**
+- [ ] **要対応: ESP32 がオフライン** (2026-06-10 13:25 時点) — ping 不達、LAN 上に MAC 44:1b:f6 なし、USB 接続もなし。電源喪失か WiFi 切断フリーズとみられる。**実機の電源入れ直しが必要**。復帰すれば mDNS 発見 → 自動接続（今日の修正で ~13 秒）
+- [x] 追加: mDNS 広告アドレス固定 `STACKCHAN_MDNS_ADVERTISE_ADDR` 実装 (23ef800) — ESP32 接続 ~50s → **13s**
+- [x] 追加: 学習用 worklog 開始 — `docs/worklog/2026-06-10-phase-b-voice.md`（毎セッション継続、memory 登録済み）
 
 ## Phase B での学び・メモ
 - Hermes API はステートレス (`/v1/chat/completions`) なら認証不要だが、**セッション継続 (`X-Hermes-Session-Id`) には `API_SERVER_KEY` 設定が必須**（B8 で対応）
