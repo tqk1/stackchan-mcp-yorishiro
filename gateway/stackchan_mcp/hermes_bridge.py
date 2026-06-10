@@ -204,6 +204,20 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
     if not ogg:
         return web.json_response({"ok": False, "error": "empty body"}, status=400)
 
+    # Opt-in capture dump for diagnosing mic quality (STT/VAD issues).
+    dump_dir = os.getenv("STACKCHAN_VOICE_DUMP_DIR", "")
+    if dump_dir:
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            dump_path = os.path.join(
+                dump_dir, f"voice_turn_{int(time.time())}.ogg"
+            )
+            with open(dump_path, "wb") as fp:
+                fp.write(ogg)
+            logger.info("voice_turn: capture dumped to %s", dump_path)
+        except OSError:
+            logger.exception("voice_turn: capture dump failed")
+
     t0 = time.monotonic()
     try:
         pcm = await asyncio.to_thread(_ogg_opus_to_pcm16k, ogg)
