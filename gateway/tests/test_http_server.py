@@ -462,7 +462,14 @@ async def test_response_correlation_for_two_concurrent_clients() -> None:
 
 @pytest.mark.asyncio
 async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
-    assert BYPASS_TOOLS == frozenset({"get_status"})
+    assert BYPASS_TOOLS == frozenset(
+        {
+            "get_status",
+            "switchbot_list_devices",
+            "switchbot_get_status",
+            "switchbot_send_command",
+        }
+    )
     queue = CommandQueue(capacity=2)
 
     async def dispatch(_item: QueueItem):
@@ -484,6 +491,50 @@ async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
     payload = response.json()
     status = json.loads(payload["result"]["content"][0]["text"])
     assert status["connected"] is True
+    assert queue.depth == 0
+
+
+@pytest.mark.asyncio
+async def test_switchbot_tools_exposed_and_bypass_device_queue(monkeypatch) -> None:
+    """SwitchBot tools are listed over Streamable HTTP and dispatch
+    gateway-locally: no queue entry, no ESP32 — even when the device is
+    disconnected the call reaches the SwitchBot layer (here: the
+    unconfigured-credentials error, not the disconnected-device payload)."""
+    monkeypatch.delenv("SWITCHBOT_TOKEN", raising=False)
+    monkeypatch.delenv("SWITCHBOT_SECRET", raising=False)
+    queue = CommandQueue(capacity=2)
+
+    async def dispatch(_item: QueueItem):
+        raise AssertionError("switchbot tools must bypass the command queue")
+
+    app = build_app(
+        queue,
+        gateway=FakeGateway(connected=False),
+        owner_id="owner-test",
+        host="127.0.0.1",
+        port=8767,
+        dispatch_fn=dispatch,
+    )
+
+    async with _client(app) as client:
+        session_id = await _initialize(client)
+        listing = await client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 5, "method": "tools/list"},
+            headers=_headers(session_id),
+        )
+        response = await _call_tool(
+            client, session_id=session_id, name="switchbot_list_devices"
+        )
+
+    tool_names = {tool["name"] for tool in listing.json()["result"]["tools"]}
+    assert {
+        "switchbot_list_devices",
+        "switchbot_get_status",
+        "switchbot_send_command",
+    } <= tool_names
+    payload = json.loads(response.json()["result"]["content"][0]["text"])
+    assert "SWITCHBOT_TOKEN" in payload["error"]
     assert queue.depth == 0
 
 

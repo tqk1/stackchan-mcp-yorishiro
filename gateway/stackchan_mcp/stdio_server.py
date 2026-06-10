@@ -18,7 +18,7 @@ from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
 from mcp.types import Notification, TextContent, Tool
 
-from . import __version__
+from . import __version__, switchbot
 from .gateway import get_gateway
 from .notify_config import NotifyConfig, load_notify_config
 from .stt import listen_and_transcribe
@@ -363,6 +363,35 @@ async def _dispatch_mcp_tool(
                     text=json.dumps({"error": str(exc)}),
                 )
             ]
+        return [TextContent(type="text", text=json.dumps(result))]
+
+    # SwitchBot tools are gateway-local cloud calls (yorishiro fork,
+    # Phase C) — they never touch the ESP32, so they are handled before
+    # the device_connected guard below.
+    if name in switchbot.TOOL_NAMES:
+        try:
+            if name == "switchbot_list_devices":
+                result = await switchbot.list_devices()
+            elif name == "switchbot_get_status":
+                result = await switchbot.get_device_status(
+                    arguments.get("device_id", "")
+                )
+            else:  # switchbot_send_command
+                result = await switchbot.send_command(
+                    arguments.get("device_id", ""),
+                    arguments.get("command", ""),
+                    arguments.get("parameter", "default"),
+                    arguments.get("command_type", "command"),
+                )
+        except (ValueError, RuntimeError) as exc:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": str(exc)}),
+                )
+            ]
+        if name == "switchbot_send_command":
+            result = {"ok": True, "result": result}
         return [TextContent(type="text", text=json.dumps(result))]
 
     if name == "load_avatar_set":
@@ -1338,6 +1367,106 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         },
                     },
                     "required": ["archive_path", "mode"],
+                },
+            ),
+            Tool(
+                name="switchbot_list_devices",
+                description=(
+                    "List the home's SwitchBot devices via the SwitchBot "
+                    "cloud API (v1.1). Returns 'deviceList' (physical "
+                    "devices: bots, plugs, curtains, sensors, hubs, ...) "
+                    "and 'infraredRemoteList' (IR appliances learned by a "
+                    "hub: lights, AC, TV, ...), each entry with deviceId / "
+                    "deviceName / deviceType (or remoteType). Call this "
+                    "first to resolve a spoken request to a deviceId — "
+                    "e.g. for 「電気つけて」, find the matching light here, "
+                    "then call switchbot_send_command with command "
+                    "'turnOn'. Requires SWITCHBOT_TOKEN / SWITCHBOT_SECRET "
+                    "on the gateway; returns a clear error when unset."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+            Tool(
+                name="switchbot_get_status",
+                description=(
+                    "Get the current status of one physical SwitchBot "
+                    "device (power state, temperature/humidity, battery, "
+                    "etc., depending on deviceType) via the SwitchBot "
+                    "cloud API. Infrared remote devices have no status — "
+                    "use this only for deviceIds from 'deviceList'. Get "
+                    "the deviceId from switchbot_list_devices first."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "device_id": {
+                            "type": "string",
+                            "description": (
+                                "deviceId from switchbot_list_devices "
+                                "(physical devices only)."
+                            ),
+                        },
+                    },
+                    "required": ["device_id"],
+                },
+            ),
+            Tool(
+                name="switchbot_send_command",
+                description=(
+                    "Control a SwitchBot device via the SwitchBot cloud "
+                    "API. Works for both physical devices and infrared "
+                    "remote devices (commandType 'command' covers both; "
+                    "IR appliances support turnOn / turnOff and "
+                    "type-specific commands like setAll). Typical voice "
+                    "flow: 「電気つけて」 → switchbot_list_devices → find "
+                    "the light's deviceId → send command 'turnOn'. Common "
+                    "commands: turnOn, turnOff, toggle, press (Bot), "
+                    "setPosition (Curtain). Use commandType 'customize' "
+                    "with the button name as 'command' for user-defined "
+                    "IR buttons."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "device_id": {
+                            "type": "string",
+                            "description": (
+                                "deviceId from switchbot_list_devices "
+                                "(physical or infrared remote device)."
+                            ),
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": (
+                                "Command name, e.g. 'turnOn', 'turnOff', "
+                                "'press', 'setPosition' — or a custom IR "
+                                "button name with commandType 'customize'."
+                            ),
+                        },
+                        "parameter": {
+                            "type": "string",
+                            "description": (
+                                "Command parameter. Defaults to 'default'. "
+                                "Command-specific, e.g. '0,ff,80' for "
+                                "Curtain setPosition."
+                            ),
+                            "default": "default",
+                        },
+                        "command_type": {
+                            "type": "string",
+                            "description": (
+                                "'command' for standard commands "
+                                "(physical and IR), 'customize' for "
+                                "user-defined IR buttons. Defaults to "
+                                "'command'."
+                            ),
+                            "default": "command",
+                        },
+                    },
+                    "required": ["device_id", "command"],
                 },
             ),
         ]

@@ -26,8 +26,11 @@ from starlette.types import Receive, Scope, Send
 from .notify_config import NotifyConfig
 from .queue import CommandQueue, QueueFull, QueueItem, build_queue_full_error
 from .stdio_server import _dispatch_mcp_tool, create_server
+from .switchbot import TOOL_NAMES as SWITCHBOT_TOOL_NAMES
 
-BYPASS_TOOLS = frozenset({"get_status"})
+# Tools handled gateway-locally (no ESP32 round-trip): they bypass the
+# single-flight device queue and its device_connected guard.
+BYPASS_TOOLS = frozenset({"get_status"}) | SWITCHBOT_TOOL_NAMES
 MCP_HTTP_ALLOWED_HOSTS_ENV = "MCP_HTTP_ALLOWED_HOSTS"
 AUTH_FAILURE_MESSAGE = "Unauthorized: missing or invalid bearer token"
 HOST_FAILURE_MESSAGE = "Forbidden: invalid Host header"
