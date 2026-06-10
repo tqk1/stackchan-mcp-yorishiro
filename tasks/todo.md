@@ -26,7 +26,22 @@
 - [ ] B6 (実機版): タップ→会話成立の確認【ユーザー帰宅後】
 - [x] B7: Hermes→gateway MCP 接続 (2026-06-10、**方式(b) 常駐+HTTP MCP で稼働確認済み**) — Streamable HTTP サーバーは upstream 実装済み (`stackchan-mcp serve --transport streamable-http`、:8767) で追加コード不要。`stackchan-gateway.service` 稼働中（`docs/deploy/` に unit、enable 済み）、`~/.hermes/config.yaml` に mcp_servers.stackchan 登録（バックアップ: config.yaml.bak-20260610）。**Hermes が say ツールを MCP 経由で呼び出し、結果を報告するところまで確認済み**（ESP32 未接続のため発話自体は未達）
 - [x] B8 (API_SERVER_KEY): 生成・適用済み — gateway 側 `~/.yorishiro/secrets.env` (HERMES_API_KEY)、Hermes 側 drop-in。キー認証 + `X-Hermes-Session-Id: stackchan-voice` でセッション継続通信を確認。**STACKCHAN_TOKEN は実機確認後に別途**
-- [ ] **要対応: ESP32 がオフライン** (2026-06-10 13:25 時点) — ping 不達、LAN 上に MAC 44:1b:f6 なし、USB 接続もなし。電源喪失か WiFi 切断フリーズとみられる。**実機の電源入れ直しが必要**。復帰すれば mDNS 発見 → 自動接続（今日の修正で ~13 秒）
+- [x] **ESP32 オフラインの原因特定** (2026-06-10) — firmware の `PowerSaveTimer(-1, 60, 300)` が「WS 切断のまま 5 分」で AXP2101 PowerOff を発動（USB 給電でも切れる）。gateway 入れ替え時の切断 >5 分で発動した。タッチでは復帰不可、**電源ボタン（長押し）で起動**
+- [x] **firmware 修正: 自動電源オフ無効化** (2026-06-10, コミット 8490088) — `boards/stackchan/stackchan.cc` を `PowerSaveTimer(-1, 60, -1)` に変更（画面減光は維持、shutdown のみ無効）。**ビルド成功済み**（`build/xiaozhi.bin` 13:47、v2.2.6、mDNS 設定マージ確認済み）。**残: 実機への flash**
+
+## 次セッション再開手順（2026-06-10 clear 時点）
+
+1. **実機復帰**: ユーザーが電源ボタン（長押し）で起動 → 自動で gateway へ接続（~13 秒）。`journalctl -u stackchan-gateway -f` で確認
+2. **flash（ユーザーが USB 接続したら、電源オフ無効化の根治に必要）**: app のみで WiFi 設定は保持される:
+   `~/.venvs/esptool/bin/esptool --port /dev/ttyACM0 --baud 460800 write-flash 0x20000 firmware/build/xiaozhi.bin`
+   ※シリアルポートを開くだけでリセットされる点に注意（todo の Phase B-0 学び参照）
+3. **実機確認（B2/B3/B6 実機版）**: ①`say` で音出し（Hermes API 経由か、service を止めて mcp_repl.py）②画面タップ→話す→タップ→返事 ③Discord で Hermes に「StackChan で喋って」
+4. その後: STACKCHAN_TOKEN 設定（B8 残り）、Phase B クローズ → worklog 更新・learning-report 提案
+
+### 現在の常駐構成（全部 systemd、自動起動）
+- `voicevox.service` (:50021) / `stackchan-gateway.service` (:8765 WS, :8766 capture+voice_turn, :8767 MCP HTTP) / `hermes-gateway.service` (Discord + :8642 API)
+- Hermes→gateway は MCP 登録済み（`~/.hermes/config.yaml` mcp_servers.stackchan）。秘匿値は `~/.yorishiro/secrets.env`
+- 開発時に gateway を手で動かす場合: `sudo systemctl stop stackchan-gateway` してから `scratch/mcp_repl.py`
 - [x] 追加: mDNS 広告アドレス固定 `STACKCHAN_MDNS_ADVERTISE_ADDR` 実装 (23ef800) — ESP32 接続 ~50s → **13s**
 - [x] 追加: 学習用 worklog 開始 — `docs/worklog/2026-06-10-phase-b-voice.md`（毎セッション継続、memory 登録済み）
 
