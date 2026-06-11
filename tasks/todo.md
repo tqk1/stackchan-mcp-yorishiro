@@ -1,4 +1,4 @@
-# ✅ Phase D クローズ済み(2026-06-11 23:10)
+# ✅ Phase D 完全クローズ(2026-06-12 朝、E2E 完了)
 
 **D4「Hermes が gateway の MCP ツールを呼ばない問題」は経路分離で解決**:
 
@@ -7,10 +7,10 @@
 - 詳細: `docs/phase-d-report.md`(レポート)、`docs/worklog/2026-06-11-phase-d-autonomy.md` §6(作業ログ)
 - バックアップ: `/home/kenji/.hermes/config.yaml.bak-20260611-phaseD`
 
-## 残りの宿題(声を出しやすい時間帯に再検証)
-1. **メモ単体 E2E**: 「○○のことメモして」発話 → `~/.stackchan/notes/*.md` 生成確認、agent.log で `mcp_stackchan_write_note` の CallToolRequest 確認
-2. **検索単体 E2E**: 「○○のニュース調べて」発話 → agent.log で `mcp_stackchan_web_search` の CallToolRequest 確認
-3. **Tavily API キー登録(任意・推奨)**: `~/.yorishiro/secrets.env` に `TAVILY_API_KEY=tvly-...`(未設定でも ddgs フォールバックで動く)
+## 宿題 E2E 結果(2026-06-12 朝、ユーザー実機検証)
+1. ✅ **メモ単体 E2E**: 06:19 `~/.stackchan/notes/メモ.md`(内容「牛乳を買う」)生成、agent.log: `mcp_stackchan_write_note completed (0.01s, 158 chars)`
+2. ✅ **検索単体 E2E**: 06:19 agent.log: `mcp_stackchan_web_search completed (3.44s, 5286 chars)` — 速度から Tavily 経路で稼働中
+3. ✅ **Tavily API キー登録**: `~/.yorishiro/secrets.env` に `TAVILY_API_KEY=` 設定済み
 
 ## 遠い将来の TODO
 - 外部クライアント(Claude Code 等)から `/v1/chat/completions` で `terminal` が必要になったら、案 C(`HERMES_HOME` プロファイル分離)に切替。詳細は `docs/phase-d-report.md` §4.2

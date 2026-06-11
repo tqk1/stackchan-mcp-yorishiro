@@ -206,6 +206,18 @@ print('discord    :', sorted(_get_platform_tools(cfg, 'discord')))
 
 ### 6.6 フォローアップ（声を出しやすい時間帯に）
 
-- [ ] メモ単体 E2E: 「○○のことメモして」発話 → `~/.stackchan/notes/*.md` 生成確認、agent.log で `mcp_stackchan_write_note` の CallToolRequest 確認
-- [ ] 検索単体 E2E: 「○○のニュース調べて」発話 → agent.log で `mcp_stackchan_web_search` の CallToolRequest 確認
+- [x] メモ単体 E2E: 2026-06-12 06:19 — `~/.stackchan/notes/メモ.md`（内容「牛乳を買う」）生成、agent.log で `tool mcp_stackchan_write_note completed (0.01s, 158 chars)` を確認
+- [x] 検索単体 E2E: 2026-06-12 06:19 — agent.log で `tool mcp_stackchan_web_search completed (3.44s, 5286 chars)` を確認。`TAVILY_API_KEY` 設定済みで、応答時間（3.44s）から Tavily 経路で実行されたと判定（ddgs フォールバックなら通常さらに遅い）
 - どちらも失敗時は `~/.hermes/logs/agent.log` の該当ターンを transcript 単位で diff し、Hermes 側のツール選択を可視化する
+
+## 7. Phase D 最終 E2E（2026-06-12 朝、宿題クリア）
+
+D4 で構造的解決（`platform_toolsets.api_server`）は確定していたが、声を出しにくい時間帯のため単体 E2E は未取得だった。朝に再検証し、メモ・検索ともに狙ったツール名で CallToolRequest を観測できた。
+
+| 項目 | 結果 |
+|---|---|
+| メモ E2E | ✅ `~/.stackchan/notes/メモ.md`「牛乳を買う」生成、`mcp_stackchan_write_note` 0.01s |
+| 検索 E2E | ✅ `mcp_stackchan_web_search` 3.44s, 5286 chars（Tavily 経路） |
+| Tavily キー | ✅ `~/.yorishiro/secrets.env` に `TAVILY_API_KEY=` 設定済み |
+
+これで Phase D の宿題ゼロ、完全クローズ。残る将来課題は C1 ToF Unit（VL53L0X）購入判断と、外部クライアントから `/v1/chat/completions` で `terminal` が必要になった時の案 C（プロファイル分離）切替のみ。
