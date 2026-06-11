@@ -35,7 +35,7 @@
 - デプロイ: drop-in `docs/deploy/stackchan-gateway.service.d/local-llm.conf` を /etc に配備済み（外せばロールバック）
 
 ## フェーズ完了時
-- [ ] worklog 更新（毎セッション）+ learning-report 作成（ユーザー承認済み）
+- [x] worklog 更新 + learning-report 作成 (2026-06-11) — `docs/phase-c-report.md`（Phase A/B レポートと同テイスト、約370行）。**Phase C クローズ**（C1 のみ ToF Unit 購入待ちで持ち越し）
 
 ---
 
