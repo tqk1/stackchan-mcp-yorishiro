@@ -1,3 +1,44 @@
+# Phase D — 自律性: heartbeat + Hermes MCP ツール追加 + LFM2.5 役割拡大（2026-06-11 着手）
+
+## ユーザー決定事項（2026-06-11 AskUserQuestion で確認済み）
+- **スコープ**: 全部。D1 heartbeat → D2 MCP ツール追加 → D3 LFM2.5 役割拡大検討の順に段階実施
+- **heartbeat 挙動**: 段階導入。**第1段階は非音声のみ**（表情・首・LED、無音）。発話ありは動作が安定してから opt-in で追加（原則1「夫婦の会話に割り込まない」に配慮）
+- **検索バックエンド**: **Tavily 主**（無料 1,000 クレジット/月、クレカ不要、要 TAVILY_API_KEY）+ **ddgs フォールバック**（キー未設定・障害時に自動切替）
+- **learning-report**: Phase D 完了時に作成する（docs/phase-d-report.md）
+
+## 調査済みの前提（2026-06-11 サブエージェント調査）
+- gateway に定期実行の仕組みは皆無 → heartbeat は asyncio 周期タスクの新規実装。`Gateway.start()` 内で `asyncio.create_task()` する形が最短
+- gateway → Hermes 方向は `hermes_bridge.py` の `ask_hermes()`（OpenAI 互換 :8642）実装済み → **heartbeat は gateway 側スケジューラに置けば原則4「Hermes は reactive のまま」を守れる**
+- push 送信基盤あり: `ESP32Manager._connection` + `ESP32Connection` の WS send。MCP ツール（set_avatar / move_head / set_led 等）は gateway 内から直接呼べる
+- 発火ガードが必要: ESP32 接続中か / 音声パイプライン（TTS/listen）非稼働か / クワイエットアワー
+- MCP ツールは現在 31 個（stdio_server.py の list_tools）。検索・ファイルツールはここに追加
+
+## D1: heartbeat（非音声・第1段階）
+- [x] D1-1: `stackchan_mcp/heartbeat.py` 新規 (2026-06-11) — asyncio 周期タスク、`Gateway.start()` で起動 / `stop()` でキャンセル。**opt-in**: `STACKCHAN_HEARTBEAT_INTERVAL_MIN` 未設定なら完全無効。ジッター ±25%（`STACKCHAN_HEARTBEAT_JITTER`）
+- [x] D1-2: 発火ガード実装 — ①device_connected ②tts_lock.locked()（TTS/listen 共用ロック）③クワイエットアワー（跨ぎ対応、デフォルト 22:00-08:00）。スキップは次 tick 待ち
+- [x] D1-3: 仕草 3 種（見回し/表情/うなずき、全て無音・Hermes 不使用）。首は get_head_angles で元角度に復帰、読めなければ首は動かさない。仕草失敗でもループは死なない
+- [~] D1-4: 単体テスト 22 件 ✅ / **実機 E2E はユーザーの sudo 作業待ち**（手順: docs/worklog/2026-06-11-phase-d-autonomy.md §5。1分間隔 drop-in → 仕草確認 → 本運用 heartbeat.conf へ差し替え）
+- 将来（第2段階、今回はやらない）: `STACKCHAN_HEARTBEAT_SPEAK=1` で Hermes に文脈を渡して一言生成 → say。クワイエットアワー必須のまま
+
+## D2: Hermes MCP ツール追加（検索・ファイル）
+- [x] D2-1: `stackchan_mcp/web_search.py` (2026-06-11) — Tavily REST 直叩き（aiohttp、新依存なし、Bearer 認証）→ 失敗/未設定時 ddgs 自動フォールバック。extra `search`（ddgs>=9）追加、.venv に sync 済み。**ddgs 実検索スモーク成功**（日本語クエリ OK）
+- [ ] D2-2: ユーザー作業 — Tavily にメール登録し `TAVILY_API_KEY` を `~/.yorishiro/secrets.env` へ追記（キー未設定でも ddgs で動く）
+- [x] D2-3: `stackchan_mcp/notes.py` (2026-06-11) — `~/.stackchan/notes/` 配下限定（`STACKCHAN_NOTES_DIR` で変更可）の write_note（append 対応）/ read_note / list_notes。パストラバーサル防止・256KB 上限・.md/.txt のみ。stdio/HTTP MCP に計 4 ツール公開（BYPASS_TOOLS 入り、計 35 ツール）
+- [~] D2-4: 単体テスト 19 件 ✅ / **Hermes 経由 E2E は gateway 再起動（sudo）後に**（音声で「〜を調べて」→ web_search → 音声報告 / 「メモして」→ write_note）
+- ESP32 キューはバイパス（SwitchBot ツールと同パターン）
+
+## D3: LFM2.5 役割拡大検討（検証中心、コードは最小）
+- [ ] D3-1: VRAM 同時稼働の実測 — LFM2.5 常駐（0.7GB）+ TTS/STT 稼働時の nvidia-smi 記録（faster-whisper は CPU int8 なので競合は限定的の見込み → 実証する）
+- [ ] D3-2: ルーティング閾値拡大の検討 — 30 文字制限・マーカー語の見直し余地を実データ（event log）で評価。所見をレポートへ。閾値変更する場合は定数調整のみ
+- [ ] D3-3: heartbeat 第2段階での LFM2.5 活用可否を所見としてまとめる（一言生成をローカルで賄えるか）
+
+## フェーズ完了時
+- [ ] worklog 更新（docs/worklog/2026-06-11-phase-d-autonomy.md、セッション中随時）
+- [ ] learning-report 作成（docs/phase-d-report.md、Phase A/B/C と同テイスト）
+- [ ] CLAUDE.md の開発ステータス更新
+
+---
+
 # Phase C 本体 — C1 近接視線追従 + C2 SwitchBot + C3 応答ルーティング（2026-06-11 着手、ユーザー承認: 3 本並行）
 
 ## 調査済みの前提（2026-06-11 サブエージェント調査）
