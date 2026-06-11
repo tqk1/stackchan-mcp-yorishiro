@@ -28,9 +28,9 @@
 - ESP32 キューはバイパス（SwitchBot ツールと同パターン）
 
 ## D3: LFM2.5 役割拡大検討（検証中心、コードは最小）
-- [ ] D3-1: VRAM 同時稼働の実測 — LFM2.5 常駐（0.7GB）+ TTS/STT 稼働時の nvidia-smi 記録（faster-whisper は CPU int8 なので競合は限定的の見込み → 実証する）
-- [ ] D3-2: ルーティング閾値拡大の検討 — 30 文字制限・マーカー語の見直し余地を実データ（event log）で評価。所見をレポートへ。閾値変更する場合は定数調整のみ
-- [ ] D3-3: heartbeat 第2段階での LFM2.5 活用可否を所見としてまとめる（一言生成をローカルで賄えるか）
+- [x] D3-1: VRAM 確認 (2026-06-11) — **競合は実質なし**。GPU 利用者は Ollama (LFM2.5 0.7GB) のみ（faster-whisper=CPU int8、VOICEVOX=CPU、アイドル時 0 MiB / 6144 MiB）。同時稼働の懸念は解消
+- [x] D3-2: ルーティング実績評価 (2026-06-11) — journalctl 集計: route=local 2 件 / hermes 6 件。**閾値拡大はデータ不足で時期尚早**（運用データ蓄積後に再評価）。代わりに**コールドスタート問題を発見**: local の llm 実測 2.8〜3.4s（warm 0.5s のはずが、keep_alive=30m 切れで毎回コールドロード）。**推奨: drop-in に `STACKCHAN_LOCAL_LLM_KEEP_ALIVE=24h` 追加**（コード変更不要、0.7GB 常駐は VRAM 的に許容）→ ユーザー承認後に適用
+- [x] D3-3: heartbeat 第2段階の所見 — LFM2.5 はツール呼び出し不可だが「一言生成」なら適役。VRAM 余裕も確認済みで実現性あり（実装は将来の opt-in 段階で）
 
 ## フェーズ完了時
 - [ ] worklog 更新（docs/worklog/2026-06-11-phase-d-autonomy.md、セッション中随時）

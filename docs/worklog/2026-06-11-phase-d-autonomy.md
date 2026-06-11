@@ -17,7 +17,7 @@
 **結果**:
 - ✅ **D1**: `heartbeat.py` 実装 + 単体テスト。実機 E2E はユーザーの sudo 作業待ち（手順は §5）
 - ✅ **D2**: `web_search.py`（Tavily + ddgs）と `notes.py`（write/read/list_note）を実装、MCP ツール 4 つ追加（計 35 ツール）。ddgs 実検索スモーク成功。Tavily はユーザーの API キー登録待ち
-- 🔜 **D3**: VRAM 実測・ルーティング閾値の検討（実機検証と合わせて実施）
+- ✅ **D3**: VRAM 競合は実質なし（GPU は LFM2.5 0.7GB のみ、whisper/VOICEVOX は CPU）。ルーティング閾値拡大はデータ不足（local 2件）で見送り。代わりに**コールドスタート問題を発見** — keep_alive=30m 切れで local の llm が 2.8〜3.4s（warm なら 0.5s）。`STACKCHAN_LOCAL_LLM_KEEP_ALIVE=24h` への変更を推奨（コード不要、drop-in 1 行）
 - テスト: **567 件全パス**（うち新規 41 件: heartbeat / web_search / notes）
 
 ---
