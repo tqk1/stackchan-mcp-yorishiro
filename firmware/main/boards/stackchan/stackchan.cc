@@ -498,6 +498,132 @@ private:
     }
 };
 
+// Minimal LTR-553ALS-WA driver (Lite-On ambient light + proximity sensor,
+// built into the CoreS3 front panel). Phase C1 only needs the proximity (PS)
+// channel, so the ALS side is left in its power-up standby state.
+//
+// Datasheet excerpt (Lite-On BNS-OD-C131/A4 Rev 1.0, 22 May 2013):
+//   - I2C 7-bit address: 0x23 (write 0x46 / read 0x47).
+//   - PART_ID (0x86, RO) = 0x92, MANUFAC_ID (0x87, RO) = 0x05. Used by
+//     Begin() to validate the device before any configuration write.
+//   - PS_CONTR (0x81): bits[1:0] = PS mode, 00 = standby (power-up default),
+//     10 / 11 = active. Bits[3:2] = PS gain (00 = x16 default, 10 = x32,
+//     11 = x64). Bit[5] = PS Saturation Indicator Enable; PS_DATA_1[7]
+//     always reads 0 unless this bit is set.
+//   - PS_LED (0x82, default 0x7F): bits[7:5] LED pulse freq (011 = 60 kHz),
+//     bits[4:3] duty (11 = 100%), bits[2:0] peak current (111 = 100 mA... the
+//     datasheet table tops out at 100 mA for codes 100..111).
+//   - PS_N_PULSES (0x83, default 0x01): LED pulse count per measurement,
+//     bits[3:0] = 0001..1111 (1..15 pulses).
+//   - PS_MEAS_RATE (0x84, default 0x02 = 100 ms): PS_DATA update interval
+//     in active mode. We program 0x00 (50 ms) so the 100 ms reflex poll
+//     never reads the same stale measurement twice.
+//   - PS_DATA_0 (0x8D) / PS_DATA_1 (0x8E): 11-bit PS value, low byte in
+//     PS_DATA_0, upper 3 bits in PS_DATA_1[2:0]; PS_DATA_1[7] is the
+//     saturation flag. Both registers are locked for the duration of one
+//     I2C read operation, so a single 2-byte burst read starting at 0x8D
+//     yields a coherent sample.
+//   - Timing: initial start-up 100 ms (max), standby-to-active wake-up
+//     10 ms (max). Both are covered by the boot sequence + the first
+//     poll tick landing >= PROX_POLL_MS after Begin().
+class Ltr553 : public I2cDevice {
+public:
+    static constexpr uint8_t DEFAULT_ADDR = 0x23;
+
+    Ltr553(i2c_master_bus_handle_t i2c_bus, uint8_t addr = DEFAULT_ADDR)
+        : I2cDevice(i2c_bus, addr) {}
+
+    // Probe the chip via PART_ID / MANUFAC_ID, then configure and activate
+    // the PS channel. Returns true on success.
+    bool Begin() {
+        uint8_t part_id = 0;
+        if (!SafeReadReg(REG_PART_ID, &part_id) || part_id != EXPECTED_PART_ID) {
+            ESP_LOGW("Ltr553", "PART_ID mismatch: got 0x%02X want 0x%02X",
+                     part_id, EXPECTED_PART_ID);
+            return false;
+        }
+        uint8_t manufac_id = 0;
+        if (!SafeReadReg(REG_MANUFAC_ID, &manufac_id) ||
+            manufac_id != EXPECTED_MANUFAC_ID) {
+            ESP_LOGW("Ltr553", "MANUFAC_ID mismatch: got 0x%02X want 0x%02X",
+                     manufac_id, EXPECTED_MANUFAC_ID);
+            return false;
+        }
+        // Maximum-sensitivity PS setup: the CoreS3 front panel sits between
+        // the sensor and the target, so the IR round-trip is heavily
+        // attenuated (real-device Phase C1 bring-up read ps_raw=0 even with
+        // a hand at the sensor window using the power-up defaults).
+        // LED drive: 60 kHz / 100% duty / 100 mA peak — already the table
+        // maximum, written explicitly for visibility.
+        if (!SafeWriteReg(REG_PS_LED, 0x7F)) return false;
+        // 15 LED pulses per measurement (table maximum; default is 1).
+        // More pulses integrate more reflected IR energy per sample.
+        if (!SafeWriteReg(REG_PS_N_PULSES, 0x0F)) return false;
+        // PS measurement repeat rate 50 ms (faster than the 100 ms poll).
+        if (!SafeWriteReg(REG_PS_MEAS_RATE, 0x00)) return false;
+        // PS active mode (bits1:0 = 11), gain x64 (bits3:2 = 11, table
+        // maximum; default x16), saturation indicator enabled (bit5 = 1)
+        // so PS_DATA_1[7] is meaningful — needed to tell "panel blocks
+        // all IR" (ps_raw stays 0) apart from "IC saturates" (flag set).
+        if (!SafeWriteReg(REG_PS_CONTR, 0x2F)) return false;
+        ESP_LOGI("Ltr553", "init OK: part_id=0x%02X manufac_id=0x%02X "
+                 "(PS active, gain x64, 15 pulses, 50 ms rate, sat indicator on)",
+                 part_id, manufac_id);
+        return true;
+    }
+
+    // Single-shot PS read. Returns the 11-bit raw value (0..2047) or -1 on
+    // I2C failure. The 2-byte burst read keeps the sample coherent (the
+    // chip locks PS_DATA_0/1 for the duration of one read operation).
+    // If `saturated` is non-null it receives PS_DATA_1[7] (the saturation
+    // flag; only meaningful with PS_CONTR bit5 set, which Begin() does).
+    int ReadPsRaw(bool* saturated = nullptr) {
+        uint8_t buf[2] = {0, 0};
+        uint8_t reg = REG_PS_DATA_0;
+        esp_err_t err = i2c_master_transmit_receive(i2c_device_, &reg, 1,
+                                                    buf, 2, 100);
+        if (err != ESP_OK) {
+            ESP_LOGW("Ltr553", "I2C PS data read failed: 0x%X", err);
+            return -1;
+        }
+        if (saturated != nullptr) {
+            *saturated = (buf[1] & 0x80) != 0;
+        }
+        return ((buf[1] & 0x07) << 8) | buf[0];
+    }
+
+private:
+    static constexpr uint8_t REG_PS_CONTR     = 0x81;
+    static constexpr uint8_t REG_PS_LED       = 0x82;
+    static constexpr uint8_t REG_PS_N_PULSES  = 0x83;
+    static constexpr uint8_t REG_PS_MEAS_RATE = 0x84;
+    static constexpr uint8_t REG_PART_ID      = 0x86;
+    static constexpr uint8_t REG_MANUFAC_ID   = 0x87;
+    static constexpr uint8_t REG_PS_DATA_0    = 0x8D;
+
+    static constexpr uint8_t EXPECTED_PART_ID    = 0x92;
+    static constexpr uint8_t EXPECTED_MANUFAC_ID = 0x05;
+
+    bool SafeReadReg(uint8_t reg, uint8_t* out) {
+        esp_err_t err = i2c_master_transmit_receive(i2c_device_, &reg, 1, out, 1, 100);
+        if (err != ESP_OK) {
+            ESP_LOGW("Ltr553", "I2C read reg 0x%02X failed: 0x%X", reg, err);
+            return false;
+        }
+        return true;
+    }
+
+    bool SafeWriteReg(uint8_t reg, uint8_t value) {
+        uint8_t buffer[2] = {reg, value};
+        esp_err_t err = i2c_master_transmit(i2c_device_, buffer, 2, 100);
+        if (err != ESP_OK) {
+            ESP_LOGW("Ltr553", "I2C write reg 0x%02X failed: 0x%X", reg, err);
+            return false;
+        }
+        return true;
+    }
+};
+
 class StackChanBoard : public WifiBoard {
 private:
     // Internal I2C bus (shared by AXP2101 / AW9523 / FT6336 / PY32 / Si12T /
@@ -704,6 +830,56 @@ private:
     // with press judged via debounce, etc.).
     bool       press_start_zones_[3] = {false, false, false};
     uint8_t    press_start_output1_raw_ = 0;
+
+    // Phase C1: LTR-553ALS-WA proximity hand-wave reflex.
+    // The CoreS3 front panel carries an LTR-553 (IR-reflective proximity +
+    // ambient light) on the internal I2C bus at 0x23. Polling every
+    // PROX_POLL_MS reads the 11-bit PS value; PROX_DEBOUNCE_SAMPLES
+    // consecutive over-threshold samples confirm a "hand near" rising edge,
+    // which triggers a board-local reflex (look up front + happy face) —
+    // no Hermes / gateway round-trip, per the design principle that
+    // low-level reflexes stay on the firmware. A rising-edge-only trigger
+    // plus PROX_COOLDOWN_MS keeps a hand held over the sensor (or repeated
+    // waving) from firing a chain of reactions.
+    // Reflex disabled (2026-06-11 real-hardware finding): the StackChan
+    // front shell has no opening for the LTR-553 window — a hand directly
+    // over the camera area leaves ps_raw flat at the ~380 panel-crosstalk
+    // baseline even at gain x64 / 15 pulses, so a hand can never be seen.
+    // The driver and the ps_raw diagnostics stay (harmless, and useful if
+    // the shell is ever opened up); room-scale proximity will come from an
+    // external ToF unit on Grove Port A instead.
+    static constexpr bool PROX_REFLEX_ENABLED  = false;
+    static constexpr int PROX_POLL_MS          = 100;  // same cadence as touch poll
+    static constexpr int PROX_PS_THRESHOLD     = 700;  // raw PS counts (0..2047).
+                                                       // Above the observed panel
+                                                       // crosstalk baseline (~380)
+                                                       // so NEAR/FAR logs stay
+                                                       // meaningful if re-enabled.
+    static constexpr int PROX_DEBOUNCE_SAMPLES = 3;    // ~300 ms confirm; rejects
+                                                       // single-sample IR glints
+    static constexpr int PROX_COOLDOWN_MS      = 5000; // min gap between reflexes
+    static constexpr int PROX_REACT_YAW_DEG    = 0;    // face front...
+    static constexpr int PROX_REACT_PITCH_DEG  = 60;   // ...and slightly up
+                                                       // (rest pose is 45)
+    // ps_raw DEBUG-level dump cadence (20 x 100 ms = 2 s); enable with
+    // esp_log_level_set when re-calibrating.
+    static constexpr int PROX_DEBUG_LOG_TICKS  = 20;
+
+    std::unique_ptr<Ltr553> ltr553_;
+    bool ltr553_ok_ = false;
+    esp_timer_handle_t prox_poll_timer_ = nullptr;
+
+    // Proximity detection state (single-thread access from the
+    // prox_poll_timer_ callback on ESP_TIMER_TASK, same model as the
+    // Si12T touch state above).
+    int      prox_over_count_ = 0;          // consecutive over-threshold polls
+    bool     prox_detected_prev_ = false;   // last debounced state
+    uint64_t prox_cooldown_until_us_ = 0;   // suppress reflex until this ts
+    int      prox_debug_tick_count_ = 0;    // TEMP DEBUG: 2 s log cadence
+    // Latest raw PS sample for MCP visibility (read by get_touch_state on
+    // the MCP task; benign torn-read trade-off identical to
+    // last_output1_raw_).
+    int      last_ps_raw_ = -1;             // -1 until the first good sample
 
     // Servo wobble sub-state. Keeps the previously-set angles untouched
     // before/after the wobble so that an external set_head_angles call is
@@ -4027,6 +4203,103 @@ private:
         ESP_LOGI(TAG, "Si12T touch poll started (%d ms interval)", TOUCH_POLL_MS);
     }
 
+    // ---- Phase C1: proximity (LTR-553) sensing + hand-wave reflex --------
+
+    // Board-local reflex on a confirmed "hand near" rising edge: look up
+    // front + happy face, then auto-revert to idle after REACTION_HOLD_MS.
+    // Mirrors HandleStroke(); WriteHeadAngles takes motion_mutex_ internally
+    // and is safe to call from the ESP_TIMER_TASK poll callback.
+    void HandleProximity(int ps_raw) {
+        ESP_LOGI(TAG, "proximity event: HAND ps_raw=%d (threshold=%d) -> look up",
+                 ps_raw, PROX_PS_THRESHOLD);
+        WriteHeadAngles(PROX_REACT_YAW_DEG, PROX_REACT_PITCH_DEG);
+        SetAvatarExpressionIfActive("happy");
+        ScheduleIdleRevert();
+    }
+
+    static void ProximityPollCb(void* arg) {
+        StackChanBoard* self = static_cast<StackChanBoard*>(arg);
+        self->ProximityPollTick();
+    }
+
+    // PROX_POLL_MS periodic poll. Reads the 11-bit PS value, requires
+    // PROX_DEBOUNCE_SAMPLES consecutive over-threshold samples to confirm
+    // detection, and fires the reflex on the rising edge only (a held hand
+    // produces no new edge; PROX_COOLDOWN_MS additionally gates re-fires
+    // from repeated waving). Detection-state changes are logged with the
+    // raw PS value to support threshold calibration on real hardware.
+    void ProximityPollTick() {
+        if (!ltr553_ok_ || ltr553_ == nullptr) {
+            return;
+        }
+        bool saturated = false;
+        int ps = ltr553_->ReadPsRaw(&saturated);
+        if (ps < 0) {
+            return;  // transient I2C failure; keep previous state
+        }
+        last_ps_raw_ = ps;
+
+        // Periodic raw dump every 2 s, DEBUG level (calibration done
+        // 2026-06-11: panel-crosstalk baseline ~380, hand invisible).
+        if (++prox_debug_tick_count_ >= PROX_DEBUG_LOG_TICKS) {
+            prox_debug_tick_count_ = 0;
+            ESP_LOGD(TAG, "proximity debug: ps_raw=%d sat=%d (threshold=%d)",
+                     ps, saturated ? 1 : 0, PROX_PS_THRESHOLD);
+        }
+
+        if (ps >= PROX_PS_THRESHOLD) {
+            if (prox_over_count_ < PROX_DEBOUNCE_SAMPLES) {
+                prox_over_count_++;
+            }
+        } else {
+            prox_over_count_ = 0;
+        }
+        bool detected = prox_over_count_ >= PROX_DEBOUNCE_SAMPLES;
+        if (detected != prox_detected_prev_) {
+            // Calibration aid: one INFO line per state change with the raw
+            // value that caused it.
+            ESP_LOGI(TAG, "proximity state: %s ps_raw=%d sat=%d (threshold=%d)",
+                     detected ? "NEAR" : "FAR", ps, saturated ? 1 : 0,
+                     PROX_PS_THRESHOLD);
+        }
+        if (PROX_REFLEX_ENABLED && detected && !prox_detected_prev_) {
+            uint64_t now_us = esp_timer_get_time();
+            if (now_us >= prox_cooldown_until_us_) {
+                HandleProximity(ps);
+                prox_cooldown_until_us_ =
+                    now_us + (uint64_t)PROX_COOLDOWN_MS * 1000ULL;
+            } else {
+                ESP_LOGI(TAG, "proximity reflex suppressed (cooldown, %d ms left)",
+                         (int)((prox_cooldown_until_us_ - now_us) / 1000ULL));
+            }
+        }
+        prox_detected_prev_ = detected;
+    }
+
+    void InitializeLtr553Proximity() {
+        ESP_LOGI(TAG, "Init LTR-553 proximity sensor (I2C addr 0x%02X)",
+                 Ltr553::DEFAULT_ADDR);
+        ltr553_ = std::unique_ptr<Ltr553>(new Ltr553(i2c_bus_));
+        ltr553_ok_ = ltr553_->Begin();
+        if (!ltr553_ok_) {
+            ESP_LOGW(TAG, "LTR-553 not detected; proximity reflex disabled (other features unaffected)");
+            ltr553_.reset();
+            return;
+        }
+
+        esp_timer_create_args_t poll_args = {
+            .callback = &StackChanBoard::ProximityPollCb,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "prox_poll",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&poll_args, &prox_poll_timer_));
+        ESP_ERROR_CHECK(esp_timer_start_periodic(prox_poll_timer_,
+                                                 (uint64_t)PROX_POLL_MS * 1000));
+        ESP_LOGI(TAG, "LTR-553 proximity poll started (%d ms interval)", PROX_POLL_MS);
+    }
+
     // Map a face name to AvatarSet's 0-indexed slot, or -1 if unknown.
     static int FaceNameToIndex(const char* face) {
         if (face == nullptr) return -1;
@@ -5637,10 +5910,16 @@ private:
         // Phase 7: head-touch (Si12T). Returns the latest debounced zone
         // states plus the most recent gesture event. Polled by the MCP client
         // to notice TAP/STROKE on the head without holding open a stream.
+        // Phase C1 piggy-backs the latest LTR-553 proximity raw value here
+        // (proximity_available / ps_raw) instead of adding a dedicated tool —
+        // both values come from the same kind of poll-timer snapshot and the
+        // gateway already calls this tool for sensor visibility.
         mcp_server.AddTool(
             "self.touch.get_touch_state",
             "Get the current head-touch sensor state and last gesture event "
-            "(tap/stroke/idle) with its age in milliseconds.",
+            "(tap/stroke/idle) with its age in milliseconds. Also reports the "
+            "latest proximity sensor raw value (ps_raw, 0..2047; -1 before "
+            "the first sample) for hand-wave threshold calibration.",
             PropertyList(),
             [this](const PropertyList& properties) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -5649,6 +5928,8 @@ private:
                 cJSON_AddBoolToObject(root, "zone1", last_zone_snapshot_[1]);
                 cJSON_AddBoolToObject(root, "zone2", last_zone_snapshot_[2]);
                 cJSON_AddNumberToObject(root, "raw", last_output1_raw_);
+                cJSON_AddBoolToObject(root, "proximity_available", ltr553_ok_);
+                cJSON_AddNumberToObject(root, "ps_raw", last_ps_raw_);
                 const char* ev = "idle";
                 switch (last_event_) {
                     case TouchEvent::TAP:    ev = "tap";    break;
@@ -6330,6 +6611,7 @@ public:
         InitializeIOExpander();
         InitializeServo();
         InitializeSi12tTouch();
+        InitializeLtr553Proximity();
         I2cDetect();
         // Avatar auto-display disabled: WiFi config UI needs to be visible.
         // Avatar is shown on-demand via MCP set_avatar command.
