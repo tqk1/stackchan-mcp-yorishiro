@@ -15,10 +15,12 @@
 - [x] `mcp_repl.py` で `i2c_scan`（外部 Grove バス）→ 空。**ただしユーザー指摘で CoreS3 内蔵の LTR-553ALS-WA（内部バス 0x23、近接+照度）を発見**（公式 docs.m5stack.com で確認。firmware は未ドライブだった）
 - [x] 方針決定（ユーザー承認）: LTR-553 で「手かざしリフレックス」として実装（有効距離 数cm〜10cm。部屋スケールの視線追従は将来 ToF Unit で拡張可）
 
-## C1: 近接リフレックス（firmware、LTR-553 手かざし）
-- [x] C1-1/C1-2: LTR-553 ドライバ + 検知→首+表情リフレックス実装（stackchan.cc、Si12T パターン踏襲）— 実装済み
-- [ ] C1-3: Docker ビルド検証（実行中）→ app flash → 実機テスト（手をかざすと反応）
-- 設計原則 2 遵守: Hermes/gateway を介さない board ローカル実装
+## C1: 近接リフレックス（firmware、LTR-553 手かざし）→ **物理的に不可と判明、ToF Unit 待ち**
+- [x] C1-1/C1-2: LTR-553 ドライバ + リフレックス実装（stackchan.cc、Si12T パターン踏襲、コミット c306f8a）
+- [x] C1-3: ビルド → flash → 実機キャリブレーション (2026-06-11) — **結論: 前面シェルに LTR-553 用開口がなく外界の IR が届かない**。感度最大（gain x64・15 パルス・LED 100mA）でも ps_raw はパネル内面クロストークの ~380 で固定、手かざしで全く変化せず
+  - 副所見: 当初の閾値 200 < ベースライン 380 で**毎起動誤発火**していた → PROX_REFLEX_ENABLED=false + 閾値 700 に修正して再 flash 済み（ドライバと get_touch_state の ps_raw 診断は温存）
+  - 仮にシェルを開口しても有効距離 ~10cm（手かざし専用）。本来の目標「近づくと向く」(1〜2m) には **M5Stack ToF Unit (VL53L0X, Grove Port A, ~¥1,000)** が必要 → 購入はユーザー判断待ち（外出中）
+- 学び: `i2c_scan` ツールは外部 Grove バスのみ。内蔵チップは config.h の一覧 + 公式 docs で確認する
 
 ## C2: SwitchBot 家電操作（gateway 内 fork 専用モジュール）
 前提: Hub Mini ×2（リビング・寝室）確認済み、トークンは `~/.yorishiro/secrets.env` に設定済み
