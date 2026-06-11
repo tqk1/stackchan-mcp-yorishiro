@@ -75,13 +75,26 @@ HERMES_MARKERS = (
     "リマインド",
     "覚えて",
     "思い出して",
-    "メモして",
+    "メモ",
+    "リスト",
     # needs deliberation
     "なぜ",
     "どうして",
     "どう思",
     "説明して",
     "詳しく",
+    # request-shaped utterances ("〜して" / "〜しといて" / "〜お願い")
+    # imply an action, and actions need tools. This is deliberately
+    # broad — false positives (「はじめまして」) just take the slower
+    # Hermes path, while a false negative makes the tool-less local
+    # model fake completed actions (observed live: STT mangled
+    # 「メモして」 into 「埋めまして」, slipped past the specific
+    # markers, and the local model claimed the memo was saved).
+    "して",
+    "といて",
+    "ちょうだい",
+    "頂戴",
+    "お願い",
     # needs SwitchBot / device tools (home-appliance control lives on
     # Hermes via the gateway's switchbot_* MCP tools; the local model
     # cannot call tools, so command-style utterances must not short-cut)
@@ -133,6 +146,19 @@ def decide_route(text: str) -> str:
     return ROUTE_HERMES
 
 
+#: The local model cannot call tools. STT mis-transcriptions can strip
+#: the marker words that would have routed a tool request to Hermes
+#: (e.g. 「メモして」→「埋めまして」), and without this line the model
+#: happily claims to have saved memos or run searches it cannot run.
+#: Asking back instead gives the user a natural retry, and the retried
+#: utterance usually transcribes well enough to route to Hermes.
+LOCAL_NO_TOOLS_LINE = (
+    "重要: あなたは道具が使えないので、実行・保存・記録・調査・操作は一切できません。"
+    "そういう依頼や、意味のよくわからない発話が来たら、内容をでっち上げず、"
+    "「ごめん、うまく聞き取れなかったみたい。もう一度言ってもらえる？」とだけ答えてください。"
+)
+
+
 def _today_line(now: datetime.datetime | None = None) -> str:
     """Date context for the system prompt.
 
@@ -173,7 +199,10 @@ async def ask_local(text: str, *, system_prompt: str) -> str:
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": system_prompt + _today_line()},
+            {
+                "role": "system",
+                "content": system_prompt + _today_line() + LOCAL_NO_TOOLS_LINE,
+            },
             {"role": "user", "content": text},
         ],
         "stream": False,

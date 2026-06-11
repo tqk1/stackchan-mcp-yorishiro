@@ -55,6 +55,18 @@ def test_decide_route_short_simple_goes_local(text):
         "エアコン切って",
         "テレビつけて",
         "SwitchBotのデバイス一覧見せて",
+        # notes / web_search tools (Phase D) live on Hermes too; "メモ"
+        # and "リスト" also catch common STT mangling of those requests
+        # (e.g. 「買い物リストに牛乳をメモして」→「ハイモノリストに…」)
+        "買い物リストに牛乳をメモして",
+        "ハイモノリストに輸入を埋めまして",
+        "メモを読んで",
+        # request-shaped utterances imply actions, and actions need
+        # tools — including STT-mangled forms that lost their original
+        # marker word (observed live in the Phase D2 E2E)
+        "牛乳を埋めまして",
+        "それ保存しといて",
+        "電源を入れてお願い",
     ],
 )
 def test_decide_route_markers_go_hermes(text):
@@ -148,6 +160,8 @@ async def test_ask_local_success(monkeypatch, aiohttp_unused_port):
     assert system["role"] == "system"
     assert system["content"].startswith("短く話して。")
     assert "曜日)です。" in system["content"]   # date context injected
+    # no-tools guard: the local model must not pretend to run tools
+    assert local_llm.LOCAL_NO_TOOLS_LINE in system["content"]
     assert payload["messages"][1] == {"role": "user", "content": "こんにちは"}
 
 
