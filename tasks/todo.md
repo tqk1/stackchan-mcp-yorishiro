@@ -1,3 +1,39 @@
+# 🚧 次セッション最初に着手すること(2026-06-11 夜 clear 時点)
+
+**Phase D 実機 E2E で見つかった本丸の問題**: Hermes が gateway の MCP ツール(`write_note` / `web_search`)を使ってくれず、組み込みツール(`read_file` / `write_file` / `terminal` / `browser_*`)で代用したり、過去履歴を根拠に嘘の応答を返したりする。**gateway 側のシステムプロンプト誘導(コミット 0f997d2)では効果不十分と判明**。Hermes 側の設定/プロファイル改造で解決する方針(ユーザー承認済み)。
+
+## 次セッションのタスク
+1. **Hermes の設定を把握する** — `~/.hermes/config.yaml`、`~/.hermes/hermes-agent/` 配下のプロファイル定義、ツール無効化の仕組み、セッションごとのツール制限の有無
+2. **stackchan-voice セッション専用構成を検討** — 候補:
+   - (a) 既存 default プロファイルから組み込みツール(`terminal` / `browser_*` / `read_file` / `write_file` / `search_files` 等)を無効化する設定
+   - (b) `stackchan-voice` 専用プロファイルを作って音声経路だけそちらに向ける(`API_SERVER_PROFILE` 的な分岐があるか調査)
+   - (c) MCP サーバー側で「voice セッション向けの推奨ツール宣言」を強くする方法（mcp.types.AnnotatedTool 等の余地があるか）
+3. **実機 E2E でメモ・検索が MCP ツール経由で動くまで確認**:
+   - メモ: `~/.stackchan/notes/` にファイル生成
+   - 検索: Hermes ログで `web_search` ツール呼び出し
+4. Phase D クローズ → learning-report `docs/phase-d-report.md` 作成
+
+## 判明済みの実証データ(調査済み・再調査不要)
+- Hermes は **gpt-5.5 / openai-codex** 駆動。組み込みツールは `read_file` / `write_file` / `terminal` / `browser_navigate` / `browser_console` / `search_files` 等を保持(agent.log 確認)
+- 21:45 のメモターン: `read_file` 1 回のみ → 過去履歴を読んで「すでに入っています」と回答。`write_note` も `write_file` も呼ばれていない
+- 21:45 の天気ターン: `terminal` → `browser_navigate` → `browser_console` の経路。`web_search` は呼ばれていない
+- gateway の MCP HTTP(:8767)への `CallToolRequest` は 0 件、`ListToolsRequest` のみ(=Hermes は MCP の存在は知っているがツール選択で外している)
+- Hermes ログ: journal は空、`~/.hermes/logs/gateway.log` `agent.log` `errors.log` に出る
+- `tool_turns=24` まで蓄積(=Hermes 側のセッション履歴が長く、組み込みツール慣れが強化されている可能性)
+
+## D1 / D2 の現状(動作確認済み・触らなくてよい)
+- **D1 heartbeat**: 本運用稼働中(30 分間隔、quiet 22:00-08:00)。実機で見回し・表情変化を目視確認済み。drop-in `/etc/systemd/system/stackchan-gateway.service.d/heartbeat.conf` 配備済み
+- **D2 web_search/notes ツール**: gateway 側は動作する(ddgs 直接実行成功)。MCP に登録済み(35 tools)。**Hermes が呼んでくれないのが問題**
+- **D3 keep_alive=24h**: 適用済み(`local-llm.conf`)、warm 0.5s 維持を実測確認
+- **ローカル LLM ルーティング修正(441a95f)**: 依頼形マーカー(して/といて/お願い/メモ/リスト)+ no-tools プロンプト追加で「ローカルが嘘の完了報告をする」問題は解消済み
+
+## ブランチ・コミット状態
+- ブランチ: `feature/phase-d`(push 未実施)
+- 最新コミット: `0f997d2 fix(gateway): steer Hermes voice turns to MCP tools via system prompt`
+- ワーキングツリー: clean
+
+---
+
 # Phase D — 自律性: heartbeat + Hermes MCP ツール追加 + LFM2.5 役割拡大（2026-06-11 着手）
 
 ## ユーザー決定事項（2026-06-11 AskUserQuestion で確認済み）
