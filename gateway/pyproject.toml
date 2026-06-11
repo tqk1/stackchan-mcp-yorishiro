@@ -82,6 +82,13 @@ stt-openai = [
     "openai>=1.0",
 ]
 
+# Phase D web search (yorishiro fork) — the Tavily backend needs no
+# extra dependency (aiohttp); this pulls in the keyless DuckDuckGo
+# fallback used when TAVILY_API_KEY is unset or Tavily fails.
+search = [
+    "ddgs>=9",
+]
+
 [project.urls]
 Homepage = "https://github.com/kisaragi-mochi/stackchan-mcp"
 Repository = "https://github.com/kisaragi-mochi/stackchan-mcp"

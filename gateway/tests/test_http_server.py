@@ -468,6 +468,10 @@ async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
             "switchbot_list_devices",
             "switchbot_get_status",
             "switchbot_send_command",
+            "web_search",
+            "write_note",
+            "read_note",
+            "list_notes",
         }
     )
     queue = CommandQueue(capacity=2)

@@ -6,6 +6,7 @@ Each tool call is relayed to the connected ESP32 device.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import AsyncExitStack
 import inspect
 import json
@@ -18,7 +19,7 @@ from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
 from mcp.types import Notification, TextContent, Tool
 
-from . import __version__, switchbot
+from . import __version__, notes, switchbot, web_search
 from .gateway import get_gateway
 from .notify_config import NotifyConfig, load_notify_config
 from .stt import listen_and_transcribe
@@ -392,6 +393,47 @@ async def _dispatch_mcp_tool(
             ]
         if name == "switchbot_send_command":
             result = {"ok": True, "result": result}
+        return [TextContent(type="text", text=json.dumps(result))]
+
+    # Web search + notes are gateway-local (yorishiro fork, Phase D) —
+    # they never touch the ESP32, so they are handled before the
+    # device_connected guard below.
+    if name in web_search.TOOL_NAMES:
+        try:
+            result = await web_search.search(
+                arguments.get("query", ""), arguments.get("max_results")
+            )
+        except (ValueError, RuntimeError) as exc:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": str(exc)}),
+                )
+            ]
+        return [TextContent(type="text", text=json.dumps(result))]
+
+    if name in notes.TOOL_NAMES:
+        try:
+            if name == "write_note":
+                result = await asyncio.to_thread(
+                    notes.write_note,
+                    arguments.get("name", ""),
+                    arguments.get("content", ""),
+                    bool(arguments.get("append", False)),
+                )
+            elif name == "read_note":
+                result = await asyncio.to_thread(
+                    notes.read_note, arguments.get("name", "")
+                )
+            else:  # list_notes
+                result = await asyncio.to_thread(notes.list_notes)
+        except (ValueError, OSError) as exc:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"error": str(exc)}),
+                )
+            ]
         return [TextContent(type="text", text=json.dumps(result))]
 
     if name == "load_avatar_set":
@@ -1467,6 +1509,108 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         },
                     },
                     "required": ["device_id", "command"],
+                },
+            ),
+            Tool(
+                name="web_search",
+                description=(
+                    "Search the web and return results as JSON. Uses "
+                    "the Tavily search API when TAVILY_API_KEY is set "
+                    "on the gateway (response includes an LLM-composed "
+                    "'answer' summary), falling back to DuckDuckGo "
+                    "otherwise. Use this for questions about current "
+                    "events, facts you are unsure of, weather, prices, "
+                    "and anything the user asks you to look up. Results "
+                    "carry title / url / snippet — summarise them in "
+                    "your own words for spoken replies."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "Search query. Use the user's language "
+                                "(Japanese queries are fine)."
+                            ),
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Number of results, 1-10.",
+                            "default": 5,
+                            "minimum": 1,
+                            "maximum": 10,
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
+            Tool(
+                name="write_note",
+                description=(
+                    "Create or update a text note in the gateway's note "
+                    "directory (~/.stackchan/notes). Use this when the "
+                    "user asks to remember something, take a memo, keep "
+                    "a list, or save a search summary. Notes are plain "
+                    "Markdown/text files the user can open directly. "
+                    "Set append=true to add to an existing note (e.g. "
+                    "growing a shopping list) instead of overwriting."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "File name without directories, e.g. "
+                                "'買い物リスト.md'. A bare name gets "
+                                "'.md' appended; only .md/.txt allowed."
+                            ),
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Note body (UTF-8 text).",
+                        },
+                        "append": {
+                            "type": "boolean",
+                            "description": (
+                                "Append to the existing note instead of "
+                                "overwriting. Defaults to false."
+                            ),
+                            "default": False,
+                        },
+                    },
+                    "required": ["name", "content"],
+                },
+            ),
+            Tool(
+                name="read_note",
+                description=(
+                    "Read one note from the gateway's note directory. "
+                    "Use list_notes first when unsure of the exact "
+                    "file name."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "File name from list_notes.",
+                        },
+                    },
+                    "required": ["name"],
+                },
+            ),
+            Tool(
+                name="list_notes",
+                description=(
+                    "List the notes saved in the gateway's note "
+                    "directory with their sizes and modification "
+                    "times."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
                 },
             ),
         ]
