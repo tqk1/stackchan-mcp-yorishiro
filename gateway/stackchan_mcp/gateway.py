@@ -14,6 +14,7 @@ from aiohttp import web
 
 from .capture_server import create_capture_app, stage_avatar_set
 from .esp32_client import ESP32Manager
+from .heartbeat import HeartbeatRunner
 from .mdns_advertiser import MdnsAdvertiser
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class Gateway:
         # against the same web.Application that serves /avatar_set/{id}.
         self._capture_app: web.Application | None = None
         self._mdns_advertiser: MdnsAdvertiser | None = None
+        self._heartbeat: HeartbeatRunner | None = None
 
     @property
     def vision_url(self) -> str:
@@ -168,6 +170,12 @@ class Gateway:
         else:
             self._mdns_advertiser = None
 
+        # Phase D heartbeat (yorishiro fork): opt-in via
+        # STACKCHAN_HEARTBEAT_INTERVAL_MIN; from_env returns None when unset.
+        self._heartbeat = HeartbeatRunner.from_env(self)
+        if self._heartbeat is not None:
+            self._heartbeat.start()
+
         self._running = True
         logger.info(
             "Gateway started: WS on %s:%d, capture on %s:%d, vision_url=%s",
@@ -177,6 +185,9 @@ class Gateway:
     async def stop(self) -> None:
         """Stop the gateway."""
         self._running = False
+        if self._heartbeat is not None:
+            await self._heartbeat.stop()
+            self._heartbeat = None
         if self._mdns_advertiser:
             try:
                 await self._mdns_advertiser.stop()
