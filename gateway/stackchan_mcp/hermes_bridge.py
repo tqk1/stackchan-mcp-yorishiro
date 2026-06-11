@@ -64,6 +64,21 @@ DEFAULT_VOICE_SYSTEM_PROMPT = (
     "返答は話し言葉で短く、1〜3文にまとめてください。記号や箇条書きは使わないでください。"
 )
 
+#: Tool-routing guidance appended to the voice system prompt. The
+#: Hermes agent also has built-in tools (terminal, ...) that are
+#: approval-gated in this deployment and tempt the model into dead
+#: ends or fake completions — observed live in the Phase D2 E2E: a
+#: weather question went to `curl wttr.in` via the terminal tool
+#: (blocked pending approval) instead of the MCP web_search tool, and
+#: a memo request was reported "added" without any tool call at all.
+HERMES_VOICE_TOOLS_LINE = (
+    "調べ物・天気・ニュースは必ず MCP ツールの web_search を使ってください。"
+    "メモやリストの保存は write_note（追記は append=true）、"
+    "内容の確認は list_notes / read_note、家電操作は switchbot_* ツールを使ってください。"
+    "terminal など他の手段は使わないでください。"
+    "ツールを呼ばずに「やりました」「調べました」と報告することは禁止です。"
+)
+
 #: Hard ceiling for one Hermes turn. The agent may run tools internally;
 #: beyond this the voice interaction is dead anyway.
 HERMES_TIMEOUT_S = 120.0
@@ -128,7 +143,10 @@ async def ask_hermes(text: str) -> str:
     payload = {
         "model": "hermes-agent",
         "messages": [
-            {"role": "system", "content": system_prompt},
+            {
+                "role": "system",
+                "content": system_prompt + HERMES_VOICE_TOOLS_LINE,
+            },
             {"role": "user", "content": text},
         ],
     }
