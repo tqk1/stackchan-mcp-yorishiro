@@ -118,3 +118,94 @@
    ```
 2. **Tavily 登録**（任意・推奨）: <https://tavily.com> にメール登録 → API キー取得 → `~/.yorishiro/secrets.env` に `TAVILY_API_KEY=tvly-...` を追記 → `sudo systemctl restart stackchan-gateway`。未登録でも ddgs で検索は動く
 3. 再起動後、音声で「○○を調べて」「メモして」を試すと D2 の E2E になる
+
+---
+
+## 6. Phase D 最終ステップ — 経路分離による組み込みツール抑制（2026-06-11 22:00〜23:10）
+
+### 6.1 症状（再掲）
+
+D1 heartbeat と D2 検索・メモツールは投入済み。だが Hermes (gpt-5.5/openai-codex) が gateway の MCP ツール (`mcp_stackchan_write_note` / `mcp_stackchan_web_search`) を呼ばず、組み込み `terminal` / `browser_*` / `read_file` / `write_file` で代用したり、過去履歴を根拠に嘘応答する症状が続いた。
+
+例（2026-06-11 21:45 ターン）:
+
+- メモ依頼 → `read_file` 1 回のみ → 「すでに入っています」と回答（実際は `~/.stackchan/notes/` ディレクトリ未作成）
+- 天気依頼 → `terminal` → `browser_navigate` → `browser_console` 経由（`web_search` 不使用）
+
+コミット `0f997d2`（gateway 側 `HERMES_VOICE_TOOLS_LINE` のシステムプロンプト誘導）では効果不十分と判明。**「terminal は使うな」「web_search を使え」と書いても、組み込みツールが見えている限り gpt-5.5 はそちらを優先する。プロンプト誘導 < 構造的制約**。
+
+### 6.2 採用案と根拠（案 B: `platform_toolsets.api_server`）
+
+Hermes 側を調査して 3 案を比較:
+
+- **案 A（リクエスト body 上書き）**: `api_server.py` は body の `disabled_toolsets` を読まない（grep 0 件）→ **実装不可、棄却**
+- **案 B（`platform_toolsets.api_server` で経路分離）**: `~/.hermes/config.yaml` 1 箇所追記。Hermes 本体は無改造、Discord 経路は無影響、MCP server `stackchan` は `include_default_mcp_servers=True` で自動付与 → **採用**
+- **案 C（`HERMES_HOME` プロファイル分離）**: 別 systemd unit でプロセス分離。Hermes 無改造だが運用が重く、Discord と人格分裂 → **将来課題に凍結**（外部クライアントから `/v1/chat/completions` で terminal が必要になった時点で再検討）
+
+動作保証:
+
+- `~/.hermes/hermes-agent/gateway/platforms/api_server.py:989` で `_get_platform_tools(user_config, "api_server")` 呼び出し
+- 公式テスト `tests/gateway/test_api_server_toolset.py:101-129` が `{"platform_toolsets": {"api_server": ["web", "terminal"]}}` → enabled が `[terminal, web]` だけになることを保証
+
+### 6.3 実装（config.yaml 1 ブロック追記）
+
+```yaml
+# ~/.hermes/config.yaml の platform_toolsets: ブロック末尾に追記
+api_server:
+- web        # web_search / web_extract
+- vision     # 写真の意味解釈
+- todo       # 頭の整理
+- memory     # Hermes 内部メモリ (write_note とは別)
+- messaging  # send_message
+- clarify    # 聞き返し
+```
+
+意図的に外したコア toolset: `terminal`, `file`, `browser`, `code_execution`, `delegation`, `search_files`, `cronjob`, `tts`（gateway で VOICEVOX を直接叩くので冗長）。
+
+事前検証（Hermes venv で `_get_platform_tools` を直接呼ぶ）:
+
+```bash
+cd /home/kenji/.hermes/hermes-agent && HERMES_HOME=/home/kenji/.hermes ./venv/bin/python -c "
+from hermes_cli.tools_config import _get_platform_tools
+import yaml
+cfg = yaml.safe_load(open('/home/kenji/.hermes/config.yaml'))
+print('api_server :', sorted(_get_platform_tools(cfg, 'api_server')))
+print('discord    :', sorted(_get_platform_tools(cfg, 'discord')))
+"
+```
+
+結果:
+
+- `api_server`: `['clarify', 'memory', 'messaging', 'stackchan', 'todo', 'vision', 'web']`（7 個、`stackchan` は MCP 自動付与）
+- `discord`: `terminal` / `file` / `browser` を含む 19 個のまま（**無回帰**）
+
+`sudo systemctl restart hermes-gateway` で適用。gateway 側 `hermes_bridge.py` は無編集（当初想定していた `X-Hermes-Platform` ヘッダー追加は Hermes 側に受け口がないため不要）。
+
+バックアップ: `/home/kenji/.hermes/config.yaml.bak-20260611-phaseD`
+
+### 6.4 E2E 結果（22:17 再起動後）
+
+| シナリオ | 結果 | 根拠 |
+|---|---|---|
+| MCP server 自動付与 | ✅ | 22:17:56 で 35 ツール登録 (`mcp_stackchan_write_note` / `mcp_stackchan_web_search` / `mcp_stackchan_switchbot_*` 含む) |
+| 家電 (`switchbot_*`) | ✅ | 23:07:21 `tool mcp_stackchan_switchbot_send_command completed`、reply='リビングの電気を消しました。'、実機消灯 |
+| Discord 経路の `terminal` | ✅ | 23:07:06 `tool terminal completed` (platform=discord)、**無回帰** |
+| 組み込みツール抑制 | ✅ | 再起動後の `[stackchan-voice]` セッションで `terminal` / `browser_*` / `write_file` / `read_file` の CallToolRequest **0 件** |
+| `clarify` toolset の効果 | ✅ | 検索ターンで Hermes が「天気か勉強か聞き返し」を選択 = 強引な `terminal` 利用に走らなくなった |
+| メモ単体ログ | ⚠️ | STT 起因で transcript 未取得（ユーザーが声を出しにくい時間帯、後日再検証） |
+| 検索単体ログ | ⚠️ | 同上（transcript = `'東京の京の勉強して'` で意図不明 → clarify に流れた） |
+
+**構造的効果は確定**（組み込みツールへの偏りは消えた）。メモ・検索の単体ログは STT 安定時に撮り直すフォローアップとして残す。
+
+### 6.5 学び
+
+- **プロンプト誘導 < 構造的制約**: 21:45 までは「terminal を使うな」とシステムプロンプトに明示注入していたが、gpt-5.5 はそれを無視してでも組み込みツールに流れた。`platform_toolsets` で目の前から消した瞬間、迷いなく MCP ツールに流れるようになった。LLM に「使うな」と言うより、見せないほうが速い
+- **MCP server の自動付与**: `include_default_mcp_servers=True` (`tools_config.py:1325-1329`) のおかげで、`platform_toolsets.api_server` を絞っても `mcp_servers.stackchan` は自動的に enabled に残る。「ツールセット = コア機能の取捨選択」「MCP = 外付け機能」が独立軸として扱われている設計
+- **副作用範囲を把握しておく**: `platform_toolsets.api_server` は **Hermes API（port 8642）経路全体**を絞る。今は声経路だけが API を叩いているので問題ないが、将来 Claude Code 等 別クライアントから `/v1/chat/completions` を叩く要件が出たらその時点で案 C（プロファイル分離）に切り替える、と覚悟しておく
+- **音声系の E2E 判定は STT 安定が前提**: 5.x で書いたのと同じ罠で、今回もメモ・検索の transcript が崩壊してログ判定が完結しなかった。「応答が自然だった」より「ツールが呼ばれた」を、しかも「狙ったツール名」で見るのが本筋
+
+### 6.6 フォローアップ（声を出しやすい時間帯に）
+
+- [ ] メモ単体 E2E: 「○○のことメモして」発話 → `~/.stackchan/notes/*.md` 生成確認、agent.log で `mcp_stackchan_write_note` の CallToolRequest 確認
+- [ ] 検索単体 E2E: 「○○のニュース調べて」発話 → agent.log で `mcp_stackchan_web_search` の CallToolRequest 確認
+- どちらも失敗時は `~/.hermes/logs/agent.log` の該当ターンを transcript 単位で diff し、Hermes 側のツール選択を可視化する

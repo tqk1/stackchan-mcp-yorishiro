@@ -1,36 +1,24 @@
-# 🚧 次セッション最初に着手すること(2026-06-11 夜 clear 時点)
+# ✅ Phase D クローズ済み(2026-06-11 23:10)
 
-**Phase D 実機 E2E で見つかった本丸の問題**: Hermes が gateway の MCP ツール(`write_note` / `web_search`)を使ってくれず、組み込みツール(`read_file` / `write_file` / `terminal` / `browser_*`)で代用したり、過去履歴を根拠に嘘の応答を返したりする。**gateway 側のシステムプロンプト誘導(コミット 0f997d2)では効果不十分と判明**。Hermes 側の設定/プロファイル改造で解決する方針(ユーザー承認済み)。
+**D4「Hermes が gateway の MCP ツールを呼ばない問題」は経路分離で解決**:
 
-## 次セッションのタスク
-1. **Hermes の設定を把握する** — `~/.hermes/config.yaml`、`~/.hermes/hermes-agent/` 配下のプロファイル定義、ツール無効化の仕組み、セッションごとのツール制限の有無
-2. **stackchan-voice セッション専用構成を検討** — 候補:
-   - (a) 既存 default プロファイルから組み込みツール(`terminal` / `browser_*` / `read_file` / `write_file` / `search_files` 等)を無効化する設定
-   - (b) `stackchan-voice` 専用プロファイルを作って音声経路だけそちらに向ける(`API_SERVER_PROFILE` 的な分岐があるか調査)
-   - (c) MCP サーバー側で「voice セッション向けの推奨ツール宣言」を強くする方法（mcp.types.AnnotatedTool 等の余地があるか）
-3. **実機 E2E でメモ・検索が MCP ツール経由で動くまで確認**:
-   - メモ: `~/.stackchan/notes/` にファイル生成
-   - 検索: Hermes ログで `web_search` ツール呼び出し
-4. Phase D クローズ → learning-report `docs/phase-d-report.md` 作成
+- 採用: 案 B(`~/.hermes/config.yaml` の `platform_toolsets.api_server` 追記、Hermes 本体無改造)
+- 効果: 再起動後の `[stackchan-voice]` で `terminal`/`browser_*`/`write_file`/`read_file` の CallToolRequest **0 件**。家電(`mcp_stackchan_switchbot_send_command`)実灯 ✅、Discord 経路の `terminal` 無回帰 ✅、clarify による聞き返しも実観測 ✅
+- 詳細: `docs/phase-d-report.md`(レポート)、`docs/worklog/2026-06-11-phase-d-autonomy.md` §6(作業ログ)
+- バックアップ: `/home/kenji/.hermes/config.yaml.bak-20260611-phaseD`
 
-## 判明済みの実証データ(調査済み・再調査不要)
-- Hermes は **gpt-5.5 / openai-codex** 駆動。組み込みツールは `read_file` / `write_file` / `terminal` / `browser_navigate` / `browser_console` / `search_files` 等を保持(agent.log 確認)
-- 21:45 のメモターン: `read_file` 1 回のみ → 過去履歴を読んで「すでに入っています」と回答。`write_note` も `write_file` も呼ばれていない
-- 21:45 の天気ターン: `terminal` → `browser_navigate` → `browser_console` の経路。`web_search` は呼ばれていない
-- gateway の MCP HTTP(:8767)への `CallToolRequest` は 0 件、`ListToolsRequest` のみ(=Hermes は MCP の存在は知っているがツール選択で外している)
-- Hermes ログ: journal は空、`~/.hermes/logs/gateway.log` `agent.log` `errors.log` に出る
-- `tool_turns=24` まで蓄積(=Hermes 側のセッション履歴が長く、組み込みツール慣れが強化されている可能性)
+## 残りの宿題(声を出しやすい時間帯に再検証)
+1. **メモ単体 E2E**: 「○○のことメモして」発話 → `~/.stackchan/notes/*.md` 生成確認、agent.log で `mcp_stackchan_write_note` の CallToolRequest 確認
+2. **検索単体 E2E**: 「○○のニュース調べて」発話 → agent.log で `mcp_stackchan_web_search` の CallToolRequest 確認
+3. **Tavily API キー登録(任意・推奨)**: `~/.yorishiro/secrets.env` に `TAVILY_API_KEY=tvly-...`(未設定でも ddgs フォールバックで動く)
 
-## D1 / D2 の現状(動作確認済み・触らなくてよい)
-- **D1 heartbeat**: 本運用稼働中(30 分間隔、quiet 22:00-08:00)。実機で見回し・表情変化を目視確認済み。drop-in `/etc/systemd/system/stackchan-gateway.service.d/heartbeat.conf` 配備済み
-- **D2 web_search/notes ツール**: gateway 側は動作する(ddgs 直接実行成功)。MCP に登録済み(35 tools)。**Hermes が呼んでくれないのが問題**
-- **D3 keep_alive=24h**: 適用済み(`local-llm.conf`)、warm 0.5s 維持を実測確認
-- **ローカル LLM ルーティング修正(441a95f)**: 依頼形マーカー(して/といて/お願い/メモ/リスト)+ no-tools プロンプト追加で「ローカルが嘘の完了報告をする」問題は解消済み
+## 遠い将来の TODO
+- 外部クライアント(Claude Code 等)から `/v1/chat/completions` で `terminal` が必要になったら、案 C(`HERMES_HOME` プロファイル分離)に切替。詳細は `docs/phase-d-report.md` §4.2
 
-## ブランチ・コミット状態
+## ブランチ・コミット状態(Phase D)
 - ブランチ: `feature/phase-d`(push 未実施)
-- 最新コミット: `0f997d2 fix(gateway): steer Hermes voice turns to MCP tools via system prompt`
-- ワーキングツリー: clean
+- D4 編集差分: `~/.hermes/config.yaml`(git 管理外)、`docs/worklog/2026-06-11-phase-d-autonomy.md` §6、`docs/phase-d-report.md` 新規、`CLAUDE.md` 最終行、`tasks/todo.md` 本ブロック
+- 直前の Hermes プロンプト誘導コミット: `0f997d2 fix(gateway): steer Hermes voice turns to MCP tools via system prompt`(D4 でより構造的解決を選んだが、保険として有効なので残す)
 
 ---
 
