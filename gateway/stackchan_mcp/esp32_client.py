@@ -7,7 +7,7 @@ and as an MCP client that sends commands TO the ESP32.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import json
 import logging
 import os
@@ -366,6 +366,11 @@ class ESP32Manager:
         self._server: Any = None
         self._lock = asyncio.Lock()
         self._notify_config = notify_config or load_notify_config()
+        # Phase E (yorishiro fork): the owning Gateway wires this to
+        # note_human_interaction() so validated touch events feed the
+        # heartbeat's speak cooldown. Optional because the manager is
+        # also constructed standalone in tests.
+        self.on_human_interaction: Callable[[], None] | None = None
         self._init_tasks: list[asyncio.Task] = []
         self._vision_url: str = ""
         self._vision_token: str = ""
@@ -768,6 +773,12 @@ class ESP32Manager:
         if not isinstance(session_id, str) or not session_id:
             logger.warning("Malformed stackchan-event frame: session_id=%r", session_id)
             return
+
+        if self.on_human_interaction is not None:
+            try:
+                self.on_human_interaction()
+            except Exception:
+                logger.exception("on_human_interaction callback failed")
 
         config = self._notify_config
         message = config.messages.get(

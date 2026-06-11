@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from aiohttp import web
 
@@ -38,6 +39,17 @@ class Gateway:
         self._capture_app: web.Application | None = None
         self._mdns_advertiser: MdnsAdvertiser | None = None
         self._heartbeat: HeartbeatRunner | None = None
+        # Phase E (yorishiro fork): monotonic timestamp of the last
+        # human-initiated interaction (voice turn or touch). The
+        # heartbeat's speak cooldown reads this so a proactive
+        # utterance never lands right after — or during — a
+        # conversation the user started.
+        self.last_human_interaction_monotonic: float | None = None
+        self.esp32.on_human_interaction = self.note_human_interaction
+
+    def note_human_interaction(self) -> None:
+        """Record that the user just interacted (voice turn / touch)."""
+        self.last_human_interaction_monotonic = time.monotonic()
 
     @property
     def vision_url(self) -> str:

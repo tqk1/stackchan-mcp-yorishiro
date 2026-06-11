@@ -1,3 +1,35 @@
+# Phase E — 通知型 heartbeat: 価値があるときだけ話す（2026-06-12 着手）
+
+## ユーザー決定事項（2026-06-12 AskUserQuestion で確認済み）
+- **コンセプト転換**: 「ランダムな一言発話」ではなく**通知型** — 沈黙がデフォルト、伝える価値がある情報があるときだけ一言話す（無意味な発話・仕草は不要、とユーザー明言）
+- **情報源 v1**: ①メモリマインド（notes.py、夕方ウィンドウ）②天気の急変・注意報（気象庁 bosai API、朝ウィンドウ）
+- **クワイエットアワーは 22:00-06:30 に変更**（旧デフォルト 22:00-08:00）
+- **天気の対象地域**: 大阪府守口市 — office `270000` / class20 `2720900`（area.json で検証済み 2026-06-12）
+- **言い方は v1 テンプレート固定**（決定的・テスト可能）。LLM 委譲は将来の拡張点
+- **将来拡張（設計考慮のみ）**: SwitchBot 人感センサーPro / CO2センサー購入予定 → checker は情報源を後から1ユニットで追加できる形を保つ
+- 記録: worklog + 学習レポート（phase-e-report.md）両方作成
+
+## チェックリスト
+- [x] E1: 対話タイムスタンプの土台 — gateway.note_human_interaction() + voice_turn 冒頭・タッチイベントで記録
+- [x] E2: weather.py 新規 — 気象庁 API 取得 + judge_weather() pure 関数。エリアコードは area.json 実データで検証（守口市 2720900 / 大阪府 270000）
+- [x] E3: heartbeat.py 通知型拡張 — SPEAK opt-in、抑制5層、checker 巡回、state 永続化。DEFAULT_QUIET を 22:00-06:30 へ
+- [x] E4: ユニットテスト — 全 607 件パス（Phase E 新規 42 件: heartbeat 31 + weather 11）、変更ファイルの ruff クリーン
+- [~] E5: 実機 E2E — **ログ検証 ✅**（2026-06-12 朝、加速 drop-in で 07:53 天気発話 → 07:54 メモリマインド → 07:55 ネタ切れで沈黙(仕草のみ)、state 永続化確認、TTS エラーなし）。**聴感確認・抑制テスト・本番 conf 差し替えは夜に持ち越し**（手順: worklog §5、conf: scratch/heartbeat-prod.conf）
+- [x] E6: 記録 — worklog / phase-e-report.md / CLAUDE.md ステータス / memory（将来センサー拡張）
+
+## 完了条件
+- 朝、雨や注意報のときだけ天気を一言教えてくれる — ログ検証 ✅ / 聴感は夜
+- 夕方、その日のメモがあるときだけリマインドしてくれる — ログ検証 ✅（加速ウィンドウ）/ 実運用ウィンドウは夜
+- 話しかけた直後・録音中・夜間（22:00-06:30）に自発発話が絶対に起きない — ユニットテスト ✅ / 実機抑制ログは夜
+- 伝える情報がない日は終日沈黙する — tick 3 で仕草フォールバック確認 ✅
+
+## 夜にやること（5分）
+1. `sudo install -m 644 ~/dev/yorishiro-workspace/scratch/heartbeat-prod.conf /etc/systemd/system/stackchan-gateway.service.d/heartbeat.conf && sudo systemctl daemon-reload && sudo systemctl restart stackchan-gateway`
+2. `rm ~/.stackchan/heartbeat_state.json` + メモを書き足し → 18:00-21:00 のウィンドウでメモリマインド聴感確認
+3. タップ会話の直後に `journalctl -fu stackchan-gateway | grep heartbeat` で `speak suppressed (recent interaction)` を確認
+
+---
+
 # ✅ Phase D 完全クローズ(2026-06-12 朝、E2E 完了)
 
 **D4「Hermes が gateway の MCP ツールを呼ばない問題」は経路分離で解決**:

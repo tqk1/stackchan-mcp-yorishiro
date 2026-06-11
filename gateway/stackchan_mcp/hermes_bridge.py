@@ -240,6 +240,12 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
             {"ok": False, "error": "gateway not attached"}, status=503
         )
 
+    # Phase E: stamp the interaction at the very start of the turn —
+    # while the STT/Hermes round-trip is in flight neither tts_lock nor
+    # the recording slot is held, so this timestamp is what keeps the
+    # heartbeat from speaking into that gap.
+    gateway.note_human_interaction()
+
     session_id = request.headers.get("X-StackChan-Session", "")
     if (request.content_length or 0) > MAX_OGG_BYTES:
         return web.json_response(

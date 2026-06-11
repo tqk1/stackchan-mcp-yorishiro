@@ -39,6 +39,7 @@ class FakeESP32:
 class FakeGateway:
     def __init__(self):
         self.esp32 = FakeESP32()
+        self.last_human_interaction_monotonic = None
 
 
 def make_runner(gateway=None, **kw) -> HeartbeatRunner:
@@ -268,3 +269,289 @@ async def test_loop_survives_gesture_failure(monkeypatch):
     await asyncio.wait_for(second_tick.wait(), timeout=2.0)
     await runner.stop()
     assert count >= 2
+
+
+# ---- Phase E: speak config -------------------------------------------
+
+
+def _clear_speak_env(monkeypatch):
+    for name in (
+        "STACKCHAN_HEARTBEAT_SPEAK",
+        "STACKCHAN_HEARTBEAT_SPEAK_COOLDOWN_MIN",
+        "STACKCHAN_HEARTBEAT_SPEAK_MAX_PER_DAY",
+        "STACKCHAN_WEATHER_AREA",
+        "STACKCHAN_WEATHER_CITY",
+        "STACKCHAN_WEATHER_POP_THRESHOLD",
+        "STACKCHAN_WEATHER_WINDOW",
+        "STACKCHAN_MEMO_WINDOW",
+        "STACKCHAN_HEARTBEAT_STATE",
+        "STACKCHAN_HEARTBEAT_GESTURES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_speak_config_off_by_default(monkeypatch):
+    _clear_speak_env(monkeypatch)
+    assert hb.speak_config_from_env() is None
+    monkeypatch.setenv("STACKCHAN_HEARTBEAT_SPEAK", "0")
+    assert hb.speak_config_from_env() is None
+    monkeypatch.setenv("STACKCHAN_HEARTBEAT_SPEAK", "nonsense")
+    assert hb.speak_config_from_env() is None
+
+
+def test_speak_config_enabled_defaults(monkeypatch, tmp_path):
+    _clear_speak_env(monkeypatch)
+    monkeypatch.setenv("STACKCHAN_HEARTBEAT_SPEAK", "1")
+    monkeypatch.setenv("STACKCHAN_HEARTBEAT_STATE", str(tmp_path / "s.json"))
+    cfg = hb.speak_config_from_env()
+    assert cfg is not None
+    assert cfg.cooldown_min == hb.DEFAULT_SPEAK_COOLDOWN_MIN
+    assert cfg.max_per_day == hb.DEFAULT_SPEAK_MAX_PER_DAY
+    assert cfg.pop_threshold == hb.DEFAULT_POP_THRESHOLD
+    assert cfg.weather_window == (dt.time(6, 30), dt.time(9, 30))
+    assert cfg.memo_window == (dt.time(18, 0), dt.time(21, 0))
+    assert cfg.weather_area == ""  # weather source off until codes are set
+
+
+def test_speak_config_invalid_numbers_fall_back(monkeypatch, tmp_path):
+    _clear_speak_env(monkeypatch)
+    monkeypatch.setenv("STACKCHAN_HEARTBEAT_SPEAK", "1")
+    monkeypatch.setenv("STACKCHAN_HEARTBEAT_STATE", str(tmp_path / "s.json"))
+    monkeypatch.setenv("STACKCHAN_HEARTBEAT_SPEAK_COOLDOWN_MIN", "abc")
+    monkeypatch.setenv("STACKCHAN_HEARTBEAT_SPEAK_MAX_PER_DAY", "-1")
+    cfg = hb.speak_config_from_env()
+    assert cfg.cooldown_min == hb.DEFAULT_SPEAK_COOLDOWN_MIN
+    assert cfg.max_per_day == 0  # clamped, never negative
+
+
+def test_from_env_speak_off_keeps_stage1(monkeypatch):
+    """Regression: SPEAK unset must reproduce Phase D behaviour exactly."""
+    _clear_speak_env(monkeypatch)
+    monkeypatch.setenv("STACKCHAN_HEARTBEAT_INTERVAL_MIN", "30")
+    runner = HeartbeatRunner.from_env(FakeGateway())
+    assert runner is not None
+    assert runner._speak is None
+    assert runner._gestures is True
+
+
+def test_from_env_gestures_off(monkeypatch):
+    _clear_speak_env(monkeypatch)
+    monkeypatch.setenv("STACKCHAN_HEARTBEAT_INTERVAL_MIN", "30")
+    monkeypatch.setenv("STACKCHAN_HEARTBEAT_GESTURES", "0")
+    runner = HeartbeatRunner.from_env(FakeGateway())
+    assert runner._gestures is False
+
+
+# ---- Phase E: suppression --------------------------------------------
+
+
+def make_speak(tmp_path, **kw) -> hb.SpeakConfig:
+    kw.setdefault("state_path", tmp_path / "state.json")
+    kw.setdefault("weather_window", (dt.time(6, 30), dt.time(9, 30)))
+    kw.setdefault("memo_window", (dt.time(18, 0), dt.time(21, 0)))
+    return hb.SpeakConfig(**kw)
+
+
+def test_speak_skip_while_recording(monkeypatch, tmp_path):
+    runner = make_runner(speak=make_speak(tmp_path))
+    monkeypatch.setattr(hb, "is_recording", lambda: True)
+    assert runner._speak_skip_reason() == "recording active"
+    monkeypatch.setattr(hb, "is_recording", lambda: False)
+    assert runner._speak_skip_reason() is None
+
+
+def test_speak_skip_recent_interaction(monkeypatch, tmp_path):
+    gw = FakeGateway()
+    runner = make_runner(gw, speak=make_speak(tmp_path, cooldown_min=20))
+    monkeypatch.setattr(hb, "is_recording", lambda: False)
+    monkeypatch.setattr(runner, "_monotonic", lambda: 10_000.0)
+
+    gw.last_human_interaction_monotonic = 10_000.0 - 5 * 60  # 5 min ago
+    assert runner._speak_skip_reason() == "recent interaction"
+    gw.last_human_interaction_monotonic = 10_000.0 - 25 * 60  # 25 min ago
+    assert runner._speak_skip_reason() is None
+    gw.last_human_interaction_monotonic = None  # never interacted
+    assert runner._speak_skip_reason() is None
+
+
+def test_speak_skip_daily_cap_and_rollover(monkeypatch, tmp_path):
+    runner = make_runner(speak=make_speak(tmp_path, max_per_day=2))
+    monkeypatch.setattr(hb, "is_recording", lambda: False)
+    today = dt.date(2026, 6, 12)
+    monkeypatch.setattr(runner, "_today", lambda: today)
+    runner._state = {"speak_count_date": "2026-06-12", "speak_count": 2}
+    assert runner._speak_skip_reason() == "daily cap"
+    monkeypatch.setattr(runner, "_today", lambda: dt.date(2026, 6, 13))
+    assert runner._speak_skip_reason() is None  # new day resets the count
+
+
+# ---- Phase E: memo checker -------------------------------------------
+
+
+@pytest.fixture
+def notes_dir(monkeypatch, tmp_path):
+    d = tmp_path / "notes"
+    d.mkdir()
+    monkeypatch.setenv("STACKCHAN_NOTES_DIR", str(d))
+    return d
+
+
+def make_memo_runner(tmp_path, monkeypatch, now=dt.time(19, 0), **speak_kw):
+    runner = make_runner(speak=make_speak(tmp_path, **speak_kw))
+    monkeypatch.setattr(runner, "_now", lambda: now)
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_memo_reminds_today_note(notes_dir, tmp_path, monkeypatch):
+    (notes_dir / "メモ.md").write_text("牛乳を買う\n詳細...", "utf-8")
+    runner = make_memo_runner(tmp_path, monkeypatch)
+    line = await runner._check_memo()
+    assert line is not None
+    assert "牛乳を買う" in line
+    # Same day: already reminded → silence, also across a restart.
+    assert await runner._check_memo() is None
+    fresh = make_memo_runner(tmp_path, monkeypatch)
+    assert fresh._state.get("memo_done") == dt.date.today().isoformat()
+    assert await fresh._check_memo() is None
+
+
+@pytest.mark.asyncio
+async def test_memo_outside_window_is_silent(notes_dir, tmp_path, monkeypatch):
+    (notes_dir / "メモ.md").write_text("牛乳を買う", "utf-8")
+    runner = make_memo_runner(tmp_path, monkeypatch, now=dt.time(12, 0))
+    assert await runner._check_memo() is None
+
+
+@pytest.mark.asyncio
+async def test_memo_ignores_old_notes(notes_dir, tmp_path, monkeypatch):
+    import os as _os
+    import time as _time
+
+    path = notes_dir / "old.md"
+    path.write_text("昔のメモ", "utf-8")
+    yesterday = _time.time() - 86400
+    _os.utime(path, (yesterday, yesterday))
+    runner = make_memo_runner(tmp_path, monkeypatch)
+    assert await runner._check_memo() is None
+
+
+@pytest.mark.asyncio
+async def test_memo_snippet_clamped(notes_dir, tmp_path, monkeypatch):
+    (notes_dir / "long.md").write_text("あ" * 200, "utf-8")
+    runner = make_memo_runner(tmp_path, monkeypatch)
+    line = await runner._check_memo()
+    assert line is not None
+    assert "あ" * hb.MEMO_SNIPPET_CHARS in line
+    assert "あ" * (hb.MEMO_SNIPPET_CHARS + 1) not in line
+
+
+def test_memo_snippet_skips_markup_and_blank():
+    assert hb._memo_snippet("\n\n# 見出し\n本文") == "見出し"
+    assert hb._memo_snippet("- 牛乳を買う") == "牛乳を買う"
+    assert hb._memo_snippet("   \n\n") == ""
+
+
+# ---- Phase E: weather checker ----------------------------------------
+
+
+def make_weather_runner(tmp_path, monkeypatch, now=dt.time(7, 0)):
+    runner = make_runner(
+        speak=make_speak(tmp_path, weather_area="270000", weather_city="2720900")
+    )
+    monkeypatch.setattr(runner, "_now", lambda: now)
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_weather_speaks_once_per_day(tmp_path, monkeypatch):
+    runner = make_weather_runner(tmp_path, monkeypatch)
+    calls = []
+
+    async def fake_check(area, city, threshold, *, today=None):
+        calls.append((area, city, threshold))
+        return "今日は雨が降りそうだよ"
+
+    monkeypatch.setattr(hb.weather, "check_weather", fake_check)
+    line = await runner._check_weather()
+    assert line == "今日は雨が降りそうだよ"
+    assert calls == [("270000", "2720900", 50)]
+    # Daily flag set: no second fetch, no second line.
+    assert await runner._check_weather() is None
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_weather_normal_day_marks_done_silently(tmp_path, monkeypatch):
+    runner = make_weather_runner(tmp_path, monkeypatch)
+
+    async def fake_check(area, city, threshold, *, today=None):
+        return None
+
+    monkeypatch.setattr(hb.weather, "check_weather", fake_check)
+    assert await runner._check_weather() is None
+    assert runner._state.get("weather_done") == dt.date.today().isoformat()
+
+
+@pytest.mark.asyncio
+async def test_weather_fetch_failure_retries(tmp_path, monkeypatch):
+    runner = make_weather_runner(tmp_path, monkeypatch)
+
+    async def fail(area, city, threshold, *, today=None):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(hb.weather, "check_weather", fail)
+    assert await runner._check_weather() is None
+    # Flag NOT set: the next tick inside the window retries.
+    assert "weather_done" not in runner._state
+
+
+@pytest.mark.asyncio
+async def test_weather_outside_window_no_fetch(tmp_path, monkeypatch):
+    runner = make_weather_runner(tmp_path, monkeypatch, now=dt.time(12, 0))
+
+    async def boom(*a, **k):
+        raise AssertionError("must not fetch outside the window")
+
+    monkeypatch.setattr(hb.weather, "check_weather", boom)
+    assert await runner._check_weather() is None
+
+
+# ---- Phase E: tick + speech ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tick_speak_disabled_without_config():
+    runner = make_runner()  # speak=None
+    assert await runner._tick_speak() is False
+
+
+@pytest.mark.asyncio
+async def test_perform_speak_counts_and_returns_to_idle(tmp_path, monkeypatch):
+    gw = FakeGateway()
+    runner = make_runner(gw, speak=make_speak(tmp_path))
+    spoken = []
+
+    async def fake_synth(arguments, *, gateway=None, registry=None):
+        spoken.append(arguments["text"])
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "stackchan_mcp.tts.orchestrator.synthesize_and_send", fake_synth
+    )
+    await runner._perform_speak("テスト発話")
+    assert spoken == ["テスト発話"]
+    faces = [a["face"] for n, a in gw.esp32.calls if n == "self.display.set_avatar"]
+    assert faces == ["happy", "idle"]
+    assert runner._spoken_today() == 1
+    # Persisted: a restarted runner sees the same count.
+    fresh = make_runner(FakeGateway(), speak=make_speak(tmp_path))
+    assert fresh._spoken_today() == 1
+
+
+@pytest.mark.asyncio
+async def test_tick_speak_suppressed_then_gesture_fallback(tmp_path, monkeypatch):
+    gw = FakeGateway()
+    runner = make_runner(gw, speak=make_speak(tmp_path))
+    monkeypatch.setattr(hb, "is_recording", lambda: True)
+    assert await runner._tick_speak() is False
