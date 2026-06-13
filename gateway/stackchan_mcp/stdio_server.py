@@ -19,7 +19,7 @@ from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
 from mcp.types import Notification, TextContent, Tool
 
-from . import __version__, notes, switchbot, web_search
+from . import __version__, control, notes, switchbot, web_search
 from .gateway import get_gateway
 from .notify_config import NotifyConfig, load_notify_config
 from .stt import listen_and_transcribe
@@ -399,6 +399,12 @@ async def _dispatch_mcp_tool(
     # they never touch the ESP32, so they are handled before the
     # device_connected guard below.
     if name in web_search.TOOL_NAMES:
+        # Phase F: during a voice turn, surface "調べ中" on the device so
+        # the user sees the robot is researching. Outside a turn (e.g. a
+        # Claude Desktop call) voice_turn_active is falsy and nothing is
+        # shown. The hermes bridge's finally clears the status text.
+        if getattr(gateway, "voice_turn_active", False):
+            await control.set_device_status_text(gateway, control.STATUS_SEARCHING)
         try:
             result = await web_search.search(
                 arguments.get("query", ""), arguments.get("max_results")
@@ -594,6 +600,10 @@ async def _dispatch_mcp_tool(
         ),
         "set_proximity_config": (
             "self.touch.set_proximity_config",
+            arguments,
+        ),
+        "set_status_text": (
+            "self.display.set_status_text",
             arguments,
         ),
         "set_led": (
@@ -1059,6 +1069,25 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         },
                     },
                     "required": ["enabled", "threshold"],
+                },
+            ),
+            Tool(
+                name="set_status_text",
+                description=(
+                    "Show a short one-line status string on the device screen "
+                    "under the avatar (e.g. 'きいてるよ', '考え中', '調べ中'). Pass "
+                    "an empty string to clear it. Used by the gateway's voice "
+                    "pipeline for UI feedback; safe to call directly too."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "Status line to show; empty string clears it",
+                        },
+                    },
+                    "required": ["text"],
                 },
             ),
             Tool(

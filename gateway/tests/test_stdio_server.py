@@ -817,3 +817,95 @@ class _FakeNotificationSession:
                 exclude_none=True,
             )
         )
+
+
+# ---- Phase F: set_status_text tool + voice-turn 調べ中 hook -----------
+
+
+@pytest.mark.asyncio
+async def test_list_tools_includes_set_status_text():
+    """set_status_text is exposed with a required text string."""
+    server = create_server()
+
+    result = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+
+    tool = next(
+        (t for t in result.root.tools if t.name == "set_status_text"), None
+    )
+    assert tool is not None, "set_status_text tool should be registered"
+    assert tool.inputSchema["properties"]["text"]["type"] == "string"
+    assert tool.inputSchema["required"] == ["text"]
+
+
+@pytest.mark.asyncio
+async def test_set_status_text_relays_to_device():
+    """set_status_text maps to self.display.set_status_text."""
+    calls = []
+
+    class FakeESP32:
+        device_connected = True
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            return {"content": [{"type": "text", "text": "{}"}]}, None
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    content = await stdio_server._dispatch_mcp_tool(
+        "set_status_text", {"text": "考え中"}, FakeGateway()
+    )
+    assert calls == [("self.display.set_status_text", {"text": "考え中"})]
+    assert content  # non-empty TextContent list
+
+
+@pytest.mark.asyncio
+async def test_web_search_shows_searching_during_voice_turn(monkeypatch):
+    """During a voice turn, web_search flips the device status to 調べ中."""
+    status_calls = []
+
+    async def fake_search(query, max_results=None):
+        return {"results": []}
+
+    async def fake_status(gateway, text):
+        status_calls.append(text)
+
+    monkeypatch.setattr(stdio_server.web_search, "search", fake_search)
+    monkeypatch.setattr(
+        stdio_server.control, "set_device_status_text", fake_status
+    )
+
+    class FakeGateway:
+        voice_turn_active = True
+
+    await stdio_server._dispatch_mcp_tool(
+        "web_search", {"query": "天気"}, FakeGateway()
+    )
+    assert status_calls == [stdio_server.control.STATUS_SEARCHING]
+
+
+@pytest.mark.asyncio
+async def test_web_search_no_status_outside_voice_turn(monkeypatch):
+    """Outside a voice turn (e.g. Claude Desktop), no status text fires."""
+    status_calls = []
+
+    async def fake_search(query, max_results=None):
+        return {"results": []}
+
+    async def fake_status(gateway, text):
+        status_calls.append(text)
+
+    monkeypatch.setattr(stdio_server.web_search, "search", fake_search)
+    monkeypatch.setattr(
+        stdio_server.control, "set_device_status_text", fake_status
+    )
+
+    class FakeGateway:
+        voice_turn_active = False
+
+    await stdio_server._dispatch_mcp_tool(
+        "web_search", {"query": "天気"}, FakeGateway()
+    )
+    assert status_calls == []

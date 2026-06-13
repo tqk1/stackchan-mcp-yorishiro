@@ -46,10 +46,25 @@ class Gateway:
         # conversation the user started.
         self.last_human_interaction_monotonic: float | None = None
         self.esp32.on_human_interaction = self.note_human_interaction
+        # Phase F (yorishiro fork): re-apply persisted control state
+        # (speaker volume / mute) once a (re)connected device finishes
+        # MCP init. Wired the same way as on_human_interaction above.
+        self.esp32.on_device_ready = self._on_device_ready
+        # Phase F (yorishiro fork): True while a voice turn is in flight.
+        # The status-text feedback (and the web_search "調べ中" hook) read
+        # this so they only touch the device display during a real turn,
+        # never for Claude-Desktop-driven tool calls.
+        self.voice_turn_active = False
 
     def note_human_interaction(self) -> None:
         """Record that the user just interacted (voice turn / touch)."""
         self.last_human_interaction_monotonic = time.monotonic()
+
+    async def _on_device_ready(self) -> None:
+        """Device finished MCP init — restore persisted control state."""
+        from . import control
+
+        await control.apply_persisted_volume(self)
 
     @property
     def vision_url(self) -> str:

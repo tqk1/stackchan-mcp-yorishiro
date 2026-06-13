@@ -1,3 +1,31 @@
+# Phase F — ダッシュボード操作・顔ステータス・仕草OFF・ウェイクワード（2026-06-13 着手、計画承認済み）
+
+計画: ~/.claude/plans/iterative-twirling-bengio.md / ブランチ: feature/phase-f-dashboard（c1-prox-reflex から分岐）
+
+## ユーザー決定事項（2026-06-13 AskUserQuestion）
+- ステータス表示は**表情+テキスト両方**（firmware に status label 追加 + フォント差し替え）
+- heartbeat 仕草は**デフォルト OFF + ダッシュボードでトグル**（通知発話は維持）
+- ウェイクワードは**「スタックちゃん」単体**で反応（「ハイ、スタックちゃん」は不可）→ カスタムウェイクワード（MultiNet ピンイン近似）で実験
+- worklog + learning-report（docs/phase-f-report.md）両方作成
+- 開発スタイル: Fable=指揮官、実装は Opus エージェント委任（memory 記録済み）
+
+## チェックリスト
+- [x] F0: ブランチ作成・todo・memory 記録
+- [~] F1: firmware 3変更 → release ビルド（~25分）
+  - [x] 変更1: status_label_ + EnsureStatusLabel/SetStatusText + self.display.set_status_text MCP ツール（stackchan.cc）。ラベルは active screen の text font（assets の common puhui、日本語グリフ入り）を継承するので追加フォント不要
+  - [!] 変更2: フォント basic→common は **見送り**。調査の結果、実行時フォントは既に assets の `font_puhui_common_20_4.bin`（日本語入り）で、basic は app に焼く小サブセットのフォールバックに過ぎない。CMakeLists を `font_puhui_20_4` にすると (a) app バイナリが ~2MB 増（現 3.42MB / partition 3.94MB → 確実に溢れる）、(b) build_default_assets.py の get_text_font_path が "basic" を要求するため common フォントが assets から外れて逆に日本語が壊れる。→ 指揮官判断待ち（report 参照）
+  - [x] 変更3: カスタムウェイクワード "su ta ke qiang"（スタックちゃん）。**sdkconfig 直編集は set-target(fullclean) で消える**ため board config.json の sdkconfig_append に投入（USE_AFE off / USE_CUSTOM on / 3設定 / SR_MN_CN_MULTINET7_QUANT=y）。assets ビルドログで mn7_cn+fst パック・スタックちゃん threshold 0.2 確認 ✅
+  - [x] release ビルド完走（BUILD_EXIT_CODE=0、~25分）。**app サイズ 0x36cab0 (3.43MB) / partition 0x3f0000 (3.94MB) → 0x83550 (538KB, 13%) free**。MultiNet モデルは assets 行き（3.8MB、8MB partition に収まる）なので app はほぼ増えず。フォントは basic 据え置きのため肥大なし。**変更2 を入れていたら確実に溢れていた**
+  - 変更ファイル: `firmware/main/boards/stackchan/stackchan.cc`(+95)、`firmware/main/boards/stackchan/config.json`。sdkconfig は無変更（ビルド時 config.json append から適用）
+  - **flash は app だけでは不足**: ウェイクワードの MultiNet は generated_assets.bin（assets partition 0x800000）に入る。新ウェイクワードを効かせるには assets も flash 必須（詳細は report）
+- [x] F2: gateway 完了（Opus agent） — control.py 新規（音量state/ミュート/trigger_listen/set_device_status_text）+ /control/* 8ルート + 認証ガード拡張 + heartbeat set_gestures + esp32_client に on_device_ready フック（接続時の音量再適用、1.5s遅延+リトライ1回）+ hermes_bridge「きいてるよ→考え中→finally消去」+ voice_turn_active フラグ + web_search「調べ中」フック + set_status_text ツール宣言。**テスト 660 件パス（+53）、ruff クリーン**。REST 契約逸脱なし
+- [x] F3: dashboard 完了（Opus agent） — status_api.py に _proxy_control（Bearer+Host 付与、未設定503/不達502）+ do_POST 新設。dashboard.html に「🤖 スタックちゃん」カード（接続バッジ/音量/ミュート/聞き取り/近接トグル+閾値/仕草トグル/テスト発話/表情select、ドラッグ中の自動更新上書き抑止・連打防止）。py_compile OK・モック gateway E2E パス。バックアップ: *.bak-20260613。**sudo 手順は status-api drop-in に STACKCHAN_TOKEN（worklog に転記予定）**
+- [ ] F4: flash（app のみ）+ ユーザー sudo 作業（heartbeat.conf GESTURES=0 / status-api drop-in に STACKCHAN_TOKEN / 両サービス再起動）+ E2E
+- [ ] F5: ウェイクワード実機実験（検知率・誤検知。不足ならピンイン/閾値変えて再試行）
+- [ ] F6: worklog + phase-f-report.md + CLAUDE.md ステータス更新
+
+---
+
 # 2026-06-13 — Phase E 仕上げ + LTR-553 再テスト
 
 ## 計画（ユーザー承認済み 2026-06-13 朝）

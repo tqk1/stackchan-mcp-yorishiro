@@ -342,6 +342,19 @@ def test_from_env_gestures_off(monkeypatch):
     assert runner._gestures is False
 
 
+# ---- Phase F: runtime gesture toggle ---------------------------------
+
+
+def test_set_gestures_toggles_runtime_flag():
+    runner = make_runner(gestures=True)
+    assert runner.gestures_enabled is True
+    runner.set_gestures(False)
+    assert runner.gestures_enabled is False
+    assert runner._gestures is False
+    runner.set_gestures(True)
+    assert runner.gestures_enabled is True
+
+
 # ---- Phase E: suppression --------------------------------------------
 
 

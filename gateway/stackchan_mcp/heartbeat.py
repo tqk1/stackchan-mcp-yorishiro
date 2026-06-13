@@ -314,6 +314,21 @@ class HeartbeatRunner:
             "on" if self._speak else "off",
         )
 
+    @property
+    def gestures_enabled(self) -> bool:
+        """Whether random idle gestures fire on each tick (Phase F)."""
+        return self._gestures
+
+    def set_gestures(self, enabled: bool) -> None:
+        """Toggle idle gestures at runtime (Phase F dashboard control).
+
+        A thin public wrapper over ``_gestures``; the tick loop's own
+        ``if self._gestures`` check (in :meth:`_loop`) picks this up on
+        the next tick. Notification speech (:meth:`_tick_speak`) is
+        unaffected.
+        """
+        self._gestures = bool(enabled)
+
     async def stop(self) -> None:
         if self._task is None:
             return

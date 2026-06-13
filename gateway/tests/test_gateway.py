@@ -249,3 +249,30 @@ async def test_gateway_mdns_stop_failure_does_not_mask_shutdown(
     assert gw._mdns_advertiser is None
     assert gw.esp32._server is None
     assert "mDNS advertisement shutdown failed" in caplog.text
+
+
+# ---- Phase F: device-ready connection hook ----------------------------
+
+
+def test_gateway_wires_device_ready_to_esp32():
+    """The Gateway registers on_device_ready and starts voice_turn_active off."""
+    gw = Gateway()
+    assert gw.esp32.on_device_ready is not None
+    assert gw.voice_turn_active is False
+
+
+@pytest.mark.asyncio
+async def test_on_device_ready_applies_persisted_volume(monkeypatch):
+    """The connection hook re-applies the persisted volume via control."""
+    import stackchan_mcp.control as control
+
+    applied = []
+
+    async def fake_apply(gateway):
+        applied.append(gateway)
+
+    monkeypatch.setattr(control, "apply_persisted_volume", fake_apply)
+    gw = Gateway()
+    # Invoke the callback the way ESP32Manager would after MCP init.
+    await gw.esp32.on_device_ready()
+    assert applied == [gw]

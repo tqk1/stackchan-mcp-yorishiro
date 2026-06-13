@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
+from . import control
 from .notes import TOOL_NAMES as NOTES_TOOL_NAMES
 from .notify_config import NotifyConfig
 from .queue import CommandQueue, QueueFull, QueueItem, build_queue_full_error
@@ -49,6 +50,17 @@ NON_LOOPBACK_TOKEN_REQUIRED_MESSAGE = (
 DISCONNECTED_DEVICE_PAYLOAD = {
     "error": "No ESP32 device connected. Please check the device."
 }
+#: Path prefix for the Phase F dashboard control routes. Token-guarded
+#: alongside /mcp and /status (see _GuardedASGIApp.__call__).
+CONTROL_PATH_PREFIX = "/control"
+#: Avatar faces accepted by POST /control/avatar (mirrors the firmware
+#: AvatarSet faces plus "off").
+CONTROL_AVATAR_FACES = frozenset(
+    {"idle", "happy", "thinking", "sad", "surprised", "embarrassed", "off"}
+)
+#: Upper bound on POST /control/say text (one spoken breath on a 1 W
+#: speaker; longer monologues kill the rhythm).
+CONTROL_SAY_MAX_CHARS = 200
 SERVER_SHUTDOWN_ERROR_CODE = -32000
 SERVER_SHUTDOWN_ERROR_MESSAGE = "stackchan MCP HTTP server is shutting down"
 
@@ -99,6 +111,112 @@ def make_dispatch_fn(gateway: Any) -> DispatchFn:
     return dispatch
 
 
+# ---- Phase F dashboard control helpers --------------------------------
+
+
+async def _read_json_body(request: Request) -> dict[str, Any]:
+    """Best-effort JSON body as a dict ({} for empty / non-object)."""
+    try:
+        data = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _control_json(payload: dict[str, Any], *, status: int = 200) -> JSONResponse:
+    code = status
+    if not payload.get("ok", True) and status == 200:
+        # A device-call failure without an explicit status maps to 502.
+        code = 502
+    return JSONResponse(payload, status_code=code)
+
+
+def _control_error(message: str, *, status: int) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": message}, status_code=status)
+
+
+def _device_tool_payload(content: list[Any]) -> Any:
+    """Extract the JSON payload (or raw text) from an ESP32 tool result.
+
+    The device tools come back as a list of ``TextContent``; the first
+    text item is usually a JSON document (e.g. get_touch_state) but can
+    also be a plain string. Returns a dict when parseable, the raw
+    string otherwise, or None when there is no text content.
+    """
+    for item in content:
+        text = getattr(item, "text", None)
+        if text is None and isinstance(item, dict):
+            text = item.get("text")
+        if not isinstance(text, str):
+            continue
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return text
+    return None
+
+
+def _content_has_error(content: list[Any]) -> str | None:
+    """Return the error string when a device tool result carried one."""
+    payload = _device_tool_payload(content)
+    if isinstance(payload, dict) and "error" in payload:
+        return str(payload["error"])
+    return None
+
+
+def _control_device_result(
+    content: list[Any], **extra: Any
+) -> JSONResponse:
+    """Map a device tool dispatch result to a control JSON response."""
+    error = _content_has_error(content)
+    if error is not None:
+        return _control_error(error, status=502)
+    return _control_json({"ok": True, **extra})
+
+
+async def _build_control_status(gateway: Any) -> dict[str, Any]:
+    """Assemble the GET /control/status payload (REST contract)."""
+    connected = bool(gateway.esp32.device_connected)
+    state = control.load_state()
+    volume: int | None = state["volume"] if connected else None
+    muted = state["muted"]
+
+    heartbeat = _heartbeat_status(gateway)
+    proximity = await _proximity_status(gateway) if connected else None
+
+    return {
+        "ok": True,
+        "esp32_connected": connected,
+        "volume": volume,
+        "muted": muted,
+        "heartbeat": heartbeat,
+        "proximity": proximity,
+    }
+
+
+def _heartbeat_status(gateway: Any) -> dict[str, Any] | None:
+    runner = getattr(gateway, "_heartbeat", None)
+    if runner is None:
+        return None
+    return {
+        "gestures": bool(runner.gestures_enabled),
+        "speak": runner._speak is not None,
+        "interval_min": runner._interval_min,
+    }
+
+
+async def _proximity_status(gateway: Any) -> dict[str, Any] | None:
+    content = await _dispatch_mcp_tool("get_touch_state", {}, gateway)
+    payload = _device_tool_payload(content)
+    if not isinstance(payload, dict):
+        return None
+    enabled = payload.get("prox_reflex_enabled")
+    threshold = payload.get("prox_threshold")
+    if not isinstance(enabled, bool) or not isinstance(threshold, int):
+        return None
+    return {"enabled": enabled, "threshold": threshold}
+
+
 def build_app(
     queue: CommandQueue,
     *,
@@ -144,6 +262,99 @@ def build_app(
         )
         return JSONResponse(status_payload)
 
+    async def control_status(_request: Request) -> JSONResponse:
+        return JSONResponse(await _build_control_status(gateway))
+
+    async def control_volume(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        volume = body.get("volume")
+        if not isinstance(volume, int) or isinstance(volume, bool) or not 0 <= volume <= 100:
+            return _control_error("volume must be an integer 0..100", status=400)
+        return _control_json(await control.set_volume(gateway, volume))
+
+    async def control_mute(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        muted = body.get("muted")
+        if not isinstance(muted, bool):
+            return _control_error("muted must be a boolean", status=400)
+        result = await (control.mute(gateway) if muted else control.unmute(gateway))
+        return _control_json(result)
+
+    async def control_listen(_request: Request) -> JSONResponse:
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        result = await control.trigger_listen(gateway)
+        if not result.get("ok") and result.get("error") == "already listening":
+            return _control_json(result, status=409)
+        return _control_json(result)
+
+    async def control_proximity(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        enabled = body.get("enabled")
+        threshold = body.get("threshold")
+        if not isinstance(enabled, bool):
+            return _control_error("enabled must be a boolean", status=400)
+        if (
+            not isinstance(threshold, int)
+            or isinstance(threshold, bool)
+            or not 0 <= threshold <= 2047
+        ):
+            return _control_error("threshold must be an integer 0..2047", status=400)
+        content = await _dispatch_mcp_tool(
+            "set_proximity_config",
+            {"enabled": enabled, "threshold": threshold},
+            gateway,
+        )
+        return _control_device_result(content, enabled=enabled, threshold=threshold)
+
+    async def control_heartbeat(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        runner = getattr(gateway, "_heartbeat", None)
+        if runner is None:
+            return _control_error("heartbeat not running", status=503)
+        gestures = body.get("gestures")
+        if not isinstance(gestures, bool):
+            return _control_error("gestures must be a boolean", status=400)
+        runner.set_gestures(gestures)
+        return _control_json({"ok": True, "gestures": runner.gestures_enabled})
+
+    async def control_avatar(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        face = body.get("face")
+        if face not in CONTROL_AVATAR_FACES:
+            return _control_error(
+                f"face must be one of {sorted(CONTROL_AVATAR_FACES)}", status=400
+            )
+        content = await _dispatch_mcp_tool("set_avatar", {"face": face}, gateway)
+        return _control_device_result(content, face=face)
+
+    async def control_say(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return _control_error("text must be a non-empty string", status=400)
+        if len(text) > CONTROL_SAY_MAX_CHARS:
+            return _control_error(
+                f"text exceeds {CONTROL_SAY_MAX_CHARS} characters", status=400
+            )
+        from .tts.orchestrator import synthesize_and_send
+
+        try:
+            result = await synthesize_and_send({"text": text}, gateway=gateway)
+        except (ValueError, NotImplementedError, RuntimeError, ConnectionError) as exc:
+            return _control_error(f"say failed: {exc}", status=502)
+        return _control_json({"ok": True, "tts": result})
+
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
         dispatcher_task: asyncio.Task[None] | None = None
@@ -170,6 +381,15 @@ def build_app(
         ),
         Route("/healthz", endpoint=healthz, methods=["GET"]),
         Route("/status", endpoint=status, methods=["GET"]),
+        # Phase F dashboard control routes (token-guarded by prefix).
+        Route("/control/status", endpoint=control_status, methods=["GET"]),
+        Route("/control/volume", endpoint=control_volume, methods=["POST"]),
+        Route("/control/mute", endpoint=control_mute, methods=["POST"]),
+        Route("/control/listen", endpoint=control_listen, methods=["POST"]),
+        Route("/control/proximity", endpoint=control_proximity, methods=["POST"]),
+        Route("/control/heartbeat", endpoint=control_heartbeat, methods=["POST"]),
+        Route("/control/avatar", endpoint=control_avatar, methods=["POST"]),
+        Route("/control/say", endpoint=control_say, methods=["POST"]),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.command_queue = queue
@@ -380,7 +600,11 @@ class _GuardedASGIApp:
                 send,
             )
             return
-        if self._token and scope.get("path") in {"/mcp", "/status"}:
+        path = scope.get("path", "")
+        token_protected = path in {"/mcp", "/status"} or path.startswith(
+            CONTROL_PATH_PREFIX
+        )
+        if self._token and token_protected:
             expected = f"Bearer {self._token}"
             if request.headers.get("authorization") != expected:
                 await PlainTextResponse(

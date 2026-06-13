@@ -933,3 +933,41 @@ async def test_device_driven_listen_cleanup_on_disconnect(manager_with_hook):
     # No push should have fired for the aborted capture.
     assert calls == []
 
+
+
+# ---- Phase F: on_device_ready hook ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_device_ready_hook_invokes_callback():
+    """_run_device_ready_hook awaits the registered callback."""
+    mgr = ESP32Manager()
+    fired = asyncio.Event()
+
+    async def cb():
+        fired.set()
+
+    mgr.on_device_ready = cb
+    await mgr._run_device_ready_hook()
+    assert fired.is_set()
+
+
+@pytest.mark.asyncio
+async def test_run_device_ready_hook_swallows_errors():
+    """A failing on_device_ready callback must not propagate."""
+    mgr = ESP32Manager()
+
+    async def cb():
+        raise RuntimeError("boom")
+
+    mgr.on_device_ready = cb
+    # Must not raise.
+    await mgr._run_device_ready_hook()
+
+
+@pytest.mark.asyncio
+async def test_run_device_ready_hook_noop_when_unset():
+    """No callback registered → the hook is a quiet no-op."""
+    mgr = ESP32Manager()
+    assert mgr.on_device_ready is None
+    await mgr._run_device_ready_hook()

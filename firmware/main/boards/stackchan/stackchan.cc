@@ -663,6 +663,15 @@ private:
     esp_timer_handle_t avatar_init_timer_ = nullptr;
     std::string current_avatar_face_ = "idle";
 
+    // Small status text overlay (Phase F). A short label kept in front of the
+    // avatar near the top-centre of the LCD, used to surface gateway-side
+    // status ("きいてるよ", "考え中", "調べ中", ...) via the
+    // self.display.set_status_text MCP tool. Created lazily on the active
+    // screen like avatar_img_, with its own visibility so set_avatar("off")
+    // does not affect it. Inherits the screen's text font (the common puhui
+    // font packed into assets, which carries Japanese glyphs).
+    lv_obj_t* status_label_ = nullptr;
+
     // Dynamic avatar set loaded via the load_avatar_set MCP tool. Stays
     // unloaded by default — the index-based image lookups then fall back
     // to the static const tables in avatar_images.h (placeholder or local
@@ -4579,6 +4588,68 @@ private:
         return true;
     }
 
+    // Create status_label_ on the active LVGL screen, anchored near the top
+    // centre and styled with a translucent black pill so the text stays
+    // readable over any avatar frame. Caller must hold the display lock.
+    // Returns true on success or when status_label_ already exists. Starts
+    // hidden; SetStatusText() controls visibility.
+    bool EnsureStatusLabel() {
+        if (status_label_ != nullptr) {
+            return true;
+        }
+        lv_obj_t* screen = lv_screen_active();
+        if (screen == nullptr) {
+            return false;
+        }
+        status_label_ = lv_label_create(screen);
+        if (status_label_ == nullptr) {
+            return false;
+        }
+        // Translucent black backing for legibility over the face. The label
+        // inherits the screen's text font (the common puhui font with
+        // Japanese glyphs), so no explicit font is set here.
+        lv_obj_set_style_bg_color(status_label_, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(status_label_, LV_OPA_60, 0);
+        lv_obj_set_style_text_color(status_label_, lv_color_white(), 0);
+        lv_obj_set_style_radius(status_label_, 8, 0);
+        lv_obj_set_style_pad_left(status_label_, 8, 0);
+        lv_obj_set_style_pad_right(status_label_, 8, 0);
+        lv_obj_set_style_pad_top(status_label_, 3, 0);
+        lv_obj_set_style_pad_bottom(status_label_, 3, 0);
+        lv_obj_align(status_label_, LV_ALIGN_TOP_MID, 0, 6);
+        lv_obj_clear_flag(status_label_, LV_OBJ_FLAG_SCROLLABLE);
+        // Hidden until the first non-empty SetStatusText().
+        lv_obj_add_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(status_label_);
+        ESP_LOGI(TAG, "Status label created on active screen");
+        return true;
+    }
+
+    // Public entry for the self.display.set_status_text MCP tool. An empty
+    // string hides the label; any non-empty text shows it, brings it to the
+    // foreground (above the avatar) and updates the caption. Visibility is
+    // independent of the avatar layer, so set_avatar("off") does not clear
+    // the status text. Safe to call from any task.
+    bool SetStatusText(const char* text) {
+        if (display_ == nullptr) {
+            ESP_LOGW(TAG, "SetStatusText ignored: display_ not ready");
+            return false;
+        }
+        const char* safe = (text != nullptr) ? text : "";
+        DisplayLockGuard lock(display_);
+        if (!EnsureStatusLabel()) {
+            return false;
+        }
+        if (safe[0] == '\0') {
+            lv_obj_add_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_label_set_text(status_label_, safe);
+            lv_obj_clear_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(status_label_);
+        }
+        return true;
+    }
+
     // Apply the requested face to avatar_img_. Returns false if the face is
     // unknown or the avatar object cannot be created yet.
     bool SetAvatarExpressionLocked(const char* face) {
@@ -5797,6 +5868,30 @@ private:
                         "Display not ready yet; retry after a moment.");
                 }
                 ESP_LOGI(TAG, "set_avatar: face=%s applied=%d", face.c_str(), applied);
+                return root;
+            });
+
+        // Phase F: small status caption shown in front of the avatar near the
+        // top of the LCD. The gateway drives it to surface its own state
+        // ("きいてるよ", "考え中", "調べ中", ...). An empty string clears it.
+        // Visibility is independent of the avatar, so set_avatar("off") leaves
+        // any status text in place.
+        mcp_server.AddTool(
+            "self.display.set_status_text",
+            "Set a short status caption shown over the avatar near the top of "
+            "the LCD. Pass an empty string to hide it. Used to surface "
+            "gateway-side state (listening, thinking, searching, ...).",
+            PropertyList({Property("text", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string text = properties["text"].value<std::string>();
+                bool applied = SetStatusText(text.c_str());
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", applied);
+                if (!applied) {
+                    cJSON_AddStringToObject(root, "error",
+                        "Display not ready yet; retry after a moment.");
+                }
+                ESP_LOGI(TAG, "set_status_text: text='%s' applied=%d", text.c_str(), applied);
                 return root;
             });
 

@@ -226,6 +226,7 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
     """POST /voice_turn — run one full voice conversation turn."""
     # Lazy imports keep capture-only deployments free of the stt/tts
     # extras (same pattern as the /pcm handler).
+    from . import control
     from .capture_server import GATEWAY_KEY
     from .stt import get_registry as get_stt_registry
     from .stt.orchestrator import DEFAULT_ENGINE as DEFAULT_STT_ENGINE
@@ -246,7 +247,41 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
     # heartbeat from speaking into that gap.
     gateway.note_human_interaction()
 
+    # Phase F: mark the turn in flight so device-side tools (web_search)
+    # can show a "調べ中" status, and always clear the status text +
+    # flag in the finally below so the display never gets stuck.
+    gateway.voice_turn_active = True
+
     session_id = request.headers.get("X-StackChan-Session", "")
+    try:
+        return await _run_voice_turn(
+            request,
+            gateway,
+            session_id,
+            get_stt_registry=get_stt_registry,
+            default_stt_engine=DEFAULT_STT_ENGINE,
+            synthesize_and_send=synthesize_and_send,
+            control=control,
+        )
+    finally:
+        # Phase F: always clear the on-device status text and drop the
+        # in-flight flag, no matter how the turn ended (success, early
+        # return, or exception).
+        gateway.voice_turn_active = False
+        await control.set_device_status_text(gateway, control.STATUS_CLEAR)
+
+
+async def _run_voice_turn(
+    request: web.Request,
+    gateway: "Gateway",
+    session_id: str,
+    *,
+    get_stt_registry: Any,
+    default_stt_engine: str,
+    synthesize_and_send: Any,
+    control: Any,
+) -> web.Response:
+    """Body of one voice turn; the caller owns status-text cleanup."""
     if (request.content_length or 0) > MAX_OGG_BYTES:
         return web.json_response(
             {"ok": False, "error": "payload too large"}, status=413
@@ -285,18 +320,22 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
         )
     t_decode = time.monotonic()
 
-    engine = get_stt_registry().get(DEFAULT_STT_ENGINE)
+    engine = get_stt_registry().get(default_stt_engine)
     if engine is None:
         return web.json_response(
             {
                 "ok": False,
                 "error": (
-                    f"STT engine '{DEFAULT_STT_ENGINE}' not registered — "
+                    f"STT engine '{default_stt_engine}' not registered — "
                     "install stackchan-mcp[stt-faster-whisper]"
                 ),
             },
             status=503,
         )
+    # Phase F: the capture already finished (audio arrives post-record),
+    # so "きいてるよ" reads naturally at the start of recognition; flip
+    # to "考え中" the moment STT is done and the brain takes over.
+    await control.set_device_status_text(gateway, control.STATUS_LISTENING)
     stt_result: dict[str, Any] = await engine.transcribe(pcm, language="ja")
     transcript = stt_result.get("text", "").strip()
     t_stt = time.monotonic()
@@ -308,6 +347,7 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
         )
 
     logger.info("voice_turn: transcript=%r session=%s", transcript[:120], session_id)
+    await control.set_device_status_text(gateway, control.STATUS_THINKING)
     try:
         reply, route = await generate_reply(transcript)
     except Exception as exc:

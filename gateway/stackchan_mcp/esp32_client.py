@@ -7,7 +7,7 @@ and as an MCP client that sends commands TO the ESP32.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 import json
 import logging
 import os
@@ -371,6 +371,11 @@ class ESP32Manager:
         # heartbeat's speak cooldown. Optional because the manager is
         # also constructed standalone in tests.
         self.on_human_interaction: Callable[[], None] | None = None
+        # Phase F (yorishiro fork): the owning Gateway wires this to
+        # control.apply_persisted_volume() so the user's chosen volume
+        # is restored once a (re)connected device finishes MCP init.
+        # Optional for the same standalone-test reason as above.
+        self.on_device_ready: Callable[[], Awaitable[None]] | None = None
         self._init_tasks: list[asyncio.Task] = []
         self._vision_url: str = ""
         self._vision_token: str = ""
@@ -740,8 +745,24 @@ class ESP32Manager:
                 device_id,
                 len(connection.tools),
             )
+            # Phase F (yorishiro fork): let the owning Gateway re-apply
+            # persisted state (volume) now the device is fully ready.
+            # Fire-and-forget so a slow/failing hook never stalls the
+            # init task; the callback owns its own error handling.
+            if self.on_device_ready is not None:
+                asyncio.create_task(self._run_device_ready_hook())
         else:
             logger.error("ESP32 MCP initialization failed")
+
+    async def _run_device_ready_hook(self) -> None:
+        """Invoke the on_device_ready callback, never propagating."""
+        callback = self.on_device_ready
+        if callback is None:
+            return
+        try:
+            await callback()
+        except Exception:
+            logger.exception("on_device_ready callback failed")
 
     async def _emit_stackchan_event(self, payload: dict[str, Any]) -> None:
         """Forward a firmware-originated stackchan event to the MCP client."""
