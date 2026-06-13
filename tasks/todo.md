@@ -1,3 +1,37 @@
+# 2026-06-13 — Phase E 仕上げ + LTR-553 再テスト
+
+## 計画（ユーザー承認済み 2026-06-13 朝）
+- [x] T1: 本番 conf 差し替え — ユーザーが sudo 実行、`Environment` で 30 分間隔・SPEAK=1・検証用上書き消滅を確認 ✅
+- [x] T2: LTR-553 再テスト — **前回結論が覆った**。手かざしに明確に反応（詳細下記）
+- [x] T3: ブランチ push — `feature/phase-d`（同期済み）・`feature/phase-e`（新規 push）✅
+- [ ] T4: 今夜の聴感②準備 — `rm ~/.stackchan/heartbeat_state.json` + 当日メモ書き足し → 18:00-21:00 ウィンドウでメモリマインド聴感確認（ユーザー実施）
+
+## T2 計測結果（2026-06-13 朝、稼働中 gateway :8767 経由で get_touch_state 連続サンプリング）
+| 状態 | ps_raw |
+|---|---|
+| ベースライン | 368〜388（揺らぎ±10） |
+| 手 1〜2cm | ~820〜1090 |
+| 手 10cm | ~1035〜**1277**（最強。至近では光軸ズレで反射光が受光部を外れる近接センサー特有の特性） |
+| 手 20〜30cm | 393〜448（+50 程度、ノイズと区別しづらい） |
+
+- 結論: **手かざし（〜10-15cm）は十分実用**。前回（6/11）の「前面シェルが光路を完全閉塞」は誤りだった（理由不明。前回はカメラ付近に手をかざしたがセンサー窓の実位置が違った可能性）。部屋スケール（1〜2m）は引き続き ToF Unit 待ち
+- 計測ヘルパー: `scratch/mcp_call.py`（単発 tools/call）、`scratch/ltr553_sample.py`（連続サンプリング）。mcp_repl.py は gateway を二重起動するため稼働中サービスとは併用不可 → :8767 直叩きに切替
+
+## ✅ C1 リフレックス有効化 完了（2026-06-13、ブランチ feature/c1-prox-reflex、ユーザー承認: 閾値600・後から変更可能に）
+- [x] firmware: PROX_REFLEX_ENABLED / PROX_PS_THRESHOLD を constexpr → NVS 読み込みのランタイム設定に変更（namespace `stackchan_prox`、デフォルト enabled=true / threshold=600）
+- [x] firmware: MCP ツール `self.touch.set_proximity_config(enabled, threshold)` 新設（NVS 永続化、再 flash 不要で変更可）。get_touch_state に prox_reflex_enabled / prox_threshold を追加
+- [x] gateway: stdio_server.py の tool_map + Tool 宣言に `set_proximity_config` を追加。テスト 607 件パス・ruff クリーン ✅
+- [x] ビルド（Docker espressif/idf:v5.5.2、フルビルド ~25分）→ flash（app のみ 0x20000 = ota_0、19秒、NVS 保持）
+- [x] 実機 E2E: シリアルログで 3 回発火確認（ps_raw 608 / 2012 / 848 → HAND → look up）、クールダウン抑制ログ・FAR 復帰も正常。gateway 再起動後 `set_proximity_config` の全経路疎通 ✅
+
+## ⚠️ flash 直後の「WiFi に繋がらない」インシデント（原因はルーター、firmware 無実）
+- 症状: flash 後 65 秒 `No AP found` → 設定モード（AP Xiaozhi-E79D、白い設定アイコン画面）に落ちた
+- 切り分け: NVS ダンプで wifi namespace 残存確認、otadata で ota_0 起動確認 → デバイス側は健全。razer-server の `wpa_cli scan_results` で**自宅ルーター (eoRT) の 2.4GHz 帯 (-g SSID) が電波ごと消えている**ことを発見（5GHz の -a のみ生存）
+- 解決: ルーター再起動で 2.4GHz 復活 → デバイス自動再接続（09:03、tools=31）
+- 教訓: CoreS3 は 2.4GHz 専用。「flash 直後に繋がらない」はまず環境（ルーターの 2.4GHz 停止・ch12/13 移動）を疑う。NVS/otadata の esptool ダンプで「デバイス側無実」を先に確定させると早い
+
+---
+
 # Phase E — 通知型 heartbeat: 価値があるときだけ話す（2026-06-12 着手）
 
 ## ユーザー決定事項（2026-06-12 AskUserQuestion で確認済み）

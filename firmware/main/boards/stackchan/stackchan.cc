@@ -7,6 +7,7 @@
 #include "i2c_device.h"
 #include "axp2101.h"
 #include "mcp_server.h"
+#include "settings.h"
 #include "led_strip.h"
 // Issue #79: servo driver is selectable at build time via Kconfig.
 //   - CONFIG_STACKCHAN_SERVO_SCSCL  (default): GPL-3.0 SCServo_lib
@@ -841,20 +842,24 @@ private:
     // low-level reflexes stay on the firmware. A rising-edge-only trigger
     // plus PROX_COOLDOWN_MS keeps a hand held over the sensor (or repeated
     // waving) from firing a chain of reactions.
-    // Reflex disabled (2026-06-11 real-hardware finding): the StackChan
-    // front shell has no opening for the LTR-553 window — a hand directly
-    // over the camera area leaves ps_raw flat at the ~380 panel-crosstalk
-    // baseline even at gain x64 / 15 pulses, so a hand can never be seen.
-    // The driver and the ps_raw diagnostics stay (harmless, and useful if
-    // the shell is ever opened up); room-scale proximity will come from an
-    // external ToF unit on Grove Port A instead.
-    static constexpr bool PROX_REFLEX_ENABLED  = false;
+    // Reflex re-enabled (2026-06-13 retest): contrary to the 2026-06-11
+    // finding, a hand IS visible through the front shell. Measured ps_raw:
+    // baseline 368-388 (panel crosstalk), hand at 1-2cm ~820-1090, hand at
+    // 10cm ~1035-1277 (strongest — at point-blank range the reflected spot
+    // partly misses the offset photodiode), hand at 20-30cm only ~393-448.
+    // So the hand-wave reflex works up to ~10-15cm; room-scale presence
+    // (1-2m) still needs an external ToF unit on Grove Port A.
+    // The enabled flag and threshold are runtime-tunable via the
+    // self.touch.set_proximity_config MCP tool and persist in NVS
+    // (namespace "stackchan_prox"); the defaults below apply on first boot.
+    static constexpr bool PROX_REFLEX_ENABLED_DEFAULT = true;
+    static constexpr int PROX_PS_THRESHOLD_DEFAULT    = 600;
+                                                       // raw PS counts (0..2047):
+                                                       // above the 20-30cm
+                                                       // bystander band (<=448),
+                                                       // below the weakest
+                                                       // hand-signal (~820)
     static constexpr int PROX_POLL_MS          = 100;  // same cadence as touch poll
-    static constexpr int PROX_PS_THRESHOLD     = 700;  // raw PS counts (0..2047).
-                                                       // Above the observed panel
-                                                       // crosstalk baseline (~380)
-                                                       // so NEAR/FAR logs stay
-                                                       // meaningful if re-enabled.
     static constexpr int PROX_DEBOUNCE_SAMPLES = 3;    // ~300 ms confirm; rejects
                                                        // single-sample IR glints
     static constexpr int PROX_COOLDOWN_MS      = 5000; // min gap between reflexes
@@ -868,6 +873,13 @@ private:
     std::unique_ptr<Ltr553> ltr553_;
     bool ltr553_ok_ = false;
     esp_timer_handle_t prox_poll_timer_ = nullptr;
+
+    // Runtime-tunable reflex config: loaded from NVS in
+    // InitializeLtr553Proximity(), written by set_proximity_config (MCP
+    // task). Read from the poll callback with the same benign torn-read
+    // trade-off as last_ps_raw_ below.
+    bool prox_reflex_enabled_ = PROX_REFLEX_ENABLED_DEFAULT;
+    int  prox_ps_threshold_   = PROX_PS_THRESHOLD_DEFAULT;
 
     // Proximity detection state (single-thread access from the
     // prox_poll_timer_ callback on ESP_TIMER_TASK, same model as the
@@ -4211,7 +4223,7 @@ private:
     // and is safe to call from the ESP_TIMER_TASK poll callback.
     void HandleProximity(int ps_raw) {
         ESP_LOGI(TAG, "proximity event: HAND ps_raw=%d (threshold=%d) -> look up",
-                 ps_raw, PROX_PS_THRESHOLD);
+                 ps_raw, prox_ps_threshold_);
         WriteHeadAngles(PROX_REACT_YAW_DEG, PROX_REACT_PITCH_DEG);
         SetAvatarExpressionIfActive("happy");
         ScheduleIdleRevert();
@@ -4239,15 +4251,15 @@ private:
         }
         last_ps_raw_ = ps;
 
-        // Periodic raw dump every 2 s, DEBUG level (calibration done
-        // 2026-06-11: panel-crosstalk baseline ~380, hand invisible).
+        // Periodic raw dump every 2 s, DEBUG level (calibration 2026-06-13:
+        // baseline ~380, hand at <=10cm ~820-1280).
         if (++prox_debug_tick_count_ >= PROX_DEBUG_LOG_TICKS) {
             prox_debug_tick_count_ = 0;
             ESP_LOGD(TAG, "proximity debug: ps_raw=%d sat=%d (threshold=%d)",
-                     ps, saturated ? 1 : 0, PROX_PS_THRESHOLD);
+                     ps, saturated ? 1 : 0, prox_ps_threshold_);
         }
 
-        if (ps >= PROX_PS_THRESHOLD) {
+        if (ps >= prox_ps_threshold_) {
             if (prox_over_count_ < PROX_DEBOUNCE_SAMPLES) {
                 prox_over_count_++;
             }
@@ -4260,9 +4272,9 @@ private:
             // value that caused it.
             ESP_LOGI(TAG, "proximity state: %s ps_raw=%d sat=%d (threshold=%d)",
                      detected ? "NEAR" : "FAR", ps, saturated ? 1 : 0,
-                     PROX_PS_THRESHOLD);
+                     prox_ps_threshold_);
         }
-        if (PROX_REFLEX_ENABLED && detected && !prox_detected_prev_) {
+        if (prox_reflex_enabled_ && detected && !prox_detected_prev_) {
             uint64_t now_us = esp_timer_get_time();
             if (now_us >= prox_cooldown_until_us_) {
                 HandleProximity(ps);
@@ -4286,6 +4298,16 @@ private:
             ltr553_.reset();
             return;
         }
+
+        {
+            Settings settings("stackchan_prox");
+            prox_reflex_enabled_ =
+                settings.GetBool("enabled", PROX_REFLEX_ENABLED_DEFAULT);
+            prox_ps_threshold_ =
+                settings.GetInt("threshold", PROX_PS_THRESHOLD_DEFAULT);
+        }
+        ESP_LOGI(TAG, "proximity reflex config: enabled=%d threshold=%d",
+                 prox_reflex_enabled_ ? 1 : 0, prox_ps_threshold_);
 
         esp_timer_create_args_t poll_args = {
             .callback = &StackChanBoard::ProximityPollCb,
@@ -5930,6 +5952,10 @@ private:
                 cJSON_AddNumberToObject(root, "raw", last_output1_raw_);
                 cJSON_AddBoolToObject(root, "proximity_available", ltr553_ok_);
                 cJSON_AddNumberToObject(root, "ps_raw", last_ps_raw_);
+                cJSON_AddBoolToObject(root, "prox_reflex_enabled",
+                                      prox_reflex_enabled_);
+                cJSON_AddNumberToObject(root, "prox_threshold",
+                                        prox_ps_threshold_);
                 const char* ev = "idle";
                 switch (last_event_) {
                     case TouchEvent::TAP:    ev = "tap";    break;
@@ -5945,6 +5971,35 @@ private:
                     if (age_ms < 0) age_ms = 0;
                 }
                 cJSON_AddNumberToObject(root, "last_event_age_ms", (double)age_ms);
+                return root;
+            });
+
+        // Phase C1 follow-up (2026-06-13): runtime tuning of the proximity
+        // hand-wave reflex, so threshold changes no longer need a reflash.
+        // Both arguments are required — passing only one would silently
+        // reset the other to a stale schema default.
+        mcp_server.AddTool(
+            "self.touch.set_proximity_config",
+            "Enable/disable the proximity hand-wave reflex and set its raw "
+            "PS detection threshold (0..2047; baseline ~380, hand within "
+            "10cm reads ~820+). Both values persist across reboots.",
+            PropertyList({Property("enabled", kPropertyTypeBoolean),
+                          Property("threshold", kPropertyTypeInteger, 0, 2047)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                bool enabled = properties["enabled"].value<bool>();
+                int threshold = properties["threshold"].value<int>();
+                {
+                    Settings settings("stackchan_prox", true);
+                    settings.SetBool("enabled", enabled);
+                    settings.SetInt("threshold", threshold);
+                }
+                prox_reflex_enabled_ = enabled;
+                prox_ps_threshold_ = threshold;
+                ESP_LOGI(TAG, "proximity config updated: enabled=%d threshold=%d",
+                         enabled ? 1 : 0, threshold);
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "enabled", enabled);
+                cJSON_AddNumberToObject(root, "threshold", threshold);
                 return root;
             });
 

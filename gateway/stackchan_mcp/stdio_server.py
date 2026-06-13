@@ -592,6 +592,10 @@ async def _dispatch_mcp_tool(
             "self.touch.get_touch_state",
             {},
         ),
+        "set_proximity_config": (
+            "self.touch.set_proximity_config",
+            arguments,
+        ),
         "set_led": (
             "self.led.set_color",
             arguments,
@@ -1030,6 +1034,31 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 inputSchema={
                     "type": "object",
                     "properties": {},
+                },
+            ),
+            Tool(
+                name="set_proximity_config",
+                description=(
+                    "Enable/disable the proximity hand-wave reflex (LTR-553) and "
+                    "set its raw PS detection threshold. Baseline reads ~380; a "
+                    "hand within 10cm reads ~820+. Both values persist on the "
+                    "device across reboots."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "Whether the reflex fires on detection",
+                        },
+                        "threshold": {
+                            "type": "integer",
+                            "description": "Raw PS counts (0..2047)",
+                            "minimum": 0,
+                            "maximum": 2047,
+                        },
+                    },
+                    "required": ["enabled", "threshold"],
                 },
             ),
             Tool(
