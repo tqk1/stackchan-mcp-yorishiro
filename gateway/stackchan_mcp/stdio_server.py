@@ -546,6 +546,10 @@ async def _dispatch_mcp_tool(
             "self.audio_speaker.set_volume",
             arguments,
         ),
+        "set_mic_gain": (
+            "self.audio_speaker.set_mic_gain",
+            arguments,
+        ),
         "set_brightness": (
             "self.screen.set_brightness",
             arguments,
@@ -740,6 +744,22 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         },
                     },
                     "required": ["volume"],
+                },
+            ),
+            Tool(
+                name="set_mic_gain",
+                description="Set the microphone input gain (0-36).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "gain": {
+                            "type": "integer",
+                            "description": "Mic gain level (0-36)",
+                            "minimum": 0,
+                            "maximum": 36,
+                        },
+                    },
+                    "required": ["gain"],
                 },
             ),
             Tool(

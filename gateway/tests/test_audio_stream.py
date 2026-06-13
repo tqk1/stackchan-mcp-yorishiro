@@ -143,3 +143,119 @@ async def test_push_opus_frames_empty_iterable_returns_zero():
 
     assert sent == 0
     assert esp32.frames == []
+
+
+# ---- Phase F: live mic input level -----------------------------------
+
+import math  # noqa: E402
+
+import stackchan_mcp.audio_stream as audio_stream  # noqa: E402
+from stackchan_mcp.audio_stream import (  # noqa: E402
+    _rms_from_pcm16,
+    get_input_level,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_level_state():
+    """Reset the module-level meter state + decoder between tests."""
+    yield
+    audio_stream._last_level = 0.0
+    audio_stream._level_decoder = None
+
+
+def _encode_frame(pcm_frame: bytes) -> bytes:
+    """Encode one 60ms/16kHz/mono PCM frame to Opus (real libopus)."""
+    opuslib = pytest.importorskip("opuslib")
+    from stackchan_mcp.stt.audio_utils import (
+        DEVICE_CHANNELS,
+        DEVICE_SAMPLE_RATE,
+        SAMPLES_PER_FRAME,
+    )
+
+    encoder = opuslib.Encoder(
+        DEVICE_SAMPLE_RATE, DEVICE_CHANNELS, opuslib.APPLICATION_VOIP
+    )
+    return encoder.encode(pcm_frame, SAMPLES_PER_FRAME)
+
+
+def test_rms_from_pcm16_silence_is_zero():
+    from stackchan_mcp.stt.audio_utils import SAMPLES_PER_FRAME
+
+    assert _rms_from_pcm16(b"\x00\x00" * SAMPLES_PER_FRAME) == 0.0
+
+
+def test_rms_from_pcm16_full_scale_is_one():
+    import struct
+
+    from stackchan_mcp.stt.audio_utils import SAMPLES_PER_FRAME
+
+    # Constant -32768 (full negative scale) → RMS = 32768 → normalised 1.0.
+    pcm = struct.pack(f"<{SAMPLES_PER_FRAME}h", *([-32768] * SAMPLES_PER_FRAME))
+    assert _rms_from_pcm16(pcm) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_rms_from_pcm16_empty_and_odd_bytes():
+    assert _rms_from_pcm16(b"") == 0.0
+    # A lone trailing byte is dropped rather than crashing frombytes.
+    assert _rms_from_pcm16(b"\x10") == 0.0
+
+
+def test_get_input_level_zero_when_idle():
+    assert not is_recording()
+    assert get_input_level() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_level_updates_on_recorded_frame():
+    """A buffered frame updates the live level above zero for loud audio."""
+    pytest.importorskip("opuslib")
+    import struct
+
+    from stackchan_mcp.stt.audio_utils import (
+        DEVICE_SAMPLE_RATE,
+        SAMPLES_PER_FRAME,
+    )
+
+    # A loud-ish sine so the decoded RMS is clearly non-zero.
+    samples = [
+        int(20000 * math.sin(2 * math.pi * 440 * n / DEVICE_SAMPLE_RATE))
+        for n in range(SAMPLES_PER_FRAME)
+    ]
+    pcm = struct.pack(f"<{SAMPLES_PER_FRAME}h", *samples)
+    frame = _encode_frame(pcm)
+
+    start_recording("sess-level")
+    try:
+        assert get_input_level() == 0.0  # reset on start
+        await handle_audio_frame(frame, session_id="sess-level")
+        level = get_input_level()
+    finally:
+        stop_recording()
+
+    assert 0.0 < level <= 1.0
+    # Level is reset to 0.0 when the recording closes.
+    assert get_input_level() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_level_not_updated_without_recording():
+    """Frames outside a recording slot leave the level at zero."""
+    pytest.importorskip("opuslib")
+    frame = _encode_frame(b"\x00\x00" * 960)
+    assert not is_recording()
+    await handle_audio_frame(frame, session_id="sess-x")
+    assert get_input_level() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_level_survives_undecodable_frame():
+    """A frame that fails to decode leaves the previous level intact."""
+    start_recording("sess-bad")
+    try:
+        audio_stream._last_level = 0.3  # pretend a prior good frame
+        await handle_audio_frame(b"\x99\x99\x99\xff", session_id="sess-bad")
+        # Garbage → _frame_rms_level returns None → level unchanged.
+        assert get_input_level() == 0.3
+    finally:
+        stop_recording()

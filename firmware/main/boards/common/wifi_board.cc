@@ -306,6 +306,7 @@ std::string WifiBoard::GetDeviceStatusJson() {
     auto audio_speaker = cJSON_CreateObject();
     if (auto codec = board.GetAudioCodec()) {
         cJSON_AddNumberToObject(audio_speaker, "volume", codec->output_volume());
+        cJSON_AddNumberToObject(audio_speaker, "mic_gain", codec->input_gain());
     }
     cJSON_AddItemToObject(root, "audio_speaker", audio_speaker);
 

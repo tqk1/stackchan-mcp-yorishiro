@@ -1,3 +1,29 @@
+# Phase F-3 — マイク感度調整・会話ログ・タブ順序 + ウェイクワード不反応の真因対策（2026-06-13、計画承認済み）
+
+F-2 実機 E2E でユーザー確認: 字幕 ✅ / H+青LED ✅ / マイクメーター ✅ / 日付バグ修正 ✅ / 緑LED ✅。**タブ順序は入れ替え要望**。加えて追加4要望。
+
+## 調査結論（Explore×2、file:line 裏取り済み）
+- **「スタックちゃんと呼んでも反応しない」真因 = 語の間違いではない**。generated_assets.bin 実検査で mn7_cn / "su ta ke qiang" / 閾値0.2 は正しく焼けている。真因は構造的: (1) ウェイクワード検知経路に NS/AEC が無く生マイク音声を MultiNet 直送（audio_service.cc:268-281）、(2) マイクゲイン +30dB 過大（cores3_audio_codec.cc:17、ほぼ上限37.5）でテレビ雑音を増幅し SNR 崩壊。マイクゲインは現状コード固定で実行時変更不可
+- → **マイク感度調整（要望B）の実装そのものがウェイクワード対策を兼ねる**（一石二鳥）
+
+## ユーザー決定（2026-06-13 AskUserQuestion）
+- ウェイクワード最終方針: **「スタックちゃん」単体で粘る**（マイク感度・ピンイン・閾値チューニング。ダメなら再相談）
+
+## 共通確定仕様
+- firmware MCP: `self.audio_speaker.set_mic_gain {"gain": int}`（dB 0-36, NVS永続, 既定30維持）
+- `POST /control/mic_gain {"gain":int}` / `GET /control/conversation`→`{ok,turns:[{ts,transcript,reply,route,timings_ms}]}` / `GET /control/status` に `mic_gain` 追加
+
+## チェックリスト
+- [x] F3-0: 調査2本（firmware mic/wakeword・gateway会話ログ/dashboard、Explore opus 並行）
+- [x] F3-1: gateway（Opus agent a9b9609）— control.py に会話ログ deque(maxlen30) + record_conversation_turn/get_conversation、マイクゲイン配線（_send/set/apply_persisted_mic_gain、save/load_state に mic_gain）、hermes_bridge にフック（成立した1往復のみ）、http_server に /control/conversation・/control/mic_gain・status に mic_gain、gateway.py 再接続フックに apply_persisted_mic_gain、stdio_server に set_mic_gain。**706 passed（+23）・ruff OK**
+- [x] F3-2: dashboard（Opus agent af4b1f9）— タブ順序入替（左サーバー/右スタックちゃん、初期表示はスタックちゃん維持）+ 会話ログ欄（🗨、route バッジ H=青/ローカル=緑）+ マイク感度スライダー（0-36 step3）+ status_api に /control/conversation 中継。py_compile/node --check OK。バックアップ *.bak-20260613c
+- [~] F3-3: firmware set_mic_gain ツール + app ビルド（Opus agent a370f71、バックグラウンド ~25分）— CoreS3AudioCodec::SetInputGain override + MCP登録 + NVS永続 + boot復元 + get_device_status に mic_gain
+- [ ] F3-4: app のみ flash（assets 不変）→ シリアルでウェイクワード起動ログ確認（Command/モデルロード）+ ユーザー発話で検知ログ切り分け → gateway/dashboard 再起動（sudo）
+- [ ] F3-5: 実機チューニング（マイクゲイン下げてウェイクワード検証。改善せねばピンイン qiang→chang / 閾値20→12 再ビルド）+ 全機能 E2E（会話ログ・感度スライダー・タブ）
+- [ ] F3-6: 記録（worklog 追記 / phase-f-report.md / CLAUDE.md / memory）
+
+---
+
 # Phase F — ダッシュボード操作・顔ステータス・仕草OFF・ウェイクワード（2026-06-13 着手、計画承認済み）
 
 計画: ~/.claude/plans/iterative-twirling-bengio.md / ブランチ: feature/phase-f-dashboard（c1-prox-reflex から分岐）
@@ -11,7 +37,7 @@
 
 ## チェックリスト
 - [x] F0: ブランチ作成・todo・memory 記録
-- [~] F1: firmware 3変更 → release ビルド（~25分）
+- [x] F1: firmware 変更 + release ビルド完了（コミット 549ef72）
   - [x] 変更1: status_label_ + EnsureStatusLabel/SetStatusText + self.display.set_status_text MCP ツール（stackchan.cc）。ラベルは active screen の text font（assets の common puhui、日本語グリフ入り）を継承するので追加フォント不要
   - [!] 変更2: フォント basic→common は **見送り**。調査の結果、実行時フォントは既に assets の `font_puhui_common_20_4.bin`（日本語入り）で、basic は app に焼く小サブセットのフォールバックに過ぎない。CMakeLists を `font_puhui_20_4` にすると (a) app バイナリが ~2MB 増（現 3.42MB / partition 3.94MB → 確実に溢れる）、(b) build_default_assets.py の get_text_font_path が "basic" を要求するため common フォントが assets から外れて逆に日本語が壊れる。→ 指揮官判断待ち（report 参照）
   - [x] 変更3: カスタムウェイクワード "su ta ke qiang"（スタックちゃん）。**sdkconfig 直編集は set-target(fullclean) で消える**ため board config.json の sdkconfig_append に投入（USE_AFE off / USE_CUSTOM on / 3設定 / SR_MN_CN_MULTINET7_QUANT=y）。assets ビルドログで mn7_cn+fst パック・スタックちゃん threshold 0.2 確認 ✅
@@ -20,7 +46,26 @@
   - **flash は app だけでは不足**: ウェイクワードの MultiNet は generated_assets.bin（assets partition 0x800000）に入る。新ウェイクワードを効かせるには assets も flash 必須（詳細は report）
 - [x] F2: gateway 完了（Opus agent） — control.py 新規（音量state/ミュート/trigger_listen/set_device_status_text）+ /control/* 8ルート + 認証ガード拡張 + heartbeat set_gestures + esp32_client に on_device_ready フック（接続時の音量再適用、1.5s遅延+リトライ1回）+ hermes_bridge「きいてるよ→考え中→finally消去」+ voice_turn_active フラグ + web_search「調べ中」フック + set_status_text ツール宣言。**テスト 660 件パス（+53）、ruff クリーン**。REST 契約逸脱なし
 - [x] F3: dashboard 完了（Opus agent） — status_api.py に _proxy_control（Bearer+Host 付与、未設定503/不達502）+ do_POST 新設。dashboard.html に「🤖 スタックちゃん」カード（接続バッジ/音量/ミュート/聞き取り/近接トグル+閾値/仕草トグル/テスト発話/表情select、ドラッグ中の自動更新上書き抑止・連打防止）。py_compile OK・モック gateway E2E パス。バックアップ: *.bak-20260613。**sudo 手順は status-api drop-in に STACKCHAN_TOKEN（worklog に転記予定）**
-- [ ] F4: flash（app のみ）+ ユーザー sudo 作業（heartbeat.conf GESTURES=0 / status-api drop-in に STACKCHAN_TOKEN / 両サービス再起動）+ E2E
+- [x] F4: flash 完了 ✅（app + assets、ハッシュ検証 OK）。シリアルで set_status_text ツール / CustomWakeWord「su ta ke qiang→スタックちゃん」+ mn7_cn / WiFi + WS / 近接 NVS(600) 確認。sudo 作業も完了。**プロキシ疎通 ✅**: /control/status が ok:true / esp32_connected:true / volume:50 / heartbeat gestures:false(仕草OFF効) speak:true / proximity:600。**事故: status-api drop-in に日本語トークン混入 → EnvironmentFile=secrets.env 参照に修正して解決**（worklog §4.2 更新済み・再発防止）
+- [~] F4b: ユーザー実機 E2E。**2バグ発見→修正中**（ビルド中）:
+  - バグ1: 緑LED がタップ時のみ点灯。根本原因 = タップ release のハードコード SetAllRgbLeds(stackchan.cc:2577)、state 連動 LED は GetLed() 未override で死んでいる。修正 = listening 突入エッジ(~2466)に点灯移植で3経路統一
+  - バグ2: 顔ステータス「きいてるよ/考え中」が出ない。根本原因 = gateway/firmware とも正常だが RenderAvatarLocked(4450) の move_foreground(avatar) が blink/lip-sync 毎に全画面 avatar を最前面化し label を覆う。修正 = avatar 前面化直後に status_label_ を再昇格
+  - 両方 stackchan.cc のみ・gateway 無罪。1ビルドにまとめ、今回は assets 不変＝app のみ flash
+  - 調査: investigator(rca-agent) / 修正・ビルド: fw-agent 継続
+  - [x] 修正実装（緑LED=listening 突入エッジに点灯移植 / ステータス=avatar 前面化直後に label 再昇格、RenderAvatarLocked+EnsureAvatarObject）→ ビルド成功（app 3.43MB/残13%）→ **app のみ flash 完了・再接続確認 ✅**
+  - [x] ステータステキスト表示は実機 OK（ユーザー確認「検索中・調べ中でるようになった」）。緑LED 3経路統一は未確認
+
+# Phase F-2 — 字幕・LLM視覚区別・マイクメーター・タブUI + バグ2件（2026-06-13、設計確定）
+ユーザー設計判断: 字幕=下部2-3行折返し / LLM区別=画面Hマーク+LED両方（Hermes=青0,0,32） / Safari=Tailscale HTTPS化 / 進め方=全部まとめて
+- [x] FB1: 日付復唱バグ修正（datefix-agent）— local_llm.py _today_line() を断定文→「参考情報・聞かれた時だけ答えろ」枠付け。test 1行更新。660 passed・ruff OK。**実機聴感は要確認**（短文で日付混入しない/「何曜日？」で即答）
+- [~] FB2: firmware 3ツール（fw-agent、1ビルド）: self.display.set_subtitle{text}（下部2-3行 LONG_WRAP）/ self.display.set_route_badge{text}（"H"、上部角）/ self.led.set_indicator{r,g,b}（SetAllRgbLeds 公開、0,0,0消灯）。全て status_label_ パターン複製＋RenderAvatarLocked/EnsureAvatarObject 再昇格
+  - [x] 実装完了（stackchan.cc +250行）: subtitle_label_（LV_ALIGN_BOTTOM_MID, LONG_MODE_WRAP, width300, max_height78≈3行, text_align_center, 半透明黒）/ route_badge_（LV_ALIGN_TOP_RIGHT, status と非衝突）/ set_indicator（SetAllRgbLeds 公開ラッパ, clamp, 0,0,0消灯）。再昇格は PromoteOverlaysLocked() ヘルパに集約（status+subtitle+route 3つ、RenderAvatarLocked/EnsureAvatarObject から呼ぶ）
+  - [x] release ビルド完走（BUILD_EXIT_CODE=0、~25分）。**app 0x36dde0 (3.43MB) / partition 0x3f0000 (3.94MB) → 0x82220 (533KB, 13%) free**（前回比 +3.8KB のみ）。generated_assets.bin は 3,983,046 bytes で前回とバイト同一＝assets 不変 → **app のみ 0x20000 flash で OK**。stackchan.cc のみ変更（+250行）。コミット・flash 未実施
+- [ ] FB3: gateway（gw-agent）: control.set_device_subtitle/route_badge/led_indicator + hermes_bridge で reply 字幕・route=hermes時 H+青LED（finally消去）+ audio_stream RMS + GET /control/audio_level{ok,recording,level}。local_llm は触らない。テスト+ruff
+- [x] FB4: dashboard 完了（dash-agent）— status_api.py に /control/audio_level 中継。dashboard.html: マイクメーター（録音中のみ120ms≈8Hz ポーリング、level→バー幅%、緑→黄→橙→赤、失敗で静かに停止）+ 2タブ化（#tab-stackchan 初期表示 / #tab-server に温度・CC利用率・フッター）+ ボトムナビ（fixed bottom, safe-area, --green ハイライト）+ loadStackchan はスタックちゃんタブ表示時のみ実行（通信削減）。py_compile/node --check/モックE2E OK。バックアップ *.bak-20260613b
+- [ ] FB5: flash（app のみ、assets 不変）+ 統合 E2E
+- [ ] FB6: Safari HTTPS（ユーザー作業）: 管理コンソールで HTTPS 有効化 → `sudo tailscale serve --bg --https=443 http://127.0.0.1:8080` → https://razer-server.tailc0a7ab.ts.net/ をブックマーク
+- [ ] FB7: 記録（worklog/phase-f-report.md/CLAUDE.md）
 - [ ] F5: ウェイクワード実機実験（検知率・誤検知。不足ならピンイン/閾値変えて再試行）
 - [ ] F6: worklog + phase-f-report.md + CLAUDE.md ステータス更新
 

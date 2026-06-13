@@ -4,6 +4,10 @@
 #include <driver/i2c_master.h>
 #include <driver/i2s_tdm.h>
 
+#include <cmath>
+
+#include "settings.h"
+
 #define TAG "CoreS3AudioCodec"
 
 CoreS3AudioCodec::CoreS3AudioCodec(void* i2c_master_handle, int input_sample_rate, int output_sample_rate,
@@ -187,6 +191,25 @@ void CoreS3AudioCodec::SetOutputVolume(int volume) {
     AudioCodec::SetOutputVolume(volume);
 }
 
+void CoreS3AudioCodec::SetInputGain(float gain) {
+    // ES7210 mic ADC: clamp to [0, 36] dB and round to the codec's 3 dB step.
+    if (gain < 0.0f) {
+        gain = 0.0f;
+    } else if (gain > 36.0f) {
+        gain = 36.0f;
+    }
+    gain = roundf(gain / 3.0f) * 3.0f;
+
+    input_gain_ = gain;
+    // Only push to hardware when the input device is open (EnableInput done);
+    // otherwise the gain is applied in EnableInput() on the next open.
+    if (input_enabled_) {
+        ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
+            input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_));
+    }
+    ESP_LOGI(TAG, "Set input gain to %.1f dB (applied=%d)", input_gain_, input_enabled_ ? 1 : 0);
+}
+
 void CoreS3AudioCodec::EnableInput(bool enable) {
     if (enable == input_enabled_) {
         return;
@@ -202,6 +225,12 @@ void CoreS3AudioCodec::EnableInput(bool enable) {
         if (input_reference_) {
             fs.channel_mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
         }
+        // Restore the persisted mic input gain (set at runtime via the
+        // self.audio_speaker.set_mic_gain MCP tool). When NVS has no stored
+        // value, keep the existing code default (input_gain_, = 30 dB), so the
+        // pre-feature behaviour is preserved for fresh devices.
+        Settings settings("audio", false);
+        input_gain_ = (float)settings.GetInt("input_gain", (int)input_gain_);
         ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
         ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_));
     } else {

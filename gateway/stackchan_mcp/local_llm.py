@@ -118,6 +118,27 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 _WEEKDAYS_JA = "月火水木金土日"
 
+#: Substrings that mean the user is actually asking about the date or
+#: weekday. The date context is injected into the local prompt **only**
+#: when one of these matches the transcript — otherwise the 1.2B model
+#: is never told today's date, so it cannot blurt it out on vague turns
+#: (observed live: 「うっ」 → "…今日は2026年6月13日よ。…"). Matched after
+#: NFKC normalisation, so full-width / half-width variants fold together.
+DATE_QUERY_MARKERS = (
+    "何日",
+    "なんにち",
+    "日付",
+    "日にち",
+    "何曜",
+    "なん曜",
+    "曜日",
+    "今日",
+    "きょう",
+    "本日",
+    "date",
+    "today",
+)
+
 
 def is_enabled() -> bool:
     """True when local routing is opted in via STACKCHAN_LOCAL_LLM_MODEL."""
@@ -159,17 +180,32 @@ LOCAL_NO_TOOLS_LINE = (
 )
 
 
+def _is_date_query(text: str) -> bool:
+    """True when the transcript is asking about today's date / weekday.
+
+    Pure keyword match over the NFKC-normalised text. Drives whether
+    :func:`_today_line` is injected: a small local model that is never
+    told today's date cannot volunteer it on a vague turn, so the date
+    context is opt-in per turn rather than always-on.
+    """
+    normalized = unicodedata.normalize("NFKC", text).lower()
+    return any(marker in normalized for marker in DATE_QUERY_MARKERS)
+
+
 def _today_line(now: datetime.datetime | None = None) -> str:
     """Date context for the system prompt.
 
-    A small local model has no notion of "today", but day/date
-    questions are exactly the short turns this path exists for, so
-    inject the current date the way a clock would.
+    A small local model has no notion of "today". Injected **only** when
+    the transcript is a date/weekday question (see :func:`_is_date_query`),
+    so the assertive phrasing is safe here — the user just asked.
     """
     if now is None:
         now = datetime.datetime.now()
     weekday = _WEEKDAYS_JA[now.weekday()]
-    return f"今日は{now.year}年{now.month}月{now.day}日({weekday}曜日)です。"
+    return (
+        f"（参考情報：今日は{now.year}年{now.month}月{now.day}日"
+        f"({weekday}曜日)です。）"
+    )
 
 
 async def ask_local(text: str, *, system_prompt: str) -> str:
@@ -196,12 +232,20 @@ async def ask_local(text: str, *, system_prompt: str) -> str:
         or DEFAULT_LOCAL_LLM_KEEP_ALIVE
     )
 
+    # Inject today's date only when the user actually asks about it.
+    # The 1.2B model cannot reliably keep "don't mention this unless
+    # asked" context, so the only safe guard is to withhold the fact
+    # entirely on non-date turns (observed live: 「うっ」 → unsolicited
+    # "今日は2026年6月13日よ。").
+    date_line = _today_line() if _is_date_query(text) else ""
+    system_content = system_prompt + date_line + LOCAL_NO_TOOLS_LINE
+
     payload = {
         "model": model,
         "messages": [
             {
                 "role": "system",
-                "content": system_prompt + _today_line() + LOCAL_NO_TOOLS_LINE,
+                "content": system_content,
             },
             {"role": "user", "content": text},
         ],

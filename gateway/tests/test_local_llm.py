@@ -12,6 +12,7 @@ from stackchan_mcp.local_llm import (
     LOCAL_MAX_CHARS,
     ROUTE_HERMES,
     ROUTE_LOCAL,
+    _is_date_query,
     ask_local,
     decide_route,
     is_enabled,
@@ -101,6 +102,51 @@ def test_decide_route_nfkc_normalisation():
     assert decide_route("ﾆｭｰｽは？") == ROUTE_HERMES
 
 
+# --- _is_date_query (date-context injection gate) ----------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "今日は何曜日？",
+        "今日何日だっけ",
+        "なんにち？",
+        "日付教えて",
+        "日にちわかる？",
+        "何曜日？",
+        "曜日は？",
+        "きょうって何の日",
+        "本日のスケジュール",  # 本日 still counts as a date reference
+        "What's the date today?",
+        "what day is it today",
+    ],
+)
+def test_is_date_query_true(text):
+    assert _is_date_query(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "おはよう",
+        "うっ",
+        "電気つけて",
+        "ありがとう",
+        "こんにちは、元気？",
+        "おやすみなさい",
+        "",
+        "   ",
+    ],
+)
+def test_is_date_query_false(text):
+    assert _is_date_query(text) is False
+
+
+def test_is_date_query_nfkc_folds_fullwidth():
+    """Full-width 'today' folds to the ASCII marker after NFKC."""
+    assert _is_date_query("ｔｏｄａｙ？") is True
+
+
 # --- is_enabled (opt-in gate) -------------------------------------------------
 
 
@@ -134,7 +180,8 @@ async def _run_ollama_stub(
 @pytest.mark.asyncio
 async def test_ask_local_success(monkeypatch, aiohttp_unused_port):
     """Happy path: payload carries model / stream=false / keep_alive and
-    the system prompt (plus injected date); reply text comes back."""
+    the system prompt; reply text comes back. A non-date turn must NOT
+    carry the date context (the model can't keep it secret otherwise)."""
     received: dict[str, Any] = {}
 
     async def handle(request: web.Request) -> web.Response:
@@ -159,10 +206,62 @@ async def test_ask_local_success(monkeypatch, aiohttp_unused_port):
     system = payload["messages"][0]
     assert system["role"] == "system"
     assert system["content"].startswith("短く話して。")
-    assert "曜日)です。" in system["content"]   # date context injected
+    # non-date turn: date context must be absent so the model can't blurt it
+    assert "曜日)" not in system["content"]
     # no-tools guard: the local model must not pretend to run tools
     assert local_llm.LOCAL_NO_TOOLS_LINE in system["content"]
     assert payload["messages"][1] == {"role": "user", "content": "こんにちは"}
+
+
+@pytest.mark.asyncio
+async def test_ask_local_injects_date_only_on_date_query(
+    monkeypatch, aiohttp_unused_port
+):
+    """A date/weekday question gets today's date injected into the prompt."""
+    received: dict[str, Any] = {}
+
+    async def handle(request: web.Request) -> web.Response:
+        received["payload"] = await request.json()
+        return web.json_response(
+            {"message": {"role": "assistant", "content": "今日は木曜日だよ！"}}
+        )
+
+    runner, base_url = await _run_ollama_stub(handle, aiohttp_unused_port)
+    monkeypatch.setenv("STACKCHAN_LOCAL_LLM_MODEL", "test-model:q4")
+    monkeypatch.setenv("STACKCHAN_LOCAL_LLM_URL", base_url)
+    try:
+        await ask_local("今日は何曜日？", system_prompt="短く話して。")
+    finally:
+        await runner.cleanup()
+
+    system = received["payload"]["messages"][0]["content"]
+    assert "曜日)です。" in system   # assertive date context injected
+    assert local_llm.LOCAL_NO_TOOLS_LINE in system
+
+
+@pytest.mark.asyncio
+async def test_ask_local_no_date_on_vague_turn(monkeypatch, aiohttp_unused_port):
+    """Regression: a vague non-date turn (「うっ」) must not carry the date,
+    so the local model cannot volunteer it unprompted."""
+    received: dict[str, Any] = {}
+
+    async def handle(request: web.Request) -> web.Response:
+        received["payload"] = await request.json()
+        return web.json_response(
+            {"message": {"role": "assistant", "content": "どうしたの？"}}
+        )
+
+    runner, base_url = await _run_ollama_stub(handle, aiohttp_unused_port)
+    monkeypatch.setenv("STACKCHAN_LOCAL_LLM_MODEL", "test-model:q4")
+    monkeypatch.setenv("STACKCHAN_LOCAL_LLM_URL", base_url)
+    try:
+        await ask_local("うっ", system_prompt="短く話して。")
+    finally:
+        await runner.cleanup()
+
+    system = received["payload"]["messages"][0]["content"]
+    assert "今日は" not in system
+    assert "曜日" not in system
 
 
 @pytest.mark.asyncio

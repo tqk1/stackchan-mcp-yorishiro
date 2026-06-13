@@ -65,6 +65,7 @@ class Gateway:
         from . import control
 
         await control.apply_persisted_volume(self)
+        await control.apply_persisted_mic_gain(self)
 
     @property
     def vision_url(self) -> str:

@@ -264,11 +264,17 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
             control=control,
         )
     finally:
-        # Phase F: always clear the on-device status text and drop the
-        # in-flight flag, no matter how the turn ended (success, early
-        # return, or exception).
+        # Phase F: always clear the on-device status text, subtitle,
+        # route badge and indicator LED, and drop the in-flight flag,
+        # no matter how the turn ended (success, early return, or
+        # exception). Clearing the LED here is what guarantees the
+        # gateway never leaves the indicator lit over the firmware's
+        # autonomous listening-phase LED.
         gateway.voice_turn_active = False
         await control.set_device_status_text(gateway, control.STATUS_CLEAR)
+        await control.set_device_subtitle(gateway, "")
+        await control.set_device_route_badge(gateway, "")
+        await control.set_device_led_indicator(gateway, 0, 0, 0)
 
 
 async def _run_voice_turn(
@@ -359,6 +365,16 @@ async def _run_voice_turn(
     t_llm = time.monotonic()
 
     logger.info("voice_turn: reply=%r session=%s", reply[:120], session_id)
+    # Phase F: show the reply as a subtitle while it plays, and — only
+    # for Hermes-routed turns — light the "H" badge + a blue indicator
+    # LED. Local-LLM turns stay badge/LED-free. The outer
+    # handle_voice_turn finally clears the subtitle, badge and LED on
+    # every exit path (incl. a TTS failure below), so the listening-
+    # phase green LED that the firmware owns is never left stomped.
+    await control.set_device_subtitle(gateway, reply)
+    if route == local_llm.ROUTE_HERMES:
+        await control.set_device_route_badge(gateway, "H")
+        await control.set_device_led_indicator(gateway, 0, 0, 32)
     try:
         tts_result = await synthesize_and_send({"text": reply}, gateway=gateway)
     except Exception as exc:
@@ -388,6 +404,12 @@ async def _run_voice_turn(
         route,
         timings_ms,
     )
+    # Phase F: record this completed round-trip (transcript + spoken
+    # reply) into the rolling conversation log for GET
+    # /control/conversation. Only turns that made it past STT, Hermes
+    # and TTS reach here — empty transcripts and Hermes/TTS failures
+    # return earlier and are intentionally not logged.
+    control.record_conversation_turn(transcript, reply, route, timings_ms)
     return web.json_response(
         {
             "ok": True,

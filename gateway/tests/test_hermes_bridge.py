@@ -173,7 +173,9 @@ def _make_voice_request(gateway) -> web.Request:
     )
 
 
-def _patch_voice_pipeline(monkeypatch, *, transcript: str, reply: str = "はい"):
+def _patch_voice_pipeline(
+    monkeypatch, *, transcript: str, reply: str = "はい", route: str = "hermes"
+):
     """Stub decode / STT / brain / TTS so the turn runs without deps."""
     import stackchan_mcp.stt as stt_mod
     import stackchan_mcp.tts.orchestrator as tts_orch
@@ -189,7 +191,7 @@ def _patch_voice_pipeline(monkeypatch, *, transcript: str, reply: str = "はい"
     monkeypatch.setattr(stt_mod, "get_registry", lambda: _Registry())
 
     async def fake_generate_reply(text):
-        return reply, "hermes"
+        return reply, route
 
     monkeypatch.setattr(hermes_bridge, "generate_reply", fake_generate_reply)
 
@@ -197,6 +199,25 @@ def _patch_voice_pipeline(monkeypatch, *, transcript: str, reply: str = "はい"
         return {"frame_count": 1}
 
     monkeypatch.setattr(tts_orch, "synthesize_and_send", fake_send)
+
+
+def _record_device_cosmetics(monkeypatch) -> dict[str, list]:
+    """Record subtitle / route-badge / LED calls in invocation order."""
+    rec: dict[str, list] = {"subtitle": [], "badge": [], "led": []}
+
+    async def fake_subtitle(gateway, text):
+        rec["subtitle"].append(text)
+
+    async def fake_badge(gateway, text):
+        rec["badge"].append(text)
+
+    async def fake_led(gateway, r, g, b):
+        rec["led"].append((r, g, b))
+
+    monkeypatch.setattr(control, "set_device_subtitle", fake_subtitle)
+    monkeypatch.setattr(control, "set_device_route_badge", fake_badge)
+    monkeypatch.setattr(control, "set_device_led_indicator", fake_led)
+    return rec
 
 
 def _record_status_text(monkeypatch) -> list[str]:
@@ -266,3 +287,140 @@ async def test_voice_turn_clears_status_when_brain_fails(monkeypatch):
     assert response.status == 502
     assert seen[-1] == control.STATUS_CLEAR
     assert gateway.voice_turn_active is False
+
+
+# ---- Phase F: subtitle / route badge / LED on the response phase ------
+
+
+@pytest.mark.asyncio
+async def test_voice_turn_hermes_route_sets_badge_and_led(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    _record_status_text(monkeypatch)
+    rec = _record_device_cosmetics(monkeypatch)
+    _patch_voice_pipeline(
+        monkeypatch, transcript="天気は", reply="晴れだよ", route="hermes"
+    )
+    gateway = _StubGateway()
+
+    response = await hermes_bridge.handle_voice_turn(_make_voice_request(gateway))
+
+    assert response.status == 200
+    # Subtitle: reply shown during TTS, then cleared in finally.
+    assert rec["subtitle"] == ["晴れだよ", ""]
+    # Badge: "H" set for Hermes, cleared in finally.
+    assert rec["badge"] == ["H", ""]
+    # LED: blue during response, off in finally.
+    assert rec["led"] == [(0, 0, 32), (0, 0, 0)]
+
+
+@pytest.mark.asyncio
+async def test_voice_turn_local_route_no_badge_no_led(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    _record_status_text(monkeypatch)
+    rec = _record_device_cosmetics(monkeypatch)
+    _patch_voice_pipeline(
+        monkeypatch, transcript="やあ", reply="やあ", route="local"
+    )
+    gateway = _StubGateway()
+
+    response = await hermes_bridge.handle_voice_turn(_make_voice_request(gateway))
+
+    assert response.status == 200
+    # Subtitle still shown + cleared for local turns.
+    assert rec["subtitle"] == ["やあ", ""]
+    # No badge "H" for local — only the finally clear ("").
+    assert rec["badge"] == [""]
+    # No blue LED during response — only the finally off (0,0,0).
+    assert rec["led"] == [(0, 0, 0)]
+
+
+@pytest.mark.asyncio
+async def test_voice_turn_clears_cosmetics_when_tts_fails(monkeypatch):
+    import stackchan_mcp.tts.orchestrator as tts_orch
+
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    _record_status_text(monkeypatch)
+    rec = _record_device_cosmetics(monkeypatch)
+    _patch_voice_pipeline(
+        monkeypatch, transcript="天気は", reply="晴れ", route="hermes"
+    )
+
+    async def boom(arguments, *, gateway=None, **kw):
+        raise RuntimeError("tts down")
+
+    monkeypatch.setattr(tts_orch, "synthesize_and_send", boom)
+    gateway = _StubGateway()
+
+    response = await hermes_bridge.handle_voice_turn(_make_voice_request(gateway))
+
+    assert response.status == 502
+    # Cosmetics were set before TTS, then the finally clears all three.
+    assert rec["subtitle"][-1] == ""
+    assert rec["badge"][-1] == ""
+    assert rec["led"][-1] == (0, 0, 0)
+
+
+# ---- conversation log recording hook ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_voice_turn_records_conversation(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    _record_status_text(monkeypatch)
+    control._CONVERSATION.clear()
+    _patch_voice_pipeline(
+        monkeypatch, transcript="おはよう", reply="やあ", route="local"
+    )
+    gateway = _StubGateway()
+
+    response = await hermes_bridge.handle_voice_turn(_make_voice_request(gateway))
+
+    assert response.status == 200
+    turns = control.get_conversation()["turns"]
+    assert len(turns) == 1
+    turn = turns[0]
+    assert turn["transcript"] == "おはよう"
+    assert turn["reply"] == "やあ"
+    assert turn["route"] == "local"
+    assert turn["timings_ms"] is not None and "total" in turn["timings_ms"]
+    control._CONVERSATION.clear()
+
+
+@pytest.mark.asyncio
+async def test_voice_turn_empty_transcript_not_recorded(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    _record_status_text(monkeypatch)
+    control._CONVERSATION.clear()
+    _patch_voice_pipeline(monkeypatch, transcript="   ")
+    gateway = _StubGateway()
+
+    await hermes_bridge.handle_voice_turn(_make_voice_request(gateway))
+
+    # An empty transcript returns before the recording hook.
+    assert control.get_conversation()["turns"] == []
+    control._CONVERSATION.clear()
+
+
+@pytest.mark.asyncio
+async def test_voice_turn_tts_failure_not_recorded(monkeypatch):
+    import stackchan_mcp.tts.orchestrator as tts_orch
+
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    _record_status_text(monkeypatch)
+    control._CONVERSATION.clear()
+    _patch_voice_pipeline(
+        monkeypatch, transcript="天気は", reply="晴れ", route="hermes"
+    )
+
+    async def boom(arguments, *, gateway=None, **kw):
+        raise RuntimeError("tts down")
+
+    monkeypatch.setattr(tts_orch, "synthesize_and_send", boom)
+    gateway = _StubGateway()
+
+    response = await hermes_bridge.handle_voice_turn(_make_voice_request(gateway))
+
+    assert response.status == 502
+    # A TTS failure returns before the recording hook.
+    assert control.get_conversation()["turns"] == []
+    control._CONVERSATION.clear()

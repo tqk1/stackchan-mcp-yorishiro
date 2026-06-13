@@ -67,13 +67,14 @@ sudo tee -a /etc/systemd/system/stackchan-gateway.service.d/heartbeat.conf <<'EO
 Environment=STACKCHAN_HEARTBEAT_GESTURES=0
 EOF
 
-# (2) status-api に gateway トークンを注入（<トークン>は ~/.yorishiro/secrets.env 等の STACKCHAN_TOKEN 値）
+# (2) status-api に gateway と同じトークンを渡す。手打ちで値を二重管理すると
+#     打ち間違える（実際にここで日本語混入の事故が起きた）ので、gateway と同じ
+#     EnvironmentFile を参照させて一元化する（値はコピーしない）
 sudo install -d /etc/systemd/system/status-api.service.d
 sudo tee /etc/systemd/system/status-api.service.d/token.conf <<'EOF'
 [Service]
-Environment=STACKCHAN_TOKEN=<トークン>
+EnvironmentFile=-/home/kenji/.yorishiro/secrets.env
 EOF
-sudo chmod 600 /etc/systemd/system/status-api.service.d/token.conf
 
 # (3) 反映
 sudo systemctl daemon-reload

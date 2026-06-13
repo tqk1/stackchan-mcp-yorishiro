@@ -24,7 +24,7 @@ should move onto the connection object.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 if TYPE_CHECKING:
     from .esp32_client import ESP32Manager
@@ -41,6 +41,22 @@ _recording_session_id: str | None = None
 _recording_frames: list[bytes] = []
 
 
+# --- Live mic input level (Phase F dashboard) -----------------------------
+#
+# The most recent inbound frame's RMS amplitude, normalised to 0.0-1.0,
+# updated on every buffered frame in handle_audio_frame. It exists only
+# so the dashboard can render a VU-style meter; it is reset to 0.0 when
+# a recording opens/closes so a stale value never lingers after a turn.
+# Full-scale s16 PCM RMS is 32768; we normalise against that.
+_INT16_FULL_SCALE = 32768.0
+_last_level: float = 0.0
+
+#: A persistent Opus decoder reused across frames for the level meter.
+#: Lazily created (the [stt] extra ships opuslib); decode failures are
+#: swallowed so the meter never disturbs the capture path.
+_level_decoder: Any = None
+
+
 def start_recording(session_id: str) -> None:
     """Open a fresh recording slot for ``session_id``.
 
@@ -49,7 +65,7 @@ def start_recording(session_id: str) -> None:
     capture. The orchestrator wraps start/stop in a try/finally to
     guarantee the slot is closed even on error.
     """
-    global _recording_session_id, _recording_frames
+    global _recording_session_id, _recording_frames, _last_level
     if _recording_session_id is not None:
         # Defensive: the lock should prevent this, but if it ever
         # fires we leak no audio — just log loudly so the regression
@@ -62,6 +78,7 @@ def start_recording(session_id: str) -> None:
         )
     _recording_session_id = session_id
     _recording_frames = []
+    _last_level = 0.0
 
 
 def stop_recording() -> list[bytes]:
@@ -71,16 +88,78 @@ def stop_recording() -> list[bytes]:
     cleared whether or not frames were captured so the next call to
     :func:`start_recording` starts clean.
     """
-    global _recording_session_id, _recording_frames
+    global _recording_session_id, _recording_frames, _last_level
     frames = _recording_frames
     _recording_session_id = None
     _recording_frames = []
+    _last_level = 0.0
     return frames
 
 
 def is_recording() -> bool:
     """Return ``True`` when a recording slot is currently open."""
     return _recording_session_id is not None
+
+
+def get_input_level() -> float:
+    """Return the most recent inbound frame's RMS level (0.0-1.0).
+
+    Reflects the last frame buffered during the active recording, or
+    0.0 when no recording is open (the value is reset on start/stop).
+    Used by the dashboard's mic-level meter (Phase F).
+    """
+    return _last_level
+
+
+def _frame_rms_level(frame: bytes) -> float | None:
+    """Decode one Opus frame and return its RMS amplitude (0.0-1.0).
+
+    Returns None when the frame cannot be decoded or opuslib is not
+    installed — the caller leaves the previous level untouched in that
+    case. The decoder is reused across frames so it keeps Opus's
+    inter-frame state, matching how the device encoded the stream.
+    """
+    global _level_decoder
+    if not frame:
+        return None
+    try:
+        if _level_decoder is None:
+            import opuslib  # type: ignore[import-not-found]
+
+            from .stt.audio_utils import (
+                DEVICE_CHANNELS,
+                DEVICE_SAMPLE_RATE,
+            )
+
+            _level_decoder = opuslib.Decoder(DEVICE_SAMPLE_RATE, DEVICE_CHANNELS)
+        from .stt.audio_utils import SAMPLES_PER_FRAME
+
+        pcm = _level_decoder.decode(frame, SAMPLES_PER_FRAME)
+    except Exception:
+        # opuslib missing, decode error, or a transient hiccup — the
+        # meter is cosmetic, so never let it disturb the capture path.
+        return None
+    return _rms_from_pcm16(pcm)
+
+
+def _rms_from_pcm16(pcm: bytes) -> float:
+    """RMS of signed-16 little-endian PCM, normalised to 0.0-1.0."""
+    import array
+    import math
+
+    if not pcm:
+        return 0.0
+    samples = array.array("h")
+    # An odd trailing byte would break frombytes; clamp to an even length.
+    usable = len(pcm) - (len(pcm) % 2)
+    if usable <= 0:
+        return 0.0
+    samples.frombytes(pcm[:usable])
+    if not samples:
+        return 0.0
+    mean_sq = sum(s * s for s in samples) / len(samples)
+    rms = math.sqrt(mean_sq) / _INT16_FULL_SCALE
+    return min(1.0, rms)
 
 
 def is_recording_session(session_id: str) -> bool:
@@ -136,6 +215,13 @@ async def handle_audio_frame(data: bytes, session_id: str) -> None:
         )
         return
     _recording_frames.append(data)
+    # Phase F: update the live mic level for the dashboard meter. The
+    # decode is best-effort — a failure leaves the previous level in
+    # place rather than disturbing the capture buffer above.
+    global _last_level
+    level = _frame_rms_level(data)
+    if level is not None:
+        _last_level = level
     logger.debug(
         "audio_frame session=%s bytes=%d buffered (recording active)",
         session_id,

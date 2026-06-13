@@ -180,6 +180,7 @@ async def _build_control_status(gateway: Any) -> dict[str, Any]:
     state = control.load_state()
     volume: int | None = state["volume"] if connected else None
     muted = state["muted"]
+    mic_gain = state["mic_gain"]
 
     heartbeat = _heartbeat_status(gateway)
     proximity = await _proximity_status(gateway) if connected else None
@@ -189,6 +190,7 @@ async def _build_control_status(gateway: Any) -> dict[str, Any]:
         "esp32_connected": connected,
         "volume": volume,
         "muted": muted,
+        "mic_gain": mic_gain,
         "heartbeat": heartbeat,
         "proximity": proximity,
     }
@@ -265,6 +267,16 @@ def build_app(
     async def control_status(_request: Request) -> JSONResponse:
         return JSONResponse(await _build_control_status(gateway))
 
+    async def control_audio_level(_request: Request) -> JSONResponse:
+        # Gateway-local read of the live mic level; no device round-trip,
+        # so this works even mid-capture without contending the queue.
+        return JSONResponse(control.get_audio_level())
+
+    async def control_conversation(_request: Request) -> JSONResponse:
+        # Gateway-local read of the rolling conversation log; no device
+        # round-trip, so it never contends the command queue.
+        return JSONResponse(control.get_conversation())
+
     async def control_volume(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
         if not gateway.esp32.device_connected:
@@ -273,6 +285,17 @@ def build_app(
         if not isinstance(volume, int) or isinstance(volume, bool) or not 0 <= volume <= 100:
             return _control_error("volume must be an integer 0..100", status=400)
         return _control_json(await control.set_volume(gateway, volume))
+
+    async def control_mic_gain(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        connected = bool(gateway.esp32.device_connected)
+        if not connected:
+            return _control_error("no device connected", status=503)
+        gain = body.get("gain")
+        if not isinstance(gain, int) or isinstance(gain, bool) or not 0 <= gain <= 36:
+            return _control_error("gain must be an integer 0..36", status=400)
+        result = await control.set_mic_gain(gateway, gain)
+        return _control_json({**result, "connected": connected})
 
     async def control_mute(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
@@ -383,7 +406,10 @@ def build_app(
         Route("/status", endpoint=status, methods=["GET"]),
         # Phase F dashboard control routes (token-guarded by prefix).
         Route("/control/status", endpoint=control_status, methods=["GET"]),
+        Route("/control/audio_level", endpoint=control_audio_level, methods=["GET"]),
+        Route("/control/conversation", endpoint=control_conversation, methods=["GET"]),
         Route("/control/volume", endpoint=control_volume, methods=["POST"]),
+        Route("/control/mic_gain", endpoint=control_mic_gain, methods=["POST"]),
         Route("/control/mute", endpoint=control_mute, methods=["POST"]),
         Route("/control/listen", endpoint=control_listen, methods=["POST"]),
         Route("/control/proximity", endpoint=control_proximity, methods=["POST"]),

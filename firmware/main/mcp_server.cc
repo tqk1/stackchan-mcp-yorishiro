@@ -52,14 +52,36 @@ void McpServer::AddCommonTools() {
             return board.GetDeviceStatusJson();
         });
 
-    AddTool("self.audio_speaker.set_volume", 
+    AddTool("self.audio_speaker.set_volume",
         "Set the volume of the audio speaker. If the current volume is unknown, you must call `self.get_device_status` tool first and then call this tool.",
         PropertyList({
             Property("volume", kPropertyTypeInteger, 0, 100)
-        }), 
+        }),
         [&board](const PropertyList& properties) -> ReturnValue {
             auto codec = board.GetAudioCodec();
             codec->SetOutputVolume(properties["volume"].value<int>());
+            return true;
+        });
+
+    AddTool("self.audio_speaker.set_mic_gain",
+        "Set the microphone input gain in dB (0..36, rounded to the codec's 3 dB step). "
+        "Lower it to reduce amplified background/TV noise that hurts wake-word SNR; raise it if the device is too deaf. "
+        "Applied immediately to the mic ADC and persisted across reboots. "
+        "Call `self.get_device_status` first if the current mic_gain is unknown.",
+        PropertyList({
+            Property("gain", kPropertyTypeInteger, 0, 0, 36)
+        }),
+        [&board](const PropertyList& properties) -> ReturnValue {
+            int gain = properties["gain"].value<int>();
+            // Clamp + round to 3 dB step (same policy as the codec) so the
+            // value we persist matches what the hardware actually applied.
+            if (gain < 0) gain = 0;
+            if (gain > 36) gain = 36;
+            gain = ((gain + 1) / 3) * 3;
+            auto codec = board.GetAudioCodec();
+            codec->SetInputGain((float)gain);
+            Settings settings("audio", true);
+            settings.SetInt("input_gain", gain);
             return true;
         });
     

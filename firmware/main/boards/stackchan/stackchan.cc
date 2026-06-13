@@ -672,6 +672,20 @@ private:
     // font packed into assets, which carries Japanese glyphs).
     lv_obj_t* status_label_ = nullptr;
 
+    // Subtitle overlay (Phase F). A multi-line caption pinned to the bottom
+    // of the LCD, used by the gateway to show what the persona is speaking
+    // via the self.display.set_subtitle MCP tool. Same lazy-create / own-
+    // visibility model as status_label_; wraps to 2-3 lines and shares the
+    // translucent black backing for legibility over the avatar.
+    lv_obj_t* subtitle_label_ = nullptr;
+
+    // Route badge overlay (Phase F). A tiny indicator in the top-right
+    // corner driven by the self.display.set_route_badge MCP tool (the
+    // gateway sends "H" while a turn is being served by the Hermes agent).
+    // Same lazy-create / own-visibility model as status_label_; placed in a
+    // corner so it does not collide with status_label_ (top-centre).
+    lv_obj_t* route_badge_ = nullptr;
+
     // Dynamic avatar set loaded via the load_avatar_set MCP tool. Stays
     // unloaded by default — the index-based image lookups then fall back
     // to the static const tables in avatar_images.h (placeholder or local
@@ -2467,6 +2481,12 @@ private:
             last_voice_ms = 0;
             ESP_LOGI(TAG, "Listening entered at %d ms (timeout in %d ms)",
                      (int)now_ms, (int)LISTEN_TIMEOUT_MS);
+            // 録音開始フィードバック (= 全 LED 緑点灯)。 device state が
+            // Listening に入る全経路 (タッチ / ウェイクワード / ダッシュボード
+            // の StartListening) がこのエッジを通るため、 ここで一括点灯する。
+            // タッチ release 経路 (2577) でも同色で点灯するが、 二重でも無害。
+            // 消灯は既存の 3 経路 (timeout / VAD 無音 / 再タップ) でカバー。
+            SetAllRgbLeds(0, 32, 0);
         }
         was_listening = is_listening;
         if (is_listening && listening_started_ms != 0 &&
@@ -4448,7 +4468,32 @@ private:
         if (!EnsureAvatarObject()) return false;
         lv_image_set_src(avatar_img_, dsc);
         lv_obj_move_foreground(avatar_img_);
+        // The text overlays are siblings of the full-screen avatar. Each
+        // avatar repaint (blink, lip-sync, face change) raises avatar_img_ to
+        // the front, which would otherwise bury any visible overlay. Re-
+        // promote each one here so it stays on top while shown.
+        PromoteOverlaysLocked();
         return true;
+    }
+
+    // Re-raise the status / subtitle / route-badge overlays above avatar_img_
+    // when they exist and are visible. Called after every move_foreground of
+    // the avatar so the overlays are never buried by a repaint. Caller must
+    // hold the display lock (only ever called from RenderAvatarLocked /
+    // EnsureAvatarObject, both of which already do).
+    void PromoteOverlaysLocked() {
+        if (status_label_ != nullptr &&
+            !lv_obj_has_flag(status_label_, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_move_foreground(status_label_);
+        }
+        if (subtitle_label_ != nullptr &&
+            !lv_obj_has_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_move_foreground(subtitle_label_);
+        }
+        if (route_badge_ != nullptr &&
+            !lv_obj_has_flag(route_badge_, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_move_foreground(route_badge_);
+        }
     }
 
     // ---- Avatar fetch pending machinery (intent doc invariant #6) -------
@@ -4584,6 +4629,9 @@ private:
         // chat bubbles, etc. The status bar (clock/battery) lives on a
         // separate sibling and is moved to foreground later if needed.
         lv_obj_move_foreground(avatar_img_);
+        // If any overlay is already up, keep it above the freshly created
+        // avatar (same sibling-ordering concern as RenderAvatarLocked).
+        PromoteOverlaysLocked();
         ESP_LOGI(TAG, "Avatar lv_image created on active screen");
         return true;
     }
@@ -4646,6 +4694,131 @@ private:
             lv_label_set_text(status_label_, safe);
             lv_obj_clear_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(status_label_);
+        }
+        return true;
+    }
+
+    // Create subtitle_label_ on the active LVGL screen, pinned to the bottom
+    // centre and word-wrapped to a few lines so a spoken sentence stays
+    // legible over the avatar. Caller must hold the display lock. Returns
+    // true on success or when subtitle_label_ already exists. Starts hidden;
+    // SetSubtitleText() controls visibility.
+    bool EnsureSubtitleLabel() {
+        if (subtitle_label_ != nullptr) {
+            return true;
+        }
+        lv_obj_t* screen = lv_screen_active();
+        if (screen == nullptr) {
+            return false;
+        }
+        subtitle_label_ = lv_label_create(screen);
+        if (subtitle_label_ == nullptr) {
+            return false;
+        }
+        // Wrap long sentences across lines instead of overflowing the screen
+        // width. The fixed width (300 of the 320 px LCD) plus a max height of
+        // ~3 lines keeps the box to 2-3 wrapped lines; extra text is clipped.
+        lv_label_set_long_mode(subtitle_label_, LV_LABEL_LONG_MODE_WRAP);
+        lv_obj_set_width(subtitle_label_, 300);
+        lv_obj_set_style_max_height(subtitle_label_, 78, 0);
+        lv_obj_set_style_text_align(subtitle_label_, LV_TEXT_ALIGN_CENTER, 0);
+        // Same translucent black backing as status_label_ for legibility.
+        lv_obj_set_style_bg_color(subtitle_label_, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(subtitle_label_, LV_OPA_60, 0);
+        lv_obj_set_style_text_color(subtitle_label_, lv_color_white(), 0);
+        lv_obj_set_style_radius(subtitle_label_, 8, 0);
+        lv_obj_set_style_pad_left(subtitle_label_, 8, 0);
+        lv_obj_set_style_pad_right(subtitle_label_, 8, 0);
+        lv_obj_set_style_pad_top(subtitle_label_, 3, 0);
+        lv_obj_set_style_pad_bottom(subtitle_label_, 3, 0);
+        lv_obj_align(subtitle_label_, LV_ALIGN_BOTTOM_MID, 0, -6);
+        lv_obj_clear_flag(subtitle_label_, LV_OBJ_FLAG_SCROLLABLE);
+        // Hidden until the first non-empty SetSubtitleText().
+        lv_obj_add_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(subtitle_label_);
+        ESP_LOGI(TAG, "Subtitle label created on active screen");
+        return true;
+    }
+
+    // Public entry for the self.display.set_subtitle MCP tool. An empty
+    // string hides the subtitle; any non-empty text shows it, re-promotes it
+    // above the avatar and updates the caption. Visibility is independent of
+    // the avatar layer. Safe to call from any task.
+    bool SetSubtitleText(const char* text) {
+        if (display_ == nullptr) {
+            ESP_LOGW(TAG, "SetSubtitleText ignored: display_ not ready");
+            return false;
+        }
+        const char* safe = (text != nullptr) ? text : "";
+        DisplayLockGuard lock(display_);
+        if (!EnsureSubtitleLabel()) {
+            return false;
+        }
+        if (safe[0] == '\0') {
+            lv_obj_add_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_label_set_text(subtitle_label_, safe);
+            lv_obj_clear_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(subtitle_label_);
+        }
+        return true;
+    }
+
+    // Create route_badge_ on the active LVGL screen, pinned to the top-right
+    // corner (clear of status_label_ at top-centre). Caller must hold the
+    // display lock. Returns true on success or when route_badge_ already
+    // exists. Starts hidden; SetRouteBadge() controls visibility.
+    bool EnsureRouteBadge() {
+        if (route_badge_ != nullptr) {
+            return true;
+        }
+        lv_obj_t* screen = lv_screen_active();
+        if (screen == nullptr) {
+            return false;
+        }
+        route_badge_ = lv_label_create(screen);
+        if (route_badge_ == nullptr) {
+            return false;
+        }
+        // Same translucent black backing as status_label_ for legibility.
+        lv_obj_set_style_bg_color(route_badge_, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(route_badge_, LV_OPA_60, 0);
+        lv_obj_set_style_text_color(route_badge_, lv_color_white(), 0);
+        lv_obj_set_style_radius(route_badge_, 8, 0);
+        lv_obj_set_style_pad_left(route_badge_, 6, 0);
+        lv_obj_set_style_pad_right(route_badge_, 6, 0);
+        lv_obj_set_style_pad_top(route_badge_, 3, 0);
+        lv_obj_set_style_pad_bottom(route_badge_, 3, 0);
+        // Top-right corner so it never overlaps status_label_ (top-centre).
+        lv_obj_align(route_badge_, LV_ALIGN_TOP_RIGHT, -4, 6);
+        lv_obj_clear_flag(route_badge_, LV_OBJ_FLAG_SCROLLABLE);
+        // Hidden until the first non-empty SetRouteBadge().
+        lv_obj_add_flag(route_badge_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(route_badge_);
+        ESP_LOGI(TAG, "Route badge created on active screen");
+        return true;
+    }
+
+    // Public entry for the self.display.set_route_badge MCP tool. An empty
+    // string hides the badge; any non-empty text shows it, re-promotes it
+    // above the avatar and updates the caption (the gateway sends "H" while
+    // Hermes is serving the turn). Safe to call from any task.
+    bool SetRouteBadge(const char* text) {
+        if (display_ == nullptr) {
+            ESP_LOGW(TAG, "SetRouteBadge ignored: display_ not ready");
+            return false;
+        }
+        const char* safe = (text != nullptr) ? text : "";
+        DisplayLockGuard lock(display_);
+        if (!EnsureRouteBadge()) {
+            return false;
+        }
+        if (safe[0] == '\0') {
+            lv_obj_add_flag(route_badge_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_label_set_text(route_badge_, safe);
+            lv_obj_clear_flag(route_badge_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(route_badge_);
         }
         return true;
     }
@@ -5895,6 +6068,52 @@ private:
                 return root;
             });
 
+        // Phase F: subtitle caption pinned to the bottom of the LCD. The
+        // gateway drives it with what the persona is currently speaking. Wraps
+        // to a few lines; an empty string clears it. Independent of the avatar
+        // and of set_status_text (which lives at the top).
+        mcp_server.AddTool(
+            "self.display.set_subtitle",
+            "Set a subtitle caption shown along the bottom of the LCD, used to "
+            "display what the persona is speaking. Wraps to 2-3 lines. Pass an "
+            "empty string to hide it.",
+            PropertyList({Property("text", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string text = properties["text"].value<std::string>();
+                bool applied = SetSubtitleText(text.c_str());
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", applied);
+                if (!applied) {
+                    cJSON_AddStringToObject(root, "error",
+                        "Display not ready yet; retry after a moment.");
+                }
+                ESP_LOGI(TAG, "set_subtitle: text='%s' applied=%d", text.c_str(), applied);
+                return root;
+            });
+
+        // Phase F: small route badge in the top-right corner. The gateway
+        // sends "H" while a turn is being served by the Hermes agent (vs the
+        // local fast-path), and an empty string to clear it. Placed clear of
+        // the top-centre status caption.
+        mcp_server.AddTool(
+            "self.display.set_route_badge",
+            "Set a small indicator badge in the top-right corner of the LCD. "
+            "The gateway sends 'H' while the Hermes agent is serving the turn. "
+            "Pass an empty string to hide it.",
+            PropertyList({Property("text", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string text = properties["text"].value<std::string>();
+                bool applied = SetRouteBadge(text.c_str());
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", applied);
+                if (!applied) {
+                    cJSON_AddStringToObject(root, "error",
+                        "Display not ready yet; retry after a moment.");
+                }
+                ESP_LOGI(TAG, "set_route_badge: text='%s' applied=%d", text.c_str(), applied);
+                return root;
+            });
+
         // Phase 2: lip-sync. Swap the avatar to one of the mouth-only frames.
         // The shape is held until the next set_avatar / set_mouth / blink, so
         // callers should drive it from their TTS / audio level loop.
@@ -6162,6 +6381,37 @@ private:
                 bool ok_r = ok_w ? io_expander_->RefreshLeds() : false;
                 cJSON_AddBoolToObject(root, "ok", ok_w && ok_r);
                 ESP_LOGI(TAG, "set_all_leds: rgb=(%u,%u,%u) ok=%d", r, g, b, ok_w && ok_r);
+                return root;
+            });
+
+        // Phase F: semantic indicator. Sets every base LED to one color so the
+        // gateway can signal which brain answered (e.g. blue while Hermes is
+        // responding), independent of the autonomous listening-green driven by
+        // PollTouchpad (separated in time). (0,0,0) turns the strip off. Thin
+        // wrapper over the same SetAllRgbLeds helper used by set_all.
+        mcp_server.AddTool(
+            "self.led.set_indicator",
+            "Set all base RGB LEDs to one color as a status indicator. The "
+            "gateway uses this to signal which brain is responding (e.g. blue "
+            "while Hermes answers). r/g/b are 0..255; (0,0,0) turns it off.",
+            PropertyList({
+                Property("r", kPropertyTypeInteger, 0, 255),
+                Property("g", kPropertyTypeInteger, 0, 255),
+                Property("b", kPropertyTypeInteger, 0, 255),
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "available", rgb_ok_);
+                if (!rgb_ok_) {
+                    cJSON_AddStringToObject(root, "error", "RGB strip not available (PY32 init failed?)");
+                    return root;
+                }
+                uint8_t r = ClampByte(properties["r"].value<int>());
+                uint8_t g = ClampByte(properties["g"].value<int>());
+                uint8_t b = ClampByte(properties["b"].value<int>());
+                SetAllRgbLeds(r, g, b);
+                cJSON_AddBoolToObject(root, "ok", true);
+                ESP_LOGI(TAG, "set_indicator: rgb=(%u,%u,%u)", r, g, b);
                 return root;
             });
 

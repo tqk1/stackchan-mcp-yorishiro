@@ -708,6 +708,7 @@ async def test_control_status_connected_reports_full_payload() -> None:
     assert body["esp32_connected"] is True
     assert body["volume"] == 50  # default
     assert body["muted"] is False
+    assert body["mic_gain"] == 30  # default
     assert body["heartbeat"] == {"gestures": True, "speak": True, "interval_min": 30.0}
     assert body["proximity"] == {"enabled": True, "threshold": 600}
 
@@ -917,4 +918,143 @@ async def test_control_routes_require_token() -> None:
     assert missing.status_code == 401
     assert missing.text == AUTH_FAILURE_MESSAGE
     assert wrong.status_code == 401
+    assert ok.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_control_audio_level_idle(monkeypatch) -> None:
+    import stackchan_mcp.audio_stream as audio_stream
+
+    monkeypatch.setattr(audio_stream, "is_recording", lambda: False)
+    monkeypatch.setattr(audio_stream, "get_input_level", lambda: 0.0)
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/audio_level")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "recording": False, "level": 0.0}
+
+
+@pytest.mark.asyncio
+async def test_control_audio_level_recording(monkeypatch) -> None:
+    import stackchan_mcp.audio_stream as audio_stream
+
+    monkeypatch.setattr(audio_stream, "is_recording", lambda: True)
+    monkeypatch.setattr(audio_stream, "get_input_level", lambda: 0.55)
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/audio_level")
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["recording"] is True
+    assert body["level"] == 0.55
+
+
+@pytest.mark.asyncio
+async def test_control_audio_level_requires_token() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway, token="secret")
+    async with _client(app) as client:
+        missing = await client.get("/control/audio_level")
+        ok = await client.get(
+            "/control/audio_level", headers=_headers(token="secret")
+        )
+    assert missing.status_code == 401
+    assert ok.status_code == 200
+
+
+# ---- mic gain ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_control_mic_gain_sets_and_persists() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/mic_gain", json={"gain": 24})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "gain": 24, "connected": True}
+    assert (
+        "self.audio_speaker.set_mic_gain",
+        {"gain": 24},
+    ) in gateway.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_control_mic_gain_reflected_in_status() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        await client.post("/control/mic_gain", json={"gain": 12})
+        status = await client.get("/control/status")
+    assert status.json()["mic_gain"] == 12
+
+
+@pytest.mark.asyncio
+async def test_control_mic_gain_rejects_out_of_range() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        too_high = await client.post("/control/mic_gain", json={"gain": 37})
+        negative = await client.post("/control/mic_gain", json={"gain": -1})
+    assert too_high.status_code == 400
+    assert too_high.json()["ok"] is False
+    assert negative.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_control_mic_gain_503_when_disconnected() -> None:
+    gateway = ControlFakeGateway(connected=False)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/mic_gain", json={"gain": 20})
+    assert resp.status_code == 503
+
+
+# ---- conversation log -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_control_conversation_empty() -> None:
+    from stackchan_mcp import control
+
+    control._CONVERSATION.clear()
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/conversation")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "turns": []}
+
+
+@pytest.mark.asyncio
+async def test_control_conversation_returns_recorded_turns() -> None:
+    from stackchan_mcp import control
+
+    control._CONVERSATION.clear()
+    control.record_conversation_turn("おはよう", "おはよう！", "local", {"total": 480})
+    control.record_conversation_turn("天気は？", "晴れです", "hermes", {"total": 1500})
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/conversation")
+    body = resp.json()
+    assert body["ok"] is True
+    assert [t["transcript"] for t in body["turns"]] == ["おはよう", "天気は？"]
+    assert body["turns"][0]["route"] == "local"
+    assert body["turns"][1]["timings_ms"] == {"total": 1500}
+    control._CONVERSATION.clear()
+
+
+@pytest.mark.asyncio
+async def test_control_conversation_requires_token() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway, token="secret")
+    async with _client(app) as client:
+        missing = await client.get("/control/conversation")
+        ok = await client.get(
+            "/control/conversation", headers=_headers(token="secret")
+        )
+    assert missing.status_code == 401
     assert ok.status_code == 200
