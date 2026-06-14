@@ -1,3 +1,26 @@
+# 2026-06-14 セッション3 — CC発話通知を gateway 経由で復活 + ダッシュボードにトグル（方針承認済み）
+
+ユーザー報告: ダッシュボードに「Claude Code の実行状況を話す機能」の ON/OFF トグルが無い。
+調査で判明=この通知連携は三重に停止中: ①settings.json が参照する `stackchan_cc_notify.sh` が不在(hook空振り) ②フラグ `~/.claude/hooks/stackchan_notify.off` が ON(6/13に OFF 化) ③発話先 yuno-chan-api :5050 がダウン。
+ユーザー方針(AskUserQuestion): **gateway 経由で復活**。経路= hook → status_api(:8080)/control/say → gateway(:8767) → VOICEVOX → StackChan（hook はトークン非保持、status_api が付与）。
+
+## 確定事実
+- gateway /control/say: POST `{"text":...}`、`synthesize_and_send`（http_server.py:394-456）。token_protected。
+- status_api(:8080): `/control/*` 汎用プロキシ（Bearer 付与）。:8080・gateway・device 接続すべて稼働中・esp32_connected:true 確認済み。
+- ON/OFF フラグ: `~/.claude/hooks/stackchan_notify.off` 有=OFF。stackchan_toggle.sh と共通。
+- dashboard 雛形: heartbeat トグル（HTML 236-242 / loadStackchan 468 / JS 635-640）。scPost(path,payload) は汎用 fetch で /cc_notify にも使える。
+
+## チェックリスト
+- [x] 1. hook 新規作成 `~/.claude/hooks/stackchan_cc_notify.sh`（gateway経由・2台分岐 Linux=localhost:8080/その他=192.168.0.19:8080・トークンレス・フラグ尊重・$1=attention|done）+ chmod +x。settings.json は無改変
+- [x] 2. hook 単体 E2E → StackChan が「リナックスのクロードコード、お仕事終わったよ！」発話、ユーザー確認 ✅
+- [x] 3. status_api.py に独立エンドポイント `/cc_notify`(GET/POST) 追加。CC_NOTIFY_FLAG 定数。汎用プロキシは無改変。バックアップ *.bak-20260614cc
+- [x] 4. dashboard.html に「🔔 CC発話通知」トグル追加（HTML=heartbeat の隣 / loadStackchan に /cc_notify GET 反映 / change で scPost('/cc_notify',{enabled})）。バックアップ
+- [x] 5. status_api 再起動（ユーザーが sudo 実施）→ /cc_notify 有効化確認 ✅
+- [x] 6. E2E: ON→発話 ✅ / OFF→沈黙 ✅ / GET・POST 200 ✅ / dashboard トグル目視・操作 ✅（ユーザー確認）
+- [x] 7. 記録: worklog 新規（2026-06-14-cc-notify-dashboard-toggle.md）/ memory（reference_cc_notify + project 更新）✅。残=コミット提案
+
+---
+
 # 2026-06-14 セッション2 — ②ウェイクワード不発の決定的診断（計画承認済み）
 
 計画: `~/.claude/plans/shimmying-yawning-ripple.md`。ゴール=②の根本原因を**確定**する。
