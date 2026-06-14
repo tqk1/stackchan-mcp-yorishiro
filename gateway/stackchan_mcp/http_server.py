@@ -219,11 +219,11 @@ async def _proximity_status(gateway: Any) -> dict[str, Any] | None:
     payload = _device_tool_payload(content)
     if not isinstance(payload, dict):
         return None
-    enabled = payload.get("prox_reflex_enabled")
+    mode = payload.get("prox_mode")
     threshold = payload.get("prox_threshold")
-    if not isinstance(enabled, bool) or not isinstance(threshold, int):
+    if mode not in ("reflex", "listen", "off") or not isinstance(threshold, int):
         return None
-    return {"enabled": enabled, "threshold": threshold}
+    return {"mode": mode, "threshold": threshold}
 
 
 def build_app(
@@ -350,6 +350,21 @@ def build_app(
             )
         return _control_json(await control.preview_led(gateway, slot))
 
+    async def control_led_brightness(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        brightness = body.get("brightness")
+        if (
+            not isinstance(brightness, int)
+            or isinstance(brightness, bool)
+            or not 0 <= brightness <= 100
+        ):
+            return _control_error(
+                "brightness must be an integer 0..100", status=400
+            )
+        return _control_json(await control.set_led_brightness(gateway, brightness))
+
     async def control_head(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
         if not gateway.esp32.device_connected:
@@ -404,10 +419,12 @@ def build_app(
         body = await _read_json_body(request)
         if not gateway.esp32.device_connected:
             return _control_error("no device connected", status=503)
-        enabled = body.get("enabled")
+        mode = body.get("mode")
         threshold = body.get("threshold")
-        if not isinstance(enabled, bool):
-            return _control_error("enabled must be a boolean", status=400)
+        if mode not in ("reflex", "listen", "off"):
+            return _control_error(
+                "mode must be one of: reflex, listen, off", status=400
+            )
         if (
             not isinstance(threshold, int)
             or isinstance(threshold, bool)
@@ -416,10 +433,10 @@ def build_app(
             return _control_error("threshold must be an integer 0..2047", status=400)
         content = await _dispatch_mcp_tool(
             "set_proximity_config",
-            {"enabled": enabled, "threshold": threshold},
+            {"mode": mode, "threshold": threshold},
             gateway,
         )
-        return _control_device_result(content, enabled=enabled, threshold=threshold)
+        return _control_device_result(content, mode=mode, threshold=threshold)
 
     async def control_heartbeat(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
@@ -498,6 +515,11 @@ def build_app(
         Route("/control/brightness", endpoint=control_brightness, methods=["POST"]),
         Route("/control/led", endpoint=control_led, methods=["POST"]),
         Route("/control/led_test", endpoint=control_led_test, methods=["POST"]),
+        Route(
+            "/control/led_brightness",
+            endpoint=control_led_brightness,
+            methods=["POST"],
+        ),
         Route("/control/head", endpoint=control_head, methods=["POST"]),
         Route(
             "/control/neutral_pose",

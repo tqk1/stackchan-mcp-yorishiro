@@ -498,6 +498,7 @@ async def test_apply_persisted_brightness_skips_when_disconnected(monkeypatch):
 def test_led_default_is_three_slots():
     led = control.load_state()["led"]
     assert led == {
+        "brightness": 100,
         "idle": {"on": False, "r": 30, "g": 144, "b": 255},
         "listening": {"r": 0, "g": 210, "b": 90},
         "hermes": {"r": 148, "g": 108, "b": 255},
@@ -596,6 +597,35 @@ async def test_apply_led_state_listening_lights_colour():
     gw = FakeGateway()
     await control.apply_led_state(gw, "listening")
     assert gw.esp32.calls == [("self.led.set_all", {"r": 0, "g": 210, "b": 90})]
+
+
+@pytest.mark.asyncio
+async def test_set_led_brightness_scales_live_idle_and_persists():
+    gw = FakeGateway()
+    await control.set_led(gw, "idle", on=True, r=100, g=200, b=50)
+    gw.esp32.calls.clear()
+    result = await control.set_led_brightness(gw, 50)
+    assert result == {"ok": True, "brightness": 50}
+    assert control.load_state()["led"]["brightness"] == 50
+    # 50% scale applied to the live idle colour
+    assert ("self.led.set_all", {"r": 50, "g": 100, "b": 25}) in gw.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_led_brightness_scales_apply_led_state():
+    gw = FakeGateway()
+    control.save_state(
+        {"led": {"brightness": 50, "listening": {"r": 0, "g": 200, "b": 100}}}
+    )
+    await control.apply_led_state(gw, "listening")
+    assert gw.esp32.calls == [("self.led.set_all", {"r": 0, "g": 100, "b": 50})]
+
+
+@pytest.mark.asyncio
+async def test_set_led_brightness_clamps():
+    gw = FakeGateway()
+    assert (await control.set_led_brightness(gw, 999))["brightness"] == 100
+    assert (await control.set_led_brightness(gw, -5))["brightness"] == 0
 
 
 @pytest.mark.asyncio

@@ -71,6 +71,7 @@ DEFAULT_BRIGHTNESS = 75
 #:   - ``listening`` … recording + local-LLM thinking/preparing
 #:   - ``hermes``    … Hermes agent is running
 DEFAULT_LED: dict[str, Any] = {
+    "brightness": 100,
     "idle": {"on": False, "r": 30, "g": 144, "b": 255},
     "listening": {"r": 0, "g": 210, "b": 90},
     "hermes": {"r": 148, "g": 108, "b": 255},
@@ -192,6 +193,23 @@ def _clamp_color(raw: Any, default: dict[str, Any]) -> dict[str, int]:
     }
 
 
+def _clamp_led_brightness(value: Any) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_LED["brightness"]
+    return min(max(v, 0), 100)
+
+
+def _scale_rgb(r: int, g: int, b: int, brightness: int) -> dict[str, int]:
+    """Scale an r/g/b triple by a 0..100 brightness percentage."""
+    return {
+        "r": r * brightness // 100,
+        "g": g * brightness // 100,
+        "b": b * brightness // 100,
+    }
+
+
 def _normalize_led(raw: Any) -> dict[str, Any]:
     """Coerce a stored/incoming LED blob to the 3-slot structure.
 
@@ -210,6 +228,9 @@ def _normalize_led(raw: Any) -> dict[str, Any]:
         **_clamp_color(idle_src, DEFAULT_LED["idle"]),
     }
     return {
+        "brightness": _clamp_led_brightness(
+            src.get("brightness", DEFAULT_LED["brightness"])
+        ),
         "idle": idle,
         "listening": _clamp_color(src.get("listening"), DEFAULT_LED["listening"]),
         "hermes": _clamp_color(src.get("hermes"), DEFAULT_LED["hermes"]),
@@ -485,15 +506,15 @@ async def apply_persisted_brightness(gateway: "Gateway") -> None:
 
 
 async def _send_led_color(gateway: "Gateway", r: int, g: int, b: int) -> bool:
-    """Light all 12 LEDs one colour. True on success.
+    """Light all 12 LEDs one colour, scaled by the saved LED brightness.
 
     Uses ``set_all`` (not ``set_indicator``) so it does not re-arm the
     firmware's idle-settle auto-reset timer — that is what lets a colour
     persist instead of self-clearing ~60 s later.
     """
-    _result, error = await gateway.esp32.call_tool(
-        _SET_ALL_LEDS_TOOL, {"r": r, "g": g, "b": b}
-    )
+    brightness = load_state()["led"]["brightness"]
+    scaled = _scale_rgb(r, g, b, brightness)
+    _result, error = await gateway.esp32.call_tool(_SET_ALL_LEDS_TOOL, scaled)
     if error:
         logger.warning("control: led set_all failed: %s", error)
         return False
@@ -527,11 +548,11 @@ async def apply_led_state(gateway: "Gateway", slot: str) -> None:
     if slot == "idle" and not cfg.get("on", False):
         await _best_effort_device_call(gateway, _CLEAR_LEDS_TOOL, {}, "led:idle-off")
         return
+    scaled = _scale_rgb(
+        cfg.get("r", 0), cfg.get("g", 0), cfg.get("b", 0), led["brightness"]
+    )
     await _best_effort_device_call(
-        gateway,
-        _SET_ALL_LEDS_TOOL,
-        {"r": cfg.get("r", 0), "g": cfg.get("g", 0), "b": cfg.get("b", 0)},
-        f"led:{slot}",
+        gateway, _SET_ALL_LEDS_TOOL, scaled, f"led:{slot}"
     )
 
 
@@ -576,6 +597,27 @@ async def set_led(
     state["led"] = led
     save_state(state)
     return {"ok": True, "led": led}
+
+
+async def set_led_brightness(gateway: "Gateway", value: Any) -> dict[str, Any]:
+    """Set the global LED brightness (0..100) and persist it.
+
+    Scales every LED colour (idle/listening/hermes) sent to the device.
+    Re-applies the idle colour live when idle is on and no voice turn
+    owns the LED. Returns ``{"ok": True, "brightness": int}`` on success
+    or ``{"ok": False, "error": ...}`` when the device call fails.
+    """
+    target = _clamp_led_brightness(value)
+    state = load_state()
+    state["led"]["brightness"] = target
+    save_state(state)
+    if not getattr(gateway, "voice_turn_active", False):
+        idle = state["led"]["idle"]
+        if idle["on"] and not await _send_led_color(
+            gateway, idle["r"], idle["g"], idle["b"]
+        ):
+            return {"ok": False, "error": "device call failed"}
+    return {"ok": True, "brightness": target}
 
 
 async def preview_led(gateway: "Gateway", slot: Any) -> dict[str, Any]:

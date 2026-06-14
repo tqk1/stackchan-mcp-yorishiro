@@ -882,10 +882,15 @@ private:
     // partly misses the offset photodiode), hand at 20-30cm only ~393-448.
     // So the hand-wave reflex works up to ~10-15cm; room-scale presence
     // (1-2m) still needs an external ToF unit on Grove Port A.
-    // The enabled flag and threshold are runtime-tunable via the
+    // The mode and threshold are runtime-tunable via the
     // self.touch.set_proximity_config MCP tool and persist in NVS
     // (namespace "stackchan_prox"); the defaults below apply on first boot.
-    static constexpr bool PROX_REFLEX_ENABLED_DEFAULT = true;
+    // Mode selects what a confirmed hand-wave does:
+    //   reflex = look up + happy face (board-local, no Hermes round-trip)
+    //   listen = start a tap-equivalent listen (record -> STT -> Hermes)
+    //   off    = no reaction
+    enum class ProxMode { Off, Reflex, Listen };
+    static constexpr ProxMode PROX_MODE_DEFAULT = ProxMode::Listen;
     static constexpr int PROX_PS_THRESHOLD_DEFAULT    = 600;
                                                        // raw PS counts (0..2047):
                                                        // above the 20-30cm
@@ -907,12 +912,12 @@ private:
     bool ltr553_ok_ = false;
     esp_timer_handle_t prox_poll_timer_ = nullptr;
 
-    // Runtime-tunable reflex config: loaded from NVS in
+    // Runtime-tunable proximity config: loaded from NVS in
     // InitializeLtr553Proximity(), written by set_proximity_config (MCP
     // task). Read from the poll callback with the same benign torn-read
     // trade-off as last_ps_raw_ below.
-    bool prox_reflex_enabled_ = PROX_REFLEX_ENABLED_DEFAULT;
-    int  prox_ps_threshold_   = PROX_PS_THRESHOLD_DEFAULT;
+    ProxMode prox_mode_         = PROX_MODE_DEFAULT;
+    int      prox_ps_threshold_ = PROX_PS_THRESHOLD_DEFAULT;
 
     // Proximity detection state (single-thread access from the
     // prox_poll_timer_ callback on ESP_TIMER_TASK, same model as the
@@ -4346,19 +4351,65 @@ private:
         ESP_LOGI(TAG, "Si12T touch poll started (%d ms interval)", TOUCH_POLL_MS);
     }
 
-    // ---- Phase C1: proximity (LTR-553) sensing + hand-wave reflex --------
+    // ---- Phase C1: proximity (LTR-553) sensing + hand-wave reaction -------
 
-    // Board-local reflex on a confirmed "hand near" rising edge: look up
-    // front + happy face, then auto-revert to idle after REACTION_HOLD_MS.
-    // Mirrors HandleStroke(); WriteHeadAngles takes motion_mutex_ internally
-    // and is safe to call from the ESP_TIMER_TASK poll callback.
+    static const char* ProxModeToString(ProxMode mode) {
+        switch (mode) {
+            case ProxMode::Reflex: return "reflex";
+            case ProxMode::Listen: return "listen";
+            case ProxMode::Off:
+            default:               return "off";
+        }
+    }
+
+    // Returns true and writes *out on a known mode string; false on unknown
+    // input so the caller can reject without mutating any state.
+    static bool StringToProxMode(const std::string& s, ProxMode* out) {
+        if (s == "reflex") { *out = ProxMode::Reflex; return true; }
+        if (s == "listen") { *out = ProxMode::Listen; return true; }
+        if (s == "off")    { *out = ProxMode::Off;    return true; }
+        return false;
+    }
+
+    // Board-local reaction on a confirmed "hand near" rising edge, dispatched
+    // by prox_mode_:
+    //   reflex = look up front + happy face, auto-reverting to idle.
+    //   listen = a tap-equivalent listen toggle: the 1st wave starts a listen,
+    //            a 2nd wave while listening stops it and sends the recording.
+    //            No head motion or expression change; mirrors the LCD-tap path
+    //            including the brief LED feedback.
+    // Mirrors HandleStroke(); WriteHeadAngles / Start/StopListening are all
+    // safe to call from the ESP_TIMER_TASK poll callback.
     void HandleProximity(int ps_raw) {
-        ESP_LOGI(TAG, "proximity event: HAND ps_raw=%d (threshold=%d) -> look up",
-                 ps_raw, prox_ps_threshold_);
-        WriteHeadAngles(PROX_REACT_YAW_DEG, PROX_REACT_PITCH_DEG);
-        SetAvatarExpressionIfActive("happy");
-        ScheduleIdleRevert();
-        ScheduleIdleSettle();
+        switch (prox_mode_) {
+            case ProxMode::Listen: {
+                auto& app = Application::GetInstance();
+                if (app.GetDeviceState() == kDeviceStateListening) {
+                    ESP_LOGI(TAG, "proximity event: HAND ps_raw=%d -> stop listening (send)",
+                             ps_raw);
+                    SetAllRgbLeds(0, 0, 0);   // capture-complete feedback
+                    app.StopListening();
+                } else {
+                    ESP_LOGI(TAG, "proximity event: HAND ps_raw=%d (threshold=%d) -> start listening",
+                             ps_raw, prox_ps_threshold_);
+                    SetAllRgbLeds(0, 32, 0);  // capture-start feedback (dim green)
+                    app.StartListening();
+                }
+                break;
+            }
+            case ProxMode::Reflex:
+                ESP_LOGI(TAG, "proximity event: HAND ps_raw=%d (threshold=%d) -> look up",
+                         ps_raw, prox_ps_threshold_);
+                WriteHeadAngles(PROX_REACT_YAW_DEG, PROX_REACT_PITCH_DEG);
+                SetAvatarExpressionIfActive("happy");
+                ScheduleIdleRevert();
+                ScheduleIdleSettle();
+                break;
+            case ProxMode::Off:
+            default:
+                // Unreachable: ProximityPollTick gates on prox_mode_ != Off.
+                break;
+        }
     }
 
     static void ProximityPollCb(void* arg) {
@@ -4406,14 +4457,20 @@ private:
                      detected ? "NEAR" : "FAR", ps, saturated ? 1 : 0,
                      prox_ps_threshold_);
         }
-        if (prox_reflex_enabled_ && detected && !prox_detected_prev_) {
+        if (prox_mode_ != ProxMode::Off && detected && !prox_detected_prev_) {
+            // While a listen is open, a 2nd wave must always be able to stop
+            // it (send the recording), so bypass the cooldown in that case.
+            // The cooldown still gates back-to-back *starts* (anti-bounce).
+            bool listening_now =
+                prox_mode_ == ProxMode::Listen &&
+                Application::GetInstance().GetDeviceState() == kDeviceStateListening;
             uint64_t now_us = esp_timer_get_time();
-            if (now_us >= prox_cooldown_until_us_) {
+            if (listening_now || now_us >= prox_cooldown_until_us_) {
                 HandleProximity(ps);
                 prox_cooldown_until_us_ =
                     now_us + (uint64_t)PROX_COOLDOWN_MS * 1000ULL;
             } else {
-                ESP_LOGI(TAG, "proximity reflex suppressed (cooldown, %d ms left)",
+                ESP_LOGI(TAG, "proximity reaction suppressed (cooldown, %d ms left)",
                          (int)((prox_cooldown_until_us_ - now_us) / 1000ULL));
             }
         }
@@ -4433,13 +4490,20 @@ private:
 
         {
             Settings settings("stackchan_prox");
-            prox_reflex_enabled_ =
-                settings.GetBool("enabled", PROX_REFLEX_ENABLED_DEFAULT);
+            std::string mode_str = settings.GetString("mode", "");
+            if (!StringToProxMode(mode_str, &prox_mode_)) {
+                // No (or invalid) "mode" key: migrate from the legacy
+                // "enabled" bool written before mode was introduced.
+                // enabled=true -> the new default (listen), false -> off.
+                // The legacy key is left in place (harmless, read-only).
+                bool legacy_enabled = settings.GetBool("enabled", true);
+                prox_mode_ = legacy_enabled ? PROX_MODE_DEFAULT : ProxMode::Off;
+            }
             prox_ps_threshold_ =
                 settings.GetInt("threshold", PROX_PS_THRESHOLD_DEFAULT);
         }
-        ESP_LOGI(TAG, "proximity reflex config: enabled=%d threshold=%d",
-                 prox_reflex_enabled_ ? 1 : 0, prox_ps_threshold_);
+        ESP_LOGI(TAG, "proximity config: mode=%s threshold=%d",
+                 ProxModeToString(prox_mode_), prox_ps_threshold_);
 
         esp_timer_create_args_t poll_args = {
             .callback = &StackChanBoard::ProximityPollCb,
@@ -6462,8 +6526,8 @@ private:
                 cJSON_AddNumberToObject(root, "raw", last_output1_raw_);
                 cJSON_AddBoolToObject(root, "proximity_available", ltr553_ok_);
                 cJSON_AddNumberToObject(root, "ps_raw", last_ps_raw_);
-                cJSON_AddBoolToObject(root, "prox_reflex_enabled",
-                                      prox_reflex_enabled_);
+                cJSON_AddStringToObject(root, "prox_mode",
+                                        ProxModeToString(prox_mode_));
                 cJSON_AddNumberToObject(root, "prox_threshold",
                                         prox_ps_threshold_);
                 const char* ev = "idle";
@@ -6485,30 +6549,42 @@ private:
             });
 
         // Phase C1 follow-up (2026-06-13): runtime tuning of the proximity
-        // hand-wave reflex, so threshold changes no longer need a reflash.
-        // Both arguments are required — passing only one would silently
-        // reset the other to a stale schema default.
+        // hand-wave reaction, so changes no longer need a reflash. Both
+        // arguments are required — passing only one would silently reset the
+        // other to a stale schema default.
         mcp_server.AddTool(
             "self.touch.set_proximity_config",
-            "Enable/disable the proximity hand-wave reflex and set its raw "
-            "PS detection threshold (0..2047; baseline ~380, hand within "
-            "10cm reads ~820+). Both values persist across reboots.",
-            PropertyList({Property("enabled", kPropertyTypeBoolean),
+            "Set the proximity hand-wave reaction mode and its raw PS "
+            "detection threshold (0..2047; baseline ~380, hand within 10cm "
+            "reads ~820+). mode must be one of: reflex (look up + happy "
+            "face), listen (start a tap-equivalent listen), off (no "
+            "reaction). Both values persist across reboots.",
+            PropertyList({Property("mode", kPropertyTypeString),
                           Property("threshold", kPropertyTypeInteger, 0, 2047)}),
             [this](const PropertyList& properties) -> ReturnValue {
-                bool enabled = properties["enabled"].value<bool>();
+                std::string mode_str = properties["mode"].value<std::string>();
                 int threshold = properties["threshold"].value<int>();
+                cJSON* root = cJSON_CreateObject();
+                ProxMode mode;
+                if (!StringToProxMode(mode_str, &mode)) {
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error",
+                        "Unknown mode. Allowed: reflex, listen, off.");
+                    ESP_LOGW(TAG, "set_proximity_config rejected: unknown mode '%s'",
+                             mode_str.c_str());
+                    return root;
+                }
                 {
                     Settings settings("stackchan_prox", true);
-                    settings.SetBool("enabled", enabled);
+                    settings.SetString("mode", mode_str);
                     settings.SetInt("threshold", threshold);
                 }
-                prox_reflex_enabled_ = enabled;
+                prox_mode_ = mode;
                 prox_ps_threshold_ = threshold;
-                ESP_LOGI(TAG, "proximity config updated: enabled=%d threshold=%d",
-                         enabled ? 1 : 0, threshold);
-                cJSON* root = cJSON_CreateObject();
-                cJSON_AddBoolToObject(root, "enabled", enabled);
+                ESP_LOGI(TAG, "proximity config updated: mode=%s threshold=%d",
+                         mode_str.c_str(), threshold);
+                cJSON_AddBoolToObject(root, "ok", true);
+                cJSON_AddStringToObject(root, "mode", mode_str.c_str());
                 cJSON_AddNumberToObject(root, "threshold", threshold);
                 return root;
             });

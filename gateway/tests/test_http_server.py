@@ -654,7 +654,7 @@ class ControlFakeESP32:
         self.listen_calls: list[tuple[str, str]] = []
         self.recording = False
         # get_touch_state payload exposed to /control/status.
-        self.touch_payload = {"prox_reflex_enabled": True, "prox_threshold": 600}
+        self.touch_payload = {"prox_mode": "listen", "prox_threshold": 600}
 
     def get_status(self) -> dict:
         return {"connected": self.device_connected}
@@ -710,11 +710,12 @@ async def test_control_status_connected_reports_full_payload() -> None:
     assert body["muted"] is False
     assert body["mic_gain"] == 30  # default
     assert body["brightness"] == 75  # default (matches firmware NVS default)
+    assert body["led"]["brightness"] == 100  # default
     assert body["led"]["idle"] == {"on": False, "r": 30, "g": 144, "b": 255}  # default
     assert body["led"]["listening"] == {"r": 0, "g": 210, "b": 90}
     assert body["led"]["hermes"] == {"r": 148, "g": 108, "b": 255}
     assert body["heartbeat"] == {"gestures": True, "speak": True, "interval_min": 30.0}
-    assert body["proximity"] == {"enabled": True, "threshold": 600}
+    assert body["proximity"] == {"mode": "listen", "threshold": 600}
 
 
 @pytest.mark.asyncio
@@ -790,6 +791,25 @@ async def test_control_brightness_503_when_disconnected() -> None:
     async with _client(app) as client:
         resp = await client.post("/control/brightness", json={"brightness": 40})
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_control_led_brightness_sets_and_persists() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/led_brightness", json={"brightness": 60})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "brightness": 60}
+
+
+@pytest.mark.asyncio
+async def test_control_led_brightness_rejects_out_of_range() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/led_brightness", json={"brightness": 200})
+    assert resp.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -946,13 +966,13 @@ async def test_control_proximity_dispatches() -> None:
     app = _build_control_app(gateway)
     async with _client(app) as client:
         resp = await client.post(
-            "/control/proximity", json={"enabled": True, "threshold": 700}
+            "/control/proximity", json={"mode": "reflex", "threshold": 700}
         )
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "enabled": True, "threshold": 700}
+    assert resp.json() == {"ok": True, "mode": "reflex", "threshold": 700}
     assert (
         "self.touch.set_proximity_config",
-        {"enabled": True, "threshold": 700},
+        {"mode": "reflex", "threshold": 700},
     ) in gateway.esp32.calls
 
 
@@ -962,7 +982,18 @@ async def test_control_proximity_validates_threshold() -> None:
     app = _build_control_app(gateway)
     async with _client(app) as client:
         resp = await client.post(
-            "/control/proximity", json={"enabled": True, "threshold": 9999}
+            "/control/proximity", json={"mode": "listen", "threshold": 9999}
+        )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_control_proximity_validates_mode() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/proximity", json={"mode": "bogus", "threshold": 600}
         )
     assert resp.status_code == 400
 

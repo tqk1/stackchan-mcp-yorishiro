@@ -1106,17 +1106,23 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
             Tool(
                 name="set_proximity_config",
                 description=(
-                    "Enable/disable the proximity hand-wave reflex (LTR-553) and "
-                    "set its raw PS detection threshold. Baseline reads ~380; a "
-                    "hand within 10cm reads ~820+. Both values persist on the "
-                    "device across reboots."
+                    "Set the proximity hand-wave reaction mode (LTR-553) and "
+                    "its raw PS detection threshold. mode is one of reflex / "
+                    "listen / off. Baseline reads ~380; a hand within 10cm "
+                    "reads ~820+. Both values persist on the device across "
+                    "reboots."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "enabled": {
-                            "type": "boolean",
-                            "description": "Whether the reflex fires on detection",
+                        "mode": {
+                            "type": "string",
+                            "enum": ["reflex", "listen", "off"],
+                            "description": (
+                                "Reaction on detection: reflex (look up + "
+                                "happy face), listen (tap-equivalent listen), "
+                                "off (no reaction)"
+                            ),
                         },
                         "threshold": {
                             "type": "integer",
@@ -1125,7 +1131,7 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                             "maximum": 2047,
                         },
                     },
-                    "required": ["enabled", "threshold"],
+                    "required": ["mode", "threshold"],
                 },
             ),
             Tool(
