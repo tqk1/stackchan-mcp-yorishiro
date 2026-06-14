@@ -430,6 +430,111 @@ async def test_apply_persisted_mic_gain_skips_when_disconnected(monkeypatch):
     assert gw.esp32.calls == []
 
 
+# ---- set_head_angle ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_head_angle_sends_clamped():
+    gw = FakeGateway()
+    result = await control.set_head_angle(gw, 30, 60)
+    assert result == {"ok": True, "yaw": 30, "pitch": 60, "connected": True}
+    assert gw.esp32.calls == [
+        ("self.robot.set_head_angles", {"yaw": 30, "pitch": 60})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_head_angle_clamps_out_of_range():
+    gw = FakeGateway()
+    result = await control.set_head_angle(gw, 200, 1)
+    # yaw clamped to 90, pitch floored at 5.
+    assert result == {"ok": True, "yaw": 90, "pitch": 5, "connected": True}
+    assert gw.esp32.calls == [
+        ("self.robot.set_head_angles", {"yaw": 90, "pitch": 5})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_head_angle_clamps_low_yaw_high_pitch():
+    gw = FakeGateway()
+    result = await control.set_head_angle(gw, -200, 999)
+    assert result == {"ok": True, "yaw": -90, "pitch": 85, "connected": True}
+
+
+@pytest.mark.asyncio
+async def test_set_head_angle_disconnected():
+    gw = FakeGateway(connected=False)
+    result = await control.set_head_angle(gw, 0, 30)
+    assert result == {
+        "ok": False,
+        "error": "no device connected",
+        "yaw": 0,
+        "pitch": 30,
+        "connected": False,
+    }
+    assert gw.esp32.calls == []
+
+
+@pytest.mark.asyncio
+async def test_set_head_angle_device_failure():
+    gw = FakeGateway(fail=True)
+    result = await control.set_head_angle(gw, 10, 40)
+    assert result == {
+        "ok": False,
+        "error": "device call failed",
+        "yaw": 10,
+        "pitch": 40,
+        "connected": True,
+    }
+
+
+# ---- set_neutral_pose -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_neutral_pose_sends_clamped():
+    gw = FakeGateway()
+    result = await control.set_neutral_pose(gw, -20, 50)
+    assert result == {"ok": True, "yaw": -20, "pitch": 50, "connected": True}
+    assert gw.esp32.calls == [
+        ("self.robot.set_neutral_pose", {"yaw": -20, "pitch": 50})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_neutral_pose_clamps_out_of_range():
+    gw = FakeGateway()
+    result = await control.set_neutral_pose(gw, 999, 0)
+    assert result == {"ok": True, "yaw": 90, "pitch": 5, "connected": True}
+
+
+@pytest.mark.asyncio
+async def test_set_neutral_pose_disconnected():
+    gw = FakeGateway(connected=False)
+    result = await control.set_neutral_pose(gw, 0, 30)
+    assert result == {
+        "ok": False,
+        "error": "no device connected",
+        "yaw": 0,
+        "pitch": 30,
+        "connected": False,
+    }
+    assert gw.esp32.calls == []
+
+
+@pytest.mark.asyncio
+async def test_set_neutral_pose_device_failure():
+    gw = FakeGateway(fail=True)
+    result = await control.set_neutral_pose(gw, 5, 45)
+    assert result == {
+        "ok": False,
+        "error": "device call failed",
+        "yaw": 5,
+        "pitch": 45,
+        "connected": True,
+    }
+
+
 # ---- conversation log -------------------------------------------------
 
 

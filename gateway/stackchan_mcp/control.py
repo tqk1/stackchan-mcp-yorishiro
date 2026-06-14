@@ -76,6 +76,22 @@ STATUS_CLEAR = ""
 _STATUS_TEXT_TOOL = "self.display.set_status_text"
 _SET_VOLUME_TOOL = "self.audio_speaker.set_volume"
 _SET_MIC_GAIN_TOOL = "self.audio_speaker.set_mic_gain"
+#: Phase F dashboard joystick. ``set_head_angles`` is a live move (not
+#: persisted); ``set_neutral_pose`` writes the rest pose the head
+#: returns to and persists it to NVS on the firmware side. Both clamp
+#: yaw to ``[-90,90]`` and pitch to ``[5,85]`` (the M5Stack-recommended
+#: range); the firmware applies its own wider hard clamp (pitch 0..88)
+#: on top.
+_SET_HEAD_ANGLES_TOOL = "self.robot.set_head_angles"
+_SET_NEUTRAL_POSE_TOOL = "self.robot.set_neutral_pose"
+
+#: Head-angle bounds the dashboard / REST layer clamps to. Yaw is the
+#: horizontal pan; pitch is the vertical tilt. See the tool constants
+#: above for why pitch floors at 5 rather than 0.
+MIN_HEAD_YAW = -90
+MAX_HEAD_YAW = 90
+MIN_HEAD_PITCH = 5
+MAX_HEAD_PITCH = 85
 #: Phase F dashboard extras. All three are best-effort: an old
 #: firmware without the tool just errors and we degrade silently
 #: (see :func:`_call_display_or_led`).
@@ -110,6 +126,22 @@ def _clamp_mic_gain(gain: Any) -> int:
     except (TypeError, ValueError):
         return DEFAULT_MIC_GAIN
     return min(max(value, 0), MAX_MIC_GAIN)
+
+
+def _clamp_head_yaw(yaw: Any) -> int:
+    try:
+        value = int(yaw)
+    except (TypeError, ValueError):
+        return 0
+    return min(max(value, MIN_HEAD_YAW), MAX_HEAD_YAW)
+
+
+def _clamp_head_pitch(pitch: Any) -> int:
+    try:
+        value = int(pitch)
+    except (TypeError, ValueError):
+        return MIN_HEAD_PITCH
+    return min(max(value, MIN_HEAD_PITCH), MAX_HEAD_PITCH)
 
 
 def load_state() -> dict[str, Any]:
@@ -299,6 +331,91 @@ async def apply_persisted_mic_gain(gateway: "Gateway") -> None:
         if attempt < _APPLY_VOLUME_RETRIES:
             await asyncio.sleep(_APPLY_VOLUME_DELAY_S)
     logger.warning("control: mic_gain re-apply gave up after retries")
+
+
+async def set_head_angle(
+    gateway: "Gateway", yaw: Any, pitch: Any
+) -> dict[str, Any]:
+    """Move the head live (not persisted) to clamped ``yaw``/``pitch``.
+
+    Backs the dashboard joystick's POST /control/head. Mirrors
+    :func:`set_mic_gain`: clamps the inputs (yaw ``[-90,90]``, pitch
+    ``[5,85]``), calls the firmware ``set_head_angles`` device tool, and
+    reports the connected flag so the caller can surface it. Returns
+    ``{"ok": True, "yaw": int, "pitch": int, "connected": bool}`` on
+    success or ``{"ok": False, "error": ..., ...}`` when the device call
+    fails or no device is connected.
+    """
+    target_yaw = _clamp_head_yaw(yaw)
+    target_pitch = _clamp_head_pitch(pitch)
+    connected = bool(gateway.esp32.device_connected)
+    if not connected:
+        return {
+            "ok": False,
+            "error": "no device connected",
+            "yaw": target_yaw,
+            "pitch": target_pitch,
+            "connected": False,
+        }
+    result, error = await gateway.esp32.call_tool(
+        _SET_HEAD_ANGLES_TOOL, {"yaw": target_yaw, "pitch": target_pitch}
+    )
+    if error:
+        logger.warning("control: set_head_angles failed: %s", error)
+        return {
+            "ok": False,
+            "error": "device call failed",
+            "yaw": target_yaw,
+            "pitch": target_pitch,
+            "connected": True,
+        }
+    return {
+        "ok": True,
+        "yaw": target_yaw,
+        "pitch": target_pitch,
+        "connected": True,
+    }
+
+
+async def set_neutral_pose(
+    gateway: "Gateway", yaw: Any, pitch: Any
+) -> dict[str, Any]:
+    """Save the head's neutral (rest) pose; persisted to NVS on-device.
+
+    Backs the dashboard's POST /control/neutral_pose. Same clamping and
+    contract as :func:`set_head_angle`, but calls the firmware
+    ``set_neutral_pose`` device tool (implemented in parallel on the
+    firmware side) so the chosen pose survives reboots.
+    """
+    target_yaw = _clamp_head_yaw(yaw)
+    target_pitch = _clamp_head_pitch(pitch)
+    connected = bool(gateway.esp32.device_connected)
+    if not connected:
+        return {
+            "ok": False,
+            "error": "no device connected",
+            "yaw": target_yaw,
+            "pitch": target_pitch,
+            "connected": False,
+        }
+    result, error = await gateway.esp32.call_tool(
+        _SET_NEUTRAL_POSE_TOOL, {"yaw": target_yaw, "pitch": target_pitch}
+    )
+    if error:
+        logger.warning("control: set_neutral_pose failed: %s", error)
+        return {
+            "ok": False,
+            "error": "device call failed",
+            "yaw": target_yaw,
+            "pitch": target_pitch,
+            "connected": True,
+        }
+    return {
+        "ok": True,
+        "yaw": target_yaw,
+        "pitch": target_pitch,
+        "connected": True,
+    }
 
 
 async def set_device_status_text(gateway: "Gateway", text: str) -> None:

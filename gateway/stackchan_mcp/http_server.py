@@ -297,6 +297,38 @@ def build_app(
         result = await control.set_mic_gain(gateway, gain)
         return _control_json({**result, "connected": connected})
 
+    async def control_head(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        yaw = body.get("yaw")
+        pitch = body.get("pitch")
+        if not isinstance(yaw, int) or isinstance(yaw, bool) or not -90 <= yaw <= 90:
+            return _control_error("yaw must be an integer -90..90", status=400)
+        if (
+            not isinstance(pitch, int)
+            or isinstance(pitch, bool)
+            or not 5 <= pitch <= 85
+        ):
+            return _control_error("pitch must be an integer 5..85", status=400)
+        return _control_json(await control.set_head_angle(gateway, yaw, pitch))
+
+    async def control_neutral_pose(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        yaw = body.get("yaw")
+        pitch = body.get("pitch")
+        if not isinstance(yaw, int) or isinstance(yaw, bool) or not -90 <= yaw <= 90:
+            return _control_error("yaw must be an integer -90..90", status=400)
+        if (
+            not isinstance(pitch, int)
+            or isinstance(pitch, bool)
+            or not 5 <= pitch <= 85
+        ):
+            return _control_error("pitch must be an integer 5..85", status=400)
+        return _control_json(await control.set_neutral_pose(gateway, yaw, pitch))
+
     async def control_mute(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
         if not gateway.esp32.device_connected:
@@ -410,6 +442,12 @@ def build_app(
         Route("/control/conversation", endpoint=control_conversation, methods=["GET"]),
         Route("/control/volume", endpoint=control_volume, methods=["POST"]),
         Route("/control/mic_gain", endpoint=control_mic_gain, methods=["POST"]),
+        Route("/control/head", endpoint=control_head, methods=["POST"]),
+        Route(
+            "/control/neutral_pose",
+            endpoint=control_neutral_pose,
+            methods=["POST"],
+        ),
         Route("/control/mute", endpoint=control_mute, methods=["POST"]),
         Route("/control/listen", endpoint=control_listen, methods=["POST"]),
         Route("/control/proximity", endpoint=control_proximity, methods=["POST"]),

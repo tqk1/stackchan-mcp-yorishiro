@@ -1012,6 +1012,95 @@ async def test_control_mic_gain_503_when_disconnected() -> None:
     assert resp.status_code == 503
 
 
+# ---- /control/head ----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_control_head_moves_live() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/head", json={"yaw": 25, "pitch": 55})
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ok": True,
+        "yaw": 25,
+        "pitch": 55,
+        "connected": True,
+    }
+    assert (
+        "self.robot.set_head_angles",
+        {"yaw": 25, "pitch": 55},
+    ) in gateway.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_control_head_rejects_out_of_range() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        bad_yaw = await client.post("/control/head", json={"yaw": 200, "pitch": 30})
+        bad_pitch = await client.post("/control/head", json={"yaw": 0, "pitch": 1})
+    assert bad_yaw.status_code == 400
+    assert bad_yaw.json()["ok"] is False
+    assert bad_pitch.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_control_head_503_when_disconnected() -> None:
+    gateway = ControlFakeGateway(connected=False)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/head", json={"yaw": 0, "pitch": 30})
+    assert resp.status_code == 503
+
+
+# ---- /control/neutral_pose --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_control_neutral_pose_persists() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/neutral_pose", json={"yaw": -10, "pitch": 40}
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ok": True,
+        "yaw": -10,
+        "pitch": 40,
+        "connected": True,
+    }
+    assert (
+        "self.robot.set_neutral_pose",
+        {"yaw": -10, "pitch": 40},
+    ) in gateway.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_control_neutral_pose_rejects_out_of_range() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/neutral_pose", json={"yaw": 0, "pitch": 999}
+        )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_control_neutral_pose_503_when_disconnected() -> None:
+    gateway = ControlFakeGateway(connected=False)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/neutral_pose", json={"yaw": 0, "pitch": 30}
+        )
+    assert resp.status_code == 503
+
+
 # ---- conversation log -------------------------------------------------
 
 

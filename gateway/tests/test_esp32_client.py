@@ -971,3 +971,72 @@ async def test_run_device_ready_hook_noop_when_unset():
     mgr = ESP32Manager()
     assert mgr.on_device_ready is None
     await mgr._run_device_ready_hook()
+
+
+# ---- Phase F: on_listen_started hook ----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_listen_started_hook_invokes_callback():
+    """_run_listen_started_hook awaits the registered callback."""
+    mgr = ESP32Manager()
+    fired = asyncio.Event()
+
+    async def cb():
+        fired.set()
+
+    mgr.on_listen_started = cb
+    await mgr._run_listen_started_hook()
+    assert fired.is_set()
+
+
+@pytest.mark.asyncio
+async def test_run_listen_started_hook_swallows_errors():
+    """A failing on_listen_started callback must not propagate."""
+    mgr = ESP32Manager()
+
+    async def cb():
+        raise RuntimeError("boom")
+
+    mgr.on_listen_started = cb
+    # Must not raise.
+    await mgr._run_listen_started_hook()
+
+
+@pytest.mark.asyncio
+async def test_run_listen_started_hook_noop_when_unset():
+    """No callback registered → the hook is a quiet no-op."""
+    mgr = ESP32Manager()
+    assert mgr.on_listen_started is None
+    await mgr._run_listen_started_hook()
+
+
+@pytest.mark.asyncio
+async def test_device_driven_listen_fires_listen_started(manager_with_hook):
+    """The on_listen_started hook fires the instant a device-driven
+    listen opens the recording slot — before the capture finishes."""
+    from stackchan_mcp.audio_stream import is_recording
+
+    mgr, _calls = manager_with_hook
+    port = mgr._test_port
+    fired = asyncio.Event()
+
+    async def cb():
+        fired.set()
+
+    mgr.on_listen_started = cb
+
+    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+        await _complete_handshake(ws)
+        await ws.send(json.dumps({
+            "type": "listen",
+            "state": "start",
+            "mode": "manual",
+        }))
+        # The hook fires at recording start; no listen.stop needed.
+        for _ in range(20):
+            await asyncio.sleep(0.05)
+            if fired.is_set():
+                break
+        assert is_recording()
+        assert fired.is_set(), "on_listen_started did not fire at record start"

@@ -562,6 +562,10 @@ async def _dispatch_mcp_tool(
             "self.robot.get_head_angles",
             {},
         ),
+        "set_neutral_pose": (
+            "self.robot.set_neutral_pose",
+            arguments,
+        ),
         "gpio_test": (
             "self.robot.gpio_test",
             {},
@@ -829,6 +833,39 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 inputSchema={
                     "type": "object",
                     "properties": {},
+                },
+            ),
+            Tool(
+                name="set_neutral_pose",
+                description=(
+                    "Save the head's neutral (rest) pose — the angles it "
+                    "returns to between gestures. yaw: horizontal (-90 to 90), "
+                    "pitch: vertical (5 to 85, the M5Stack-recommended range). "
+                    "Unlike move_head this persists on the device across "
+                    "reboots (NVS), so the head rests at the chosen pose after "
+                    "a power cycle. The firmware applies its own wider hard "
+                    "clamp (pitch 0..88) on top."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "yaw": {
+                            "type": "integer",
+                            "description": "Horizontal angle in degrees (-90 to 90)",
+                            "minimum": -90,
+                            "maximum": 90,
+                        },
+                        "pitch": {
+                            "type": "integer",
+                            "description": (
+                                "Vertical angle in degrees (5 to 85, "
+                                "M5Stack-recommended operating range)"
+                            ),
+                            "minimum": 5,
+                            "maximum": 85,
+                        },
+                    },
+                    "required": ["yaw", "pitch"],
                 },
             ),
             Tool(

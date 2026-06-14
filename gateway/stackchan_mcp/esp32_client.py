@@ -376,6 +376,12 @@ class ESP32Manager:
         # is restored once a (re)connected device finishes MCP init.
         # Optional for the same standalone-test reason as above.
         self.on_device_ready: Callable[[], Awaitable[None]] | None = None
+        # Phase F (yorishiro fork): fired the instant a device-driven
+        # listen capture starts recording (LCD tap / wake word / button),
+        # so the owning Gateway can flash the "きいてるよ" status text
+        # immediately instead of waiting for the recording to finish,
+        # upload, and decode. Wired the same way as on_device_ready.
+        self.on_listen_started: Callable[[], Awaitable[None]] | None = None
         self._init_tasks: list[asyncio.Task] = []
         self._vision_url: str = ""
         self._vision_token: str = ""
@@ -665,6 +671,18 @@ class ESP32Manager:
                                 "session=%s mode=%s",
                                 session_id, data.get("mode", ""),
                             )
+                            # Phase F (yorishiro fork): flash "きいてるよ"
+                            # at the earliest possible moment — the
+                            # instant recording opens — rather than after
+                            # the capture finishes, uploads, and decodes
+                            # (the old path in hermes_bridge). Fire-and-
+                            # forget so the WebSocket read loop never
+                            # blocks on the display round-trip; the hook
+                            # owns its own error handling.
+                            if self.on_listen_started is not None:
+                                asyncio.create_task(
+                                    self._run_listen_started_hook()
+                                )
                     elif state == "stop":
                         if self._device_driven_session_id == session_id:
                             self._device_driven_session_id = None
@@ -763,6 +781,16 @@ class ESP32Manager:
             await callback()
         except Exception:
             logger.exception("on_device_ready callback failed")
+
+    async def _run_listen_started_hook(self) -> None:
+        """Invoke the on_listen_started callback, never propagating."""
+        callback = self.on_listen_started
+        if callback is None:
+            return
+        try:
+            await callback()
+        except Exception:
+            logger.exception("on_listen_started callback failed")
 
     async def _emit_stackchan_event(self, payload: dict[str, Any]) -> None:
         """Forward a firmware-originated stackchan event to the MCP client."""

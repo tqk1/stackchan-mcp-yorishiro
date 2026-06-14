@@ -815,6 +815,15 @@ private:
                                                   // short of 600 ms.
     static constexpr int REACTION_HOLD_MS = 3000;
     static constexpr int COOLDOWN_MS      = 800;  // post-reaction noise gate
+    // Idle auto-settle: after this long with no face / head / LED activity,
+    // recenter the head, return to the idle face and turn the base LEDs off.
+    // Distinct from REACTION_HOLD_MS (the short per-reaction revert) — this is
+    // the long "nobody is interacting" backstop, re-armed by every activity.
+    static constexpr int IDLE_SETTLE_MS   = 60000; // 60 s
+    // If the head is already within this many degrees of neutral when the
+    // idle backstop fires, skip the WriteHeadAngles so torque is not
+    // re-engaged on an already-settled head.
+    static constexpr int IDLE_SETTLE_DEADBAND_DEG = 3;
     // With 2-sample debounce this gives ~200 ms confirm latency, fast enough
     // to catch a quick "pon" (~200 ms press) while still rejecting single-
     // sample jitter. Was 200 ms polling -> 400 ms confirm, which silently
@@ -831,6 +840,7 @@ private:
     bool si12t_ok_ = false;
     esp_timer_handle_t touch_poll_timer_ = nullptr;
     esp_timer_handle_t touch_revert_timer_ = nullptr;
+    esp_timer_handle_t idle_settle_timer_ = nullptr;  // long idle backstop
 
     // Touch detection state (single-thread access from the touch_poll_timer_
     // callback, which runs on the ESP_TIMER_TASK).
@@ -1126,7 +1136,11 @@ private:
     // target, risking servo bus degradation if the SCS0009 wakes up
     // mid-sequence.
     static constexpr int BOOT_INIT_YAW_DEG = 0;
-    static constexpr int BOOT_INIT_PITCH_DEG = 45;
+    // Rest/neutral pitch. Higher = look up (cf. PROX_REACT_PITCH_DEG=60 "slightly
+    // up"). Lowered 45 -> 38 on user feedback: at 45 the neutral pose looked up
+    // too much. This single constant drives boot-init, the proximity/touch revert
+    // (TouchRevertCb) and the idle-settle return, so they stay consistent.
+    static constexpr int BOOT_INIT_PITCH_DEG = 38;
     // BOOT_INIT_MOVE_MS=3000: minimum duration of the Phase 0 climb.
     // Used as a floor so the boot-init `WriteHeadAngles(0, 45, X)`
     // always elapses at least this long — required on the PMIC OFF/ON
@@ -1158,6 +1172,18 @@ private:
     // Single-source Phase 0 speed cap. 15 deg/s is the no-stutter Smooth
     // lower bound (#121 Problem 2 + #141 verification).
     static constexpr int BOOT_INIT_TARGET_DEG_PER_SEC = 15;
+
+    // Runtime-tunable neutral (rest) pose. BOOT_INIT_YAW_DEG /
+    // BOOT_INIT_PITCH_DEG remain the compile-time defaults; these members
+    // hold the NVS-resolved values actually used by boot-init, the
+    // proximity/touch revert (TouchRevertCb) and the idle-settle return.
+    // Loaded from NVS (namespace "stackchan_pose") at the start of
+    // InitializeServo() before the Phase 2 seed, written at runtime by the
+    // self.robot.set_neutral_pose MCP tool. pitch is held to
+    // [SAFE_PITCH_MIN, SAFE_PITCH_MAX] (clamped by set_neutral_pose before
+    // storing, matching set_head_angles).
+    int neutral_yaw_   = BOOT_INIT_YAW_DEG;
+    int neutral_pitch_ = BOOT_INIT_PITCH_DEG;
 
     static int YawDegToPos(int deg) {
         int pos = 460 + deg * 16 / 5;
@@ -2487,6 +2513,10 @@ private:
             // タッチ release 経路 (2577) でも同色で点灯するが、 二重でも無害。
             // 消灯は既存の 3 経路 (timeout / VAD 無音 / 再タップ) でカバー。
             SetAllRgbLeds(0, 32, 0);
+            // Listening 突入は「顔/LED を変える操作」なので idle backstop を
+            // 再武装する。全 listening 経路 (タッチ/ウェイクワード/ダッシュ
+            // ボード) がこのエッジを通るためここで一括。
+            ScheduleIdleSettle();
         }
         was_listening = is_listening;
         if (is_listening && listening_started_ms != 0 &&
@@ -2868,6 +2898,24 @@ private:
     void InitializeServo() {
         ESP_LOGI(TAG, "Init SCS0009 servo bus (UART%d, baud=%d, tx=%d, rx=%d)",
                  SERVO_UART_NUM, SERVO_BAUDRATE, SERVO_TX_PIN, SERVO_RX_PIN);
+
+        // Resolve the neutral (rest) pose from NVS before any boot-init seed
+        // below references it. Persisted by self.robot.set_neutral_pose
+        // (namespace "stackchan_pose"); the BOOT_INIT_* constants are the
+        // first-boot defaults. Mirrors the proximity-config NVS load in
+        // InitializeLtr553Proximity(). pitch is clamped on write, but clamp
+        // again here as defense-in-depth in case the stored value predates a
+        // SAFE_PITCH range change.
+        {
+            Settings settings("stackchan_pose");
+            neutral_yaw_   = settings.GetInt("yaw", BOOT_INIT_YAW_DEG);
+            neutral_pitch_ = settings.GetInt("pitch", BOOT_INIT_PITCH_DEG);
+            if (neutral_yaw_ < -90) neutral_yaw_ = -90;
+            if (neutral_yaw_ > 90)  neutral_yaw_ = 90;
+            if (neutral_pitch_ < SAFE_PITCH_MIN) neutral_pitch_ = SAFE_PITCH_MIN;
+            if (neutral_pitch_ > SAFE_PITCH_MAX) neutral_pitch_ = SAFE_PITCH_MAX;
+        }
+        ESP_LOGI(TAG, "neutral pose config: yaw=%d pitch=%d", neutral_yaw_, neutral_pitch_);
 #if CONFIG_STACKCHAN_SERVO_FEETECH
         // FeetechScs::begin() returns void and uses ESP_ERROR_CHECK internally,
         // so a UART configuration error aborts the boot rather than reporting
@@ -3083,17 +3131,18 @@ private:
                 ESP_LOGI(TAG, "Restored yaw_motion_.current_deg=%d from ReadPos=%d",
                          yaw_motion_.current_deg, yaw_pos_actual);
             } else {
-                // Issue #138: seed yaw current_deg to BOOT_INIT_YAW_DEG
-                // rather than leaving the struct default. The default
-                // happens to be 0 (== BOOT_INIT_YAW_DEG today), so this
-                // is a no-op assignment in current numerical terms; the
-                // explicit form keeps intent visible and propagates any
-                // future change to BOOT_INIT_YAW_DEG.
-                yaw_motion_.current_deg = BOOT_INIT_YAW_DEG;
+                // Issue #138: seed yaw current_deg to the neutral pose
+                // rather than leaving the struct default. neutral_yaw_ is the
+                // NVS-resolved rest pose (default BOOT_INIT_YAW_DEG); seeding
+                // to it keeps the boot-init climb a near-no-op
+                // (start_deg == target_deg) so the start==target invariant
+                // holds regardless of the persisted neutral. The explicit
+                // form keeps intent visible.
+                yaw_motion_.current_deg = neutral_yaw_;
                 ESP_LOGW(TAG,
                          "Failed to ReadPos(yaw) after %d attempts; "
-                         "seeded current_deg=%d (BOOT_INIT_YAW_DEG)",
-                         BOOT_READPOS_MAX_ATTEMPTS, BOOT_INIT_YAW_DEG);
+                         "seeded current_deg=%d (neutral_yaw_)",
+                         BOOT_READPOS_MAX_ATTEMPTS, neutral_yaw_);
             }
             if (pitch_pos_actual >= 0) {
                 int restored_pitch = (pitch_pos_actual - 620) * 5 / 16;
@@ -3108,28 +3157,30 @@ private:
                 ESP_LOGI(TAG, "Restored pitch_motion_.current_deg=%d from ReadPos=%d (clamped to safe range %d..%d)",
                          pitch_motion_.current_deg, pitch_pos_actual, SAFE_PITCH_MIN, SAFE_PITCH_MAX);
             } else {
-                // Issue #138: seed pitch current_deg to BOOT_INIT_PITCH_DEG.
-                // Without this, the boot-init `WriteHeadAngles(0, 45, 4000)`
+                // Issue #138: seed pitch current_deg to the neutral pose.
+                // Without this, the boot-init `WriteHeadAngles(neutral, ...)`
                 // interpolation below would start from the struct-default
                 // `current_deg=0` (== pos=620 at deg=0, the lower mechanical
                 // end-stop) and walk WritePos calls upward (pos=620, 623,
                 // 626, ...) through end-stop-adjacent positions before
                 // reaching the target -- risking servo bus degradation if
-                // the SCS0009 wakes up mid-sequence. Seeding to
-                // BOOT_INIT_PITCH_DEG makes the subsequent interpolation a
-                // near-no-op (start_deg == target_deg == 45) which keeps
-                // the servo away from end-stop territory throughout the
-                // wake-up window. This is the firmware-side counterpart to
-                // the Phase 1a ReadPos retry: retry absorbs the typical
-                // wake-up case so the snap-suppress hold can fire; this
-                // seed handles the residual case where wake-up exceeds the
-                // retry budget or the bus is genuinely hung (#100).
-                pitch_motion_.current_deg = BOOT_INIT_PITCH_DEG;
+                // the SCS0009 wakes up mid-sequence. neutral_pitch_ is the
+                // NVS-resolved rest pose (default BOOT_INIT_PITCH_DEG, always
+                // within [SAFE_PITCH_MIN, SAFE_PITCH_MAX]); seeding to it
+                // makes the subsequent interpolation a near-no-op
+                // (start_deg == target_deg) which keeps the servo away from
+                // end-stop territory throughout the wake-up window. This is
+                // the firmware-side counterpart to the Phase 1a ReadPos
+                // retry: retry absorbs the typical wake-up case so the
+                // snap-suppress hold can fire; this seed handles the residual
+                // case where wake-up exceeds the retry budget or the bus is
+                // genuinely hung (#100).
+                pitch_motion_.current_deg = neutral_pitch_;
                 ESP_LOGW(TAG,
                          "Failed to ReadPos(pitch) after %d attempts; "
-                         "seeded current_deg=%d (BOOT_INIT_PITCH_DEG) "
+                         "seeded current_deg=%d (neutral_pitch_) "
                          "to avoid end-stop walk during boot-init climb",
-                         BOOT_READPOS_MAX_ATTEMPTS, BOOT_INIT_PITCH_DEG);
+                         BOOT_READPOS_MAX_ATTEMPTS, neutral_pitch_);
             }
 
             BaseType_t ok = xTaskCreate(&StackChanBoard::ServoTaskTrampoline,
@@ -3190,9 +3241,9 @@ private:
             int phase0_yaw_delta;
             int phase0_pitch_delta;
             phase0_yaw_delta =
-                BOOT_INIT_YAW_DEG - static_cast<int>(motion_driver_->GetYawDeg());
+                neutral_yaw_ - static_cast<int>(motion_driver_->GetYawDeg());
             phase0_pitch_delta =
-                BOOT_INIT_PITCH_DEG - static_cast<int>(motion_driver_->GetPitchDeg());
+                neutral_pitch_ - static_cast<int>(motion_driver_->GetPitchDeg());
             if (phase0_yaw_delta < 0) phase0_yaw_delta = -phase0_yaw_delta;
             if (phase0_pitch_delta < 0) phase0_pitch_delta = -phase0_pitch_delta;
             int phase0_max_delta = phase0_yaw_delta > phase0_pitch_delta
@@ -3204,7 +3255,7 @@ private:
                 phase0_duration_ms = BOOT_INIT_MOVE_MS;
             }
             TickType_t boot_init_start_tick = xTaskGetTickCount();
-            WriteHeadAngles(BOOT_INIT_YAW_DEG, BOOT_INIT_PITCH_DEG,
+            WriteHeadAngles(neutral_yaw_, neutral_pitch_,
                             phase0_duration_ms,
                             /* prefer_linear = */ true);
             // Two-phase boot-init wait:
@@ -4065,6 +4116,11 @@ private:
     static void TouchRevertCb(void* arg) {
         StackChanBoard* self = static_cast<StackChanBoard*>(arg);
         self->SetAvatarExpressionIfActive("idle");
+        // Also recenter the head: HandleProximity / HandleStroke tilt the
+        // head up via this shared revert path, so resetting only the face
+        // would leave stack-chan staring upward indefinitely. Returns to the
+        // NVS-resolved neutral pose (set_neutral_pose), default BOOT_INIT_*.
+        self->WriteHeadAngles(self->neutral_yaw_, self->neutral_pitch_);
     }
 
     void ScheduleIdleRevert() {
@@ -4081,6 +4137,50 @@ private:
         esp_timer_stop(touch_revert_timer_);  // ok if not running
         esp_timer_start_once(touch_revert_timer_,
                              (uint64_t)REACTION_HOLD_MS * 1000);
+    }
+
+    // Long idle backstop. Fired once IDLE_SETTLE_MS after the last
+    // face / head / LED activity (each such activity re-arms it via
+    // ScheduleIdleSettle). Recenters the head, returns to idle and turns the
+    // base LEDs off. One-shot: it does NOT re-arm itself, so a settled
+    // stack-chan stays quiet until the next interaction.
+    static void IdleSettleCb(void* arg) {
+        StackChanBoard* self = static_cast<StackChanBoard*>(arg);
+        self->OnIdleSettle();
+    }
+
+    void OnIdleSettle() {
+        // Only re-engage servo torque if the head is meaningfully off-center;
+        // otherwise a settled head would needlessly re-energize every 60 s.
+        if (servo_ok_ && motion_driver_ != nullptr) {
+            int yaw_delta = std::abs(neutral_yaw_ -
+                static_cast<int>(motion_driver_->GetYawDeg()));
+            int pitch_delta = std::abs(neutral_pitch_ -
+                static_cast<int>(motion_driver_->GetPitchDeg()));
+            if (std::max(yaw_delta, pitch_delta) > IDLE_SETTLE_DEADBAND_DEG) {
+                WriteHeadAngles(neutral_yaw_, neutral_pitch_);
+            }
+        }
+        SetAvatarExpressionIfActive("idle");
+        SetAllRgbLeds(0, 0, 0);
+    }
+
+    // Re-arm the idle backstop. Called by every face / head / LED activity so
+    // the 60 s window is measured from the last interaction, not boot.
+    void ScheduleIdleSettle() {
+        if (idle_settle_timer_ == nullptr) {
+            esp_timer_create_args_t args = {
+                .callback = &StackChanBoard::IdleSettleCb,
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "idle_settle",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&args, &idle_settle_timer_));
+        }
+        esp_timer_stop(idle_settle_timer_);  // ok if not running
+        esp_timer_start_once(idle_settle_timer_,
+                             (uint64_t)IDLE_SETTLE_MS * 1000);
     }
 
     // Decode a 2-bit channel level from the Si12T Output1 byte.
@@ -4120,6 +4220,7 @@ private:
         // not pop the avatar back over the WiFi config / settings screens.
         SetAvatarExpressionIfActive("surprised");
         ScheduleIdleRevert();
+        ScheduleIdleSettle();
         Application::GetInstance().SendStackChanEvent("touch", "tap", duration_ms);
     }
 
@@ -4130,6 +4231,7 @@ private:
         SetAvatarExpressionIfActive("embarrassed");
         StartServoWobble();
         ScheduleIdleRevert();
+        ScheduleIdleSettle();
         Application::GetInstance().SendStackChanEvent("touch", "stroke", duration_ms);
     }
 
@@ -4256,6 +4358,7 @@ private:
         WriteHeadAngles(PROX_REACT_YAW_DEG, PROX_REACT_PITCH_DEG);
         SetAvatarExpressionIfActive("happy");
         ScheduleIdleRevert();
+        ScheduleIdleSettle();
     }
 
     static void ProximityPollCb(void* arg) {
@@ -4690,11 +4793,22 @@ private:
         }
         if (safe[0] == '\0') {
             lv_obj_add_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+            // Hidden labels don't invalidate themselves; redraw the area they
+            // vacated so the caption clears without waiting for the next touch
+            // (CoreS3 has no periodic LVGL refresh while listening).
+            lv_obj_invalidate(lv_obj_get_parent(status_label_));
         } else {
             lv_label_set_text(status_label_, safe);
             lv_obj_clear_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(status_label_);
+            // Force a deterministic same-frame flush. Without this the new
+            // caption is invisible until the next event triggers a redraw,
+            // which reads as a one-turn lag. layout first so a freshly
+            // un-hidden label has a non-zero area to invalidate.
+            lv_obj_update_layout(status_label_);
+            lv_obj_invalidate(status_label_);
         }
+        lv_refr_now(lv_obj_get_display(status_label_));
         return true;
     }
 
@@ -4756,11 +4870,18 @@ private:
         }
         if (safe[0] == '\0') {
             lv_obj_add_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
+            // Redraw the vacated area (the hidden label can't invalidate
+            // itself) so the subtitle clears immediately. See SetStatusText().
+            lv_obj_invalidate(lv_obj_get_parent(subtitle_label_));
         } else {
             lv_label_set_text(subtitle_label_, safe);
             lv_obj_clear_flag(subtitle_label_, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(subtitle_label_);
+            // Same-frame flush so the subtitle appears without a one-turn lag.
+            lv_obj_update_layout(subtitle_label_);
+            lv_obj_invalidate(subtitle_label_);
         }
+        lv_refr_now(lv_obj_get_display(subtitle_label_));
         return true;
     }
 
@@ -4815,11 +4936,18 @@ private:
         }
         if (safe[0] == '\0') {
             lv_obj_add_flag(route_badge_, LV_OBJ_FLAG_HIDDEN);
+            // Redraw the vacated area (the hidden label can't invalidate
+            // itself) so the badge clears immediately. See SetStatusText().
+            lv_obj_invalidate(lv_obj_get_parent(route_badge_));
         } else {
             lv_label_set_text(route_badge_, safe);
             lv_obj_clear_flag(route_badge_, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(route_badge_);
+            // Same-frame flush so the badge appears without a one-turn lag.
+            lv_obj_update_layout(route_badge_);
+            lv_obj_invalidate(route_badge_);
         }
+        lv_refr_now(lv_obj_get_display(route_badge_));
         return true;
     }
 
@@ -5654,6 +5782,9 @@ private:
                 } else {
                     WriteHeadAngles(yaw, pitch);
                 }
+                // Re-arm the idle backstop: an explicit move counts as
+                // activity, so the 60 s auto-settle is measured from here.
+                ScheduleIdleSettle();
                 bool yaw_motion_started = false;
                 bool pitch_motion_started = false;
                 if (servo_ok_) {
@@ -5671,6 +5802,66 @@ private:
                 cJSON_AddNumberToObject(root, "pitch_pos", pitch_pos);
                 cJSON_AddNumberToObject(root, "yaw_motion_started", yaw_motion_started ? 1 : 0);
                 cJSON_AddNumberToObject(root, "pitch_motion_started", pitch_motion_started ? 1 : 0);
+                return root;
+            });
+
+        // Persist the neutral (rest) pose so the head's resting yaw/pitch can
+        // be retuned from the dashboard without a reflash. The values drive
+        // boot-init, the proximity/touch revert (TouchRevertCb) and the
+        // idle-settle return. Saving also moves the head there immediately so
+        // the operator can confirm the pose. Both values persist across
+        // reboots (NVS namespace "stackchan_pose").
+        // Pitch schema range is intentionally permissive (whole int range);
+        // the authoritative clamp to [SAFE_PITCH_MIN, SAFE_PITCH_MAX] lives in
+        // the handler with an ESP_LOGW, mirroring set_head_angles (see the
+        // PropertyList rationale there / Issue #98).
+        mcp_server.AddTool(
+            "self.robot.set_neutral_pose",
+            "Set and persist the neutral (rest) head pose. yaw: horizontal "
+            "(-90 to 90). pitch: vertical; higher looks up. The firmware "
+            "accepts pitch 0 to 88 (silently clamped with an ESP_LOGW outside "
+            "that range). This pose is used at boot and whenever the head "
+            "recenters after a proximity/touch reaction or idle timeout. "
+            "Saving moves the head to the new pose immediately as a "
+            "confirmation. Both values persist across reboots.",
+            PropertyList({Property("yaw", kPropertyTypeInteger, 0, -90, 90),
+                          Property("pitch", kPropertyTypeInteger, 0,
+                                   std::numeric_limits<int>::min(),
+                                   std::numeric_limits<int>::max())}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int yaw = properties["yaw"].value<int>();
+                int pitch = properties["pitch"].value<int>();
+                // Tier 1 (hard clamp): silently clamp to [SAFE_PITCH_MIN,
+                // SAFE_PITCH_MAX] and ESP_LOGW, same as set_head_angles. yaw
+                // is already schema-bounded to [-90, 90], but clamp
+                // defensively in case the schema bound is ever widened.
+                if (yaw < -90) yaw = -90;
+                if (yaw > 90)  yaw = 90;
+                if (pitch < SAFE_PITCH_MIN) {
+                    ESP_LOGW(TAG, "set_neutral_pose: pitch=%d below SAFE_PITCH_MIN=%d, clamping (servo end-stop protection)",
+                             pitch, SAFE_PITCH_MIN);
+                    pitch = SAFE_PITCH_MIN;
+                }
+                if (pitch > SAFE_PITCH_MAX) {
+                    ESP_LOGW(TAG, "set_neutral_pose: pitch=%d above SAFE_PITCH_MAX=%d, clamping (servo end-stop protection)",
+                             pitch, SAFE_PITCH_MAX);
+                    pitch = SAFE_PITCH_MAX;
+                }
+                {
+                    Settings settings("stackchan_pose", true);
+                    settings.SetInt("yaw", yaw);
+                    settings.SetInt("pitch", pitch);
+                }
+                neutral_yaw_   = yaw;
+                neutral_pitch_ = pitch;
+                ESP_LOGI(TAG, "neutral pose updated: yaw=%d pitch=%d", yaw, pitch);
+                // Move to the new neutral immediately so the operator can
+                // confirm the pose on the real device.
+                WriteHeadAngles(neutral_yaw_, neutral_pitch_);
+                ScheduleIdleSettle();
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddNumberToObject(root, "yaw", yaw);
+                cJSON_AddNumberToObject(root, "pitch", pitch);
                 return root;
             });
 
@@ -5744,6 +5935,11 @@ private:
                     cJSON_AddNumberToObject(root, "yaw_attempts", yaw_attempts);
                     cJSON_AddNumberToObject(root, "pitch_attempts", pitch_attempts);
                 }
+                // Always surface the persisted neutral (rest) pose so the
+                // dashboard can show / pre-fill the set_neutral_pose form even
+                // when the live ReadPos failed.
+                cJSON_AddNumberToObject(root, "neutral_yaw", neutral_yaw_);
+                cJSON_AddNumberToObject(root, "neutral_pitch", neutral_pitch_);
                 char* str = cJSON_PrintUnformatted(root);
                 std::string result(str);
                 cJSON_free(str);
@@ -6410,6 +6606,9 @@ private:
                 uint8_t g = ClampByte(properties["g"].value<int>());
                 uint8_t b = ClampByte(properties["b"].value<int>());
                 SetAllRgbLeds(r, g, b);
+                // Re-arm the idle backstop: changing the indicator is LED
+                // activity, so the 60 s auto-settle is measured from here.
+                ScheduleIdleSettle();
                 cJSON_AddBoolToObject(root, "ok", true);
                 ESP_LOGI(TAG, "set_indicator: rgb=(%u,%u,%u)", r, g, b);
                 return root;

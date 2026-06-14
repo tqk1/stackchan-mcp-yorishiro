@@ -50,6 +50,10 @@ class Gateway:
         # (speaker volume / mute) once a (re)connected device finishes
         # MCP init. Wired the same way as on_human_interaction above.
         self.esp32.on_device_ready = self._on_device_ready
+        # Phase F (yorishiro fork): show "きいてるよ" the instant a
+        # device-driven listen starts recording, not after the capture
+        # uploads and decodes. Wired the same way as the callbacks above.
+        self.esp32.on_listen_started = self._on_listen_started
         # Phase F (yorishiro fork): True while a voice turn is in flight.
         # The status-text feedback (and the web_search "調べ中" hook) read
         # this so they only touch the device display during a real turn,
@@ -66,6 +70,18 @@ class Gateway:
 
         await control.apply_persisted_volume(self)
         await control.apply_persisted_mic_gain(self)
+
+    async def _on_listen_started(self) -> None:
+        """Device-driven listen began — flash the listening status now.
+
+        Pushed the instant recording opens (LCD tap / wake word / button)
+        so "きいてるよ" appears with the tap instead of one beat late.
+        The hermes bridge re-sends the same status when the capture
+        arrives; the double send is harmless (idempotent display update).
+        """
+        from . import control
+
+        await control.set_device_status_text(self, control.STATUS_LISTENING)
 
     @property
     def vision_url(self) -> str:

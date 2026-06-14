@@ -85,6 +85,64 @@ async def test_get_head_angles_relays_to_esp32(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_tools_includes_set_neutral_pose():
+    """set_neutral_pose is exposed with the recommended yaw/pitch range."""
+    server = create_server()
+
+    result = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+
+    tool = next(
+        (t for t in result.root.tools if t.name == "set_neutral_pose"), None
+    )
+    assert tool is not None, "set_neutral_pose tool should be registered"
+    props = tool.inputSchema["properties"]
+    assert props["yaw"]["minimum"] == -90
+    assert props["yaw"]["maximum"] == 90
+    assert props["pitch"]["minimum"] == 5
+    assert props["pitch"]["maximum"] == 85
+    assert set(tool.inputSchema["required"]) == {"yaw", "pitch"}
+
+
+@pytest.mark.asyncio
+async def test_set_neutral_pose_relays_to_esp32(monkeypatch):
+    """set_neutral_pose maps to the ESP32 self.robot.set_neutral_pose tool."""
+    calls = []
+
+    class FakeESP32:
+        device_connected = True
+
+        async def call_tool(self, name, arguments):
+            calls.append((name, arguments))
+            return {
+                "content": [
+                    {"type": "text", "text": json.dumps({"ok": True})}
+                ],
+            }, None
+
+    class FakeGateway:
+        esp32 = FakeESP32()
+
+    import stackchan_mcp.stdio_server as stdio_server
+
+    monkeypatch.setattr(stdio_server, "get_gateway", lambda: FakeGateway())
+    server = create_server()
+
+    await server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            method="tools/call",
+            params={
+                "name": "set_neutral_pose",
+                "arguments": {"yaw": -15, "pitch": 50},
+            },
+        )
+    )
+
+    assert calls == [("self.robot.set_neutral_pose", {"yaw": -15, "pitch": 50})]
+
+
+@pytest.mark.asyncio
 async def test_list_tools_includes_set_mouth_sequence():
     """set_mouth_sequence is exposed to MCP clients with an array schema."""
     server = create_server()
