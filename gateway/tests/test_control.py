@@ -49,6 +49,8 @@ def test_load_state_defaults_when_missing():
         "muted": False,
         "pre_mute_volume": control.DEFAULT_VOLUME,
         "mic_gain": control.DEFAULT_MIC_GAIN,
+        "brightness": control.DEFAULT_BRIGHTNESS,
+        "led": control.DEFAULT_LED,
     }
 
 
@@ -65,6 +67,8 @@ def test_save_then_load_roundtrip(monkeypatch, tmp_path):
         "muted": True,
         "pre_mute_volume": 70,
         "mic_gain": 18,
+        "brightness": control.DEFAULT_BRIGHTNESS,
+        "led": control.DEFAULT_LED,
     }
 
 
@@ -441,6 +445,222 @@ async def test_apply_persisted_mic_gain_skips_when_disconnected(monkeypatch):
     gw = FakeGateway(connected=False)
     await control.apply_persisted_mic_gain(gw)
     assert gw.esp32.calls == []
+
+
+# ---- brightness -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_brightness_sends_and_persists():
+    gw = FakeGateway()
+    result = await control.set_brightness(gw, 40)
+    assert result == {"ok": True, "brightness": 40}
+    assert gw.esp32.calls == [("self.screen.set_brightness", {"brightness": 40})]
+    assert control.load_state()["brightness"] == 40
+
+
+@pytest.mark.asyncio
+async def test_set_brightness_clamps_out_of_range():
+    gw = FakeGateway()
+    assert (await control.set_brightness(gw, 999))["brightness"] == 100
+    assert (await control.set_brightness(gw, -5))["brightness"] == 0
+    assert control.load_state()["brightness"] == 0
+
+
+@pytest.mark.asyncio
+async def test_set_brightness_device_failure_does_not_persist():
+    gw = FakeGateway(fail=True)
+    result = await control.set_brightness(gw, 20)
+    assert result == {"ok": False, "error": "device call failed"}
+    assert control.load_state()["brightness"] == control.DEFAULT_BRIGHTNESS
+
+
+@pytest.mark.asyncio
+async def test_apply_persisted_brightness_reapplies(monkeypatch):
+    monkeypatch.setattr(control, "_APPLY_VOLUME_DELAY_S", 0)
+    gw = FakeGateway()
+    control.save_state({"brightness": 33})
+    await control.apply_persisted_brightness(gw)
+    assert ("self.screen.set_brightness", {"brightness": 33}) in gw.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_apply_persisted_brightness_skips_when_disconnected(monkeypatch):
+    monkeypatch.setattr(control, "_APPLY_VOLUME_DELAY_S", 0)
+    gw = FakeGateway(connected=False)
+    await control.apply_persisted_brightness(gw)
+    assert gw.esp32.calls == []
+
+
+# ---- LED (3 slots: idle / listening / hermes) ------------------------
+
+
+def test_led_default_is_three_slots():
+    led = control.load_state()["led"]
+    assert led == {
+        "idle": {"on": False, "r": 30, "g": 144, "b": 255},
+        "listening": {"r": 0, "g": 210, "b": 90},
+        "hermes": {"r": 148, "g": 108, "b": 255},
+    }
+
+
+def test_led_backward_compat_flat_migrates_to_idle(monkeypatch, tmp_path):
+    path = tmp_path / "old.json"
+    monkeypatch.setenv("STACKCHAN_CONTROL_STATE", str(path))
+    # The pre-3-slot on-disk shape was a flat {on, r, g, b}.
+    path.write_text(
+        json.dumps({"led": {"on": True, "r": 1, "g": 2, "b": 3}}), encoding="utf-8"
+    )
+    led = control.load_state()["led"]
+    assert led["idle"] == {"on": True, "r": 1, "g": 2, "b": 3}
+    assert led["listening"] == control.DEFAULT_LED["listening"]
+    assert led["hermes"] == control.DEFAULT_LED["hermes"]
+
+
+@pytest.mark.asyncio
+async def test_set_led_idle_on_uses_set_all_and_persists():
+    gw = FakeGateway()
+    result = await control.set_led(gw, "idle", on=True, r=10, g=20, b=30)
+    assert result["ok"] is True
+    assert result["led"]["idle"] == {"on": True, "r": 10, "g": 20, "b": 30}
+    assert gw.esp32.calls == [("self.led.set_all", {"r": 10, "g": 20, "b": 30})]
+    assert control.load_state()["led"]["idle"] == {"on": True, "r": 10, "g": 20, "b": 30}
+
+
+@pytest.mark.asyncio
+async def test_set_led_idle_off_clears_but_keeps_colour():
+    gw = FakeGateway()
+    result = await control.set_led(gw, "idle", on=False, r=10, g=20, b=30)
+    assert result["led"]["idle"] == {"on": False, "r": 10, "g": 20, "b": 30}
+    assert gw.esp32.calls == [("self.led.clear", {})]
+
+
+@pytest.mark.asyncio
+async def test_set_led_idle_skips_device_when_voice_turn_active():
+    gw = FakeGateway()
+    gw.voice_turn_active = True  # a turn owns the LED right now
+    result = await control.set_led(gw, "idle", on=True, r=1, g=2, b=3)
+    assert result["ok"] is True
+    assert gw.esp32.calls == []  # persisted only; restore picks it up
+    assert control.load_state()["led"]["idle"]["on"] is True
+
+
+@pytest.mark.asyncio
+async def test_set_led_listening_persists_without_device_call():
+    gw = FakeGateway()
+    result = await control.set_led(gw, "listening", r=5, g=6, b=7)
+    assert result["led"]["listening"] == {"r": 5, "g": 6, "b": 7}
+    assert gw.esp32.calls == []  # shown during the phase / via preview
+    assert control.load_state()["led"]["listening"] == {"r": 5, "g": 6, "b": 7}
+
+
+@pytest.mark.asyncio
+async def test_set_led_rejects_unknown_slot():
+    gw = FakeGateway()
+    result = await control.set_led(gw, "nope", on=True, r=1, g=2, b=3)
+    assert result["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_set_led_clamps_rgb():
+    gw = FakeGateway()
+    result = await control.set_led(gw, "hermes", r=999, g=-5, b=256)
+    assert result["led"]["hermes"] == {"r": 255, "g": 0, "b": 255}
+
+
+@pytest.mark.asyncio
+async def test_set_led_idle_device_failure_does_not_persist():
+    gw = FakeGateway(fail=True)
+    result = await control.set_led(gw, "idle", on=True, r=10, g=20, b=30)
+    assert result == {"ok": False, "error": "device call failed"}
+    assert control.load_state()["led"] == control.DEFAULT_LED
+
+
+@pytest.mark.asyncio
+async def test_apply_led_state_idle_on_lights_colour():
+    gw = FakeGateway()
+    control.save_state({"led": {"idle": {"on": True, "r": 1, "g": 2, "b": 3}}})
+    await control.apply_led_state(gw, "idle")
+    assert gw.esp32.calls == [("self.led.set_all", {"r": 1, "g": 2, "b": 3})]
+
+
+@pytest.mark.asyncio
+async def test_apply_led_state_idle_off_clears():
+    gw = FakeGateway()
+    await control.apply_led_state(gw, "idle")  # default idle off
+    assert gw.esp32.calls == [("self.led.clear", {})]
+
+
+@pytest.mark.asyncio
+async def test_apply_led_state_listening_lights_colour():
+    gw = FakeGateway()
+    await control.apply_led_state(gw, "listening")
+    assert gw.esp32.calls == [("self.led.set_all", {"r": 0, "g": 210, "b": 90})]
+
+
+@pytest.mark.asyncio
+async def test_apply_led_state_swallows_exception(monkeypatch):
+    gw = FakeGateway()
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("device gone")
+
+    monkeypatch.setattr(gw.esp32, "call_tool", boom)
+    await control.apply_led_state(gw, "hermes")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_apply_persisted_led_reapplies_when_idle_on(monkeypatch):
+    monkeypatch.setattr(control, "_APPLY_VOLUME_DELAY_S", 0)
+    gw = FakeGateway()
+    control.save_state({"led": {"idle": {"on": True, "r": 1, "g": 2, "b": 3}}})
+    await control.apply_persisted_led(gw)
+    assert ("self.led.set_all", {"r": 1, "g": 2, "b": 3}) in gw.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_apply_persisted_led_noop_when_idle_off(monkeypatch):
+    monkeypatch.setattr(control, "_APPLY_VOLUME_DELAY_S", 0)
+    gw = FakeGateway()
+    await control.apply_persisted_led(gw)  # default idle off
+    assert gw.esp32.calls == []
+
+
+@pytest.mark.asyncio
+async def test_preview_led_flashes_then_reverts_to_idle(monkeypatch):
+    monkeypatch.setattr(control, "LED_PREVIEW_SECONDS", 0)
+    gw = FakeGateway()
+    result = await control.preview_led(gw, "listening")
+    assert result == {"ok": True, "slot": "listening"}
+    # listening colour shown, then idle (default off) -> clear.
+    assert gw.esp32.calls == [
+        ("self.led.set_all", {"r": 0, "g": 210, "b": 90}),
+        ("self.led.clear", {}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_preview_led_refused_during_voice_turn():
+    gw = FakeGateway()
+    gw.voice_turn_active = True
+    result = await control.preview_led(gw, "hermes")
+    assert result["ok"] is False
+    assert gw.esp32.calls == []
+
+
+@pytest.mark.asyncio
+async def test_preview_led_no_device():
+    gw = FakeGateway(connected=False)
+    result = await control.preview_led(gw, "hermes")
+    assert result["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_restore_idle_led_is_apply_idle():
+    gw = FakeGateway()
+    control.save_state({"led": {"idle": {"on": True, "r": 7, "g": 8, "b": 9}}})
+    await control.restore_idle_led(gw)
+    assert gw.esp32.calls == [("self.led.set_all", {"r": 7, "g": 8, "b": 9})]
 
 
 # ---- set_head_angle ---------------------------------------------------

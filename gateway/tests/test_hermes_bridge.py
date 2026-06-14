@@ -211,13 +211,28 @@ def _record_device_cosmetics(monkeypatch) -> dict[str, list]:
     async def fake_badge(gateway, text):
         rec["badge"].append(text)
 
-    async def fake_led(gateway, r, g, b):
-        rec["led"].append((r, g, b))
+    async def fake_led(gateway, slot):
+        rec["led"].append(slot)
 
     monkeypatch.setattr(control, "set_device_subtitle", fake_subtitle)
     monkeypatch.setattr(control, "set_device_route_badge", fake_badge)
-    monkeypatch.setattr(control, "set_device_led_indicator", fake_led)
+    # Phase 2: the voice turn drives the LED via apply_led_state(slot)
+    # (listening / hermes / idle) rather than the old raw indicator.
+    monkeypatch.setattr(control, "apply_led_state", fake_led)
     return rec
+
+
+def _force_route_hint(monkeypatch, route: str) -> None:
+    """Pin the pre-call LED route hint (decide_route) for a turn.
+
+    The bridge lights the "hermes" LED before running the brain when the
+    rule-based classifier says Hermes; pin it so the LED sequence is
+    deterministic regardless of the local-LLM env.
+    """
+    from stackchan_mcp import local_llm
+
+    monkeypatch.setattr(local_llm, "is_enabled", lambda: True)
+    monkeypatch.setattr(local_llm, "decide_route", lambda _t: route)
 
 
 def _record_status_text(monkeypatch) -> list[str]:
@@ -297,6 +312,7 @@ async def test_voice_turn_hermes_route_sets_badge_and_led(monkeypatch):
     monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
     _record_status_text(monkeypatch)
     rec = _record_device_cosmetics(monkeypatch)
+    _force_route_hint(monkeypatch, "hermes")
     _patch_voice_pipeline(
         monkeypatch, transcript="天気は", reply="晴れだよ", route="hermes"
     )
@@ -309,8 +325,8 @@ async def test_voice_turn_hermes_route_sets_badge_and_led(monkeypatch):
     assert rec["subtitle"] == ["晴れだよ", ""]
     # Badge: "H" set for Hermes, cleared in finally.
     assert rec["badge"] == ["H", ""]
-    # LED: blue during response, off in finally.
-    assert rec["led"] == [(0, 0, 32), (0, 0, 0)]
+    # LED: listening (STT) → hermes (pre-call thinking + post-call) → idle.
+    assert rec["led"] == ["listening", "hermes", "hermes", "idle"]
 
 
 @pytest.mark.asyncio
@@ -318,6 +334,7 @@ async def test_voice_turn_local_route_no_badge_no_led(monkeypatch):
     monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
     _record_status_text(monkeypatch)
     rec = _record_device_cosmetics(monkeypatch)
+    _force_route_hint(monkeypatch, "local")
     _patch_voice_pipeline(
         monkeypatch, transcript="やあ", reply="やあ", route="local"
     )
@@ -330,8 +347,8 @@ async def test_voice_turn_local_route_no_badge_no_led(monkeypatch):
     assert rec["subtitle"] == ["やあ", ""]
     # No badge "H" for local — only the finally clear ("").
     assert rec["badge"] == [""]
-    # No blue LED during response — only the finally off (0,0,0).
-    assert rec["led"] == [(0, 0, 0)]
+    # Local keeps the listening colour (no hermes); finally restores idle.
+    assert rec["led"] == ["listening", "idle"]
 
 
 @pytest.mark.asyncio
@@ -354,10 +371,11 @@ async def test_voice_turn_clears_cosmetics_when_tts_fails(monkeypatch):
     response = await hermes_bridge.handle_voice_turn(_make_voice_request(gateway))
 
     assert response.status == 502
-    # Cosmetics were set before TTS, then the finally clears all three.
+    # Cosmetics were set before TTS, then the finally restores all three
+    # (subtitle/badge cleared, LED back to the idle slot).
     assert rec["subtitle"][-1] == ""
     assert rec["badge"][-1] == ""
-    assert rec["led"][-1] == (0, 0, 0)
+    assert rec["led"][-1] == "idle"
 
 
 # ---- conversation log recording hook ---------------------------------

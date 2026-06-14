@@ -181,6 +181,11 @@ async def _build_control_status(gateway: Any) -> dict[str, Any]:
     volume: int | None = state["volume"] if connected else None
     muted = state["muted"]
     mic_gain = state["mic_gain"]
+    # Brightness is a live device value (mirrors volume: unknown when no
+    # device). The LED block is a saved preference, so it is always
+    # surfaced — the toggle shows what will be applied on (re)connect.
+    brightness: int | None = state["brightness"] if connected else None
+    led = state["led"]
 
     heartbeat = _heartbeat_status(gateway)
     proximity = await _proximity_status(gateway) if connected else None
@@ -191,6 +196,8 @@ async def _build_control_status(gateway: Any) -> dict[str, Any]:
         "volume": volume,
         "muted": muted,
         "mic_gain": mic_gain,
+        "brightness": brightness,
+        "led": led,
         "heartbeat": heartbeat,
         "proximity": proximity,
     }
@@ -296,6 +303,52 @@ def build_app(
             return _control_error("gain must be an integer 0..36", status=400)
         result = await control.set_mic_gain(gateway, gain)
         return _control_json({**result, "connected": connected})
+
+    async def control_brightness(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        brightness = body.get("brightness")
+        if (
+            not isinstance(brightness, int)
+            or isinstance(brightness, bool)
+            or not 0 <= brightness <= 100
+        ):
+            return _control_error(
+                "brightness must be an integer 0..100", status=400
+            )
+        return _control_json(await control.set_brightness(gateway, brightness))
+
+    async def control_led(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        slot = body.get("slot")
+        if slot not in control.LED_SLOTS:
+            return _control_error(
+                f"slot must be one of {list(control.LED_SLOTS)}", status=400
+            )
+        rgb = {}
+        for key in ("r", "g", "b"):
+            val = body.get(key, 0)
+            if not isinstance(val, int) or isinstance(val, bool) or not 0 <= val <= 255:
+                return _control_error(f"{key} must be an integer 0..255", status=400)
+            rgb[key] = val
+        on = body.get("on")
+        if slot == "idle" and not isinstance(on, bool):
+            return _control_error("on must be a boolean for the idle slot", status=400)
+        return _control_json(await control.set_led(gateway, slot, on=on, **rgb))
+
+    async def control_led_test(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        slot = body.get("slot")
+        if slot not in control.LED_SLOTS:
+            return _control_error(
+                f"slot must be one of {list(control.LED_SLOTS)}", status=400
+            )
+        return _control_json(await control.preview_led(gateway, slot))
 
     async def control_head(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
@@ -442,6 +495,9 @@ def build_app(
         Route("/control/conversation", endpoint=control_conversation, methods=["GET"]),
         Route("/control/volume", endpoint=control_volume, methods=["POST"]),
         Route("/control/mic_gain", endpoint=control_mic_gain, methods=["POST"]),
+        Route("/control/brightness", endpoint=control_brightness, methods=["POST"]),
+        Route("/control/led", endpoint=control_led, methods=["POST"]),
+        Route("/control/led_test", endpoint=control_led_test, methods=["POST"]),
         Route("/control/head", endpoint=control_head, methods=["POST"]),
         Route(
             "/control/neutral_pose",

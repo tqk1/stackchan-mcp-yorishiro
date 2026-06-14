@@ -267,14 +267,16 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
         # Phase F: always clear the on-device status text, subtitle,
         # route badge and indicator LED, and drop the in-flight flag,
         # no matter how the turn ended (success, early return, or
-        # exception). Clearing the LED here is what guarantees the
-        # gateway never leaves the indicator lit over the firmware's
-        # autonomous listening-phase LED.
+        # exception). Restoring the LED here (rather than a hard "off")
+        # is what guarantees the gateway never leaves the response
+        # indicator lit over the firmware's autonomous listening LED:
+        # restore_idle_led re-lights the user's chosen idle colour, or
+        # clears the LEDs when no idle colour is set (Phase 2).
         gateway.voice_turn_active = False
         await control.set_device_status_text(gateway, control.STATUS_CLEAR)
         await control.set_device_subtitle(gateway, "")
         await control.set_device_route_badge(gateway, "")
-        await control.set_device_led_indicator(gateway, 0, 0, 0)
+        await control.restore_idle_led(gateway)
 
 
 async def _run_voice_turn(
@@ -342,6 +344,9 @@ async def _run_voice_turn(
     # so "きいてるよ" reads naturally at the start of recognition; flip
     # to "考え中" the moment STT is done and the brain takes over.
     await control.set_device_status_text(gateway, control.STATUS_LISTENING)
+    # Phase 2 LED: show the "listening" colour through STT (self-
+    # contained; on_listen_started already set it for device listens).
+    await control.apply_led_state(gateway, "listening")
     stt_result: dict[str, Any] = await engine.transcribe(pcm, language="ja")
     transcript = stt_result.get("text", "").strip()
     t_stt = time.monotonic()
@@ -354,6 +359,15 @@ async def _run_voice_turn(
 
     logger.info("voice_turn: transcript=%r session=%s", transcript[:120], session_id)
     await control.set_device_status_text(gateway, control.STATUS_THINKING)
+    # Phase 2 LED: light the colour for whichever brain is about to run,
+    # so it reads as "Hermes is thinking" in real time (same rule-based
+    # classifier generate_reply uses). Local turns keep the listening
+    # colour through their fast "preparing" phase.
+    if (
+        not local_llm.is_enabled()
+        or local_llm.decide_route(transcript) == local_llm.ROUTE_HERMES
+    ):
+        await control.apply_led_state(gateway, "hermes")
     try:
         reply, route = await generate_reply(transcript)
     except Exception as exc:
@@ -366,15 +380,16 @@ async def _run_voice_turn(
 
     logger.info("voice_turn: reply=%r session=%s", reply[:120], session_id)
     # Phase F: show the reply as a subtitle while it plays, and — only
-    # for Hermes-routed turns — light the "H" badge + a blue indicator
-    # LED. Local-LLM turns stay badge/LED-free. The outer
-    # handle_voice_turn finally clears the subtitle, badge and LED on
-    # every exit path (incl. a TTS failure below), so the listening-
-    # phase green LED that the firmware owns is never left stomped.
+    # for Hermes-routed turns — light the "H" badge + the Hermes LED
+    # colour. Local-LLM turns stay badge-free and keep the listening
+    # colour. Re-asserting the Hermes colour here (idempotent with the
+    # pre-call set above) covers a local→Hermes fallback. The outer
+    # handle_voice_turn finally restores the idle LED on every exit
+    # path (incl. a TTS failure below).
     await control.set_device_subtitle(gateway, reply)
     if route == local_llm.ROUTE_HERMES:
         await control.set_device_route_badge(gateway, "H")
-        await control.set_device_led_indicator(gateway, 0, 0, 32)
+        await control.apply_led_state(gateway, "hermes")
     try:
         tts_result = await synthesize_and_send({"text": reply}, gateway=gateway)
     except Exception as exc:

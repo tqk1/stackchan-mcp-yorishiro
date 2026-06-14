@@ -56,6 +56,34 @@ DEFAULT_MIC_GAIN = 30
 #: range). The dashboard / REST layer clamps to ``0..MAX_MIC_GAIN``.
 MAX_MIC_GAIN = 36
 
+#: Default screen brightness (0..100). Matches the firmware's own NVS
+#: default so a fresh gateway and a fresh device agree. Unlike volume,
+#: the firmware *does* persist brightness to NVS (set_brightness saves),
+#: so the gateway copy is mainly for the dashboard to show a value and
+#: to re-assert the user's choice on reconnect.
+DEFAULT_BRIGHTNESS = 75
+
+#: Default LED state, one colour per phase ("slot"). r/g/b are each
+#: 0..255 (WS2812, 12 LEDs). Only ``idle`` has an on/off — it is off by
+#: default (the device is dark between conversations); ``listening`` and
+#: ``hermes`` are always shown during their phase:
+#:   - ``idle``      … not in a conversation (user colour, default off)
+#:   - ``listening`` … recording + local-LLM thinking/preparing
+#:   - ``hermes``    … Hermes agent is running
+DEFAULT_LED: dict[str, Any] = {
+    "idle": {"on": False, "r": 30, "g": 144, "b": 255},
+    "listening": {"r": 0, "g": 210, "b": 90},
+    "hermes": {"r": 148, "g": 108, "b": 255},
+}
+
+#: The configurable LED slots, in dashboard display order.
+LED_SLOTS = ("idle", "listening", "hermes")
+
+#: How long :func:`preview_led` lights a slot's colour before reverting
+#: to the idle state (so the dashboard can show a colour you would
+#: otherwise only see for ~1 s mid-conversation).
+LED_PREVIEW_SECONDS = 1.5
+
 #: Rolling, gateway-local record of recent conversation turns surfaced
 #: by GET /control/conversation. Volatile (cleared on restart) and kept
 #: out of the persisted control state, mirroring audio_stream's
@@ -76,6 +104,12 @@ STATUS_CLEAR = ""
 _STATUS_TEXT_TOOL = "self.display.set_status_text"
 _SET_VOLUME_TOOL = "self.audio_speaker.set_volume"
 _SET_MIC_GAIN_TOOL = "self.audio_speaker.set_mic_gain"
+#: Screen brightness (0..100) and base LED tools. ``set_all`` lights all
+#: 12 LEDs one colour and (unlike ``set_indicator``) does not re-arm the
+#: firmware's 60 s idle-settle timer; ``clear`` turns them all off.
+_SET_BRIGHTNESS_TOOL = "self.screen.set_brightness"
+_SET_ALL_LEDS_TOOL = "self.led.set_all"
+_CLEAR_LEDS_TOOL = "self.led.clear"
 #: Phase F dashboard joystick. ``set_head_angles`` is a live move (not
 #: persisted); ``set_neutral_pose`` writes the rest pose the head
 #: returns to and persists it to NVS on the firmware side. Both clamp
@@ -133,6 +167,55 @@ def _clamp_mic_gain(gain: Any) -> int:
     return min(max(value, 0), MAX_MIC_GAIN)
 
 
+def _clamp_brightness(value: Any) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_BRIGHTNESS
+    return min(max(v, 0), 100)
+
+
+def _clamp_rgb(value: Any) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return min(max(v, 0), 255)
+
+
+def _clamp_color(raw: Any, default: dict[str, Any]) -> dict[str, int]:
+    src = raw if isinstance(raw, dict) else {}
+    return {
+        "r": _clamp_rgb(src.get("r", default["r"])),
+        "g": _clamp_rgb(src.get("g", default["g"])),
+        "b": _clamp_rgb(src.get("b", default["b"])),
+    }
+
+
+def _normalize_led(raw: Any) -> dict[str, Any]:
+    """Coerce a stored/incoming LED blob to the 3-slot structure.
+
+    Each slot is a colour ``{r, g, b}``; ``idle`` also carries ``on``.
+    Backward-compatible with the old flat ``{on, r, g, b}`` shape (it
+    becomes the ``idle`` slot) and fills any missing slot from
+    :data:`DEFAULT_LED`.
+    """
+    src = raw if isinstance(raw, dict) else {}
+    # Old flat shape (pre-3-slot): migrate it to the idle slot.
+    if "idle" not in src and ("on" in src or "r" in src):
+        src = {"idle": src}
+    idle_src = src.get("idle") if isinstance(src.get("idle"), dict) else {}
+    idle = {
+        "on": bool(idle_src.get("on", DEFAULT_LED["idle"]["on"])),
+        **_clamp_color(idle_src, DEFAULT_LED["idle"]),
+    }
+    return {
+        "idle": idle,
+        "listening": _clamp_color(src.get("listening"), DEFAULT_LED["listening"]),
+        "hermes": _clamp_color(src.get("hermes"), DEFAULT_LED["hermes"]),
+    }
+
+
 def _clamp_head_yaw(yaw: Any) -> int:
     try:
         value = int(yaw)
@@ -153,7 +236,8 @@ def load_state() -> dict[str, Any]:
     """Read the persisted control state, with defaults filled in.
 
     Returns a dict with ``volume`` (int 0..100), ``muted`` (bool),
-    ``pre_mute_volume`` (int 0..100) and ``mic_gain`` (int 0..36). A
+    ``pre_mute_volume`` (int 0..100), ``mic_gain`` (int 0..36),
+    ``brightness`` (int 0..100) and ``led`` (``{on, r, g, b}``). A
     missing or unreadable file yields the defaults rather than raising —
     the dashboard must come up even on a fresh host.
     """
@@ -171,11 +255,15 @@ def load_state() -> dict[str, Any]:
     pre_mute = _clamp_volume(raw.get("pre_mute_volume", volume))
     muted = bool(raw.get("muted", False))
     mic_gain = _clamp_mic_gain(raw.get("mic_gain", DEFAULT_MIC_GAIN))
+    brightness = _clamp_brightness(raw.get("brightness", DEFAULT_BRIGHTNESS))
+    led = _normalize_led(raw.get("led", DEFAULT_LED))
     return {
         "volume": volume,
         "muted": muted,
         "pre_mute_volume": pre_mute,
         "mic_gain": mic_gain,
+        "brightness": brightness,
+        "led": led,
     }
 
 
@@ -189,6 +277,8 @@ def save_state(state: dict[str, Any]) -> None:
             state.get("pre_mute_volume", state.get("volume", DEFAULT_VOLUME))
         ),
         "mic_gain": _clamp_mic_gain(state.get("mic_gain", DEFAULT_MIC_GAIN)),
+        "brightness": _clamp_brightness(state.get("brightness", DEFAULT_BRIGHTNESS)),
+        "led": _normalize_led(state.get("led", DEFAULT_LED)),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,6 +428,215 @@ async def apply_persisted_mic_gain(gateway: "Gateway") -> None:
         if attempt < _APPLY_VOLUME_RETRIES:
             await asyncio.sleep(_APPLY_VOLUME_DELAY_S)
     logger.warning("control: mic_gain re-apply gave up after retries")
+
+
+async def _send_brightness(gateway: "Gateway", value: int) -> bool:
+    """Push a screen brightness to the device. True on success."""
+    _result, error = await gateway.esp32.call_tool(
+        _SET_BRIGHTNESS_TOOL, {"brightness": value}
+    )
+    if error:
+        logger.warning("control: set_brightness failed: %s", error)
+        return False
+    return True
+
+
+async def set_brightness(gateway: "Gateway", value: Any) -> dict[str, Any]:
+    """Set the screen brightness (0..100) and persist it.
+
+    The firmware also saves brightness to its own NVS, so this gateway
+    copy is for the dashboard to display and to re-assert on reconnect.
+    Returns ``{"ok": True, "brightness": int}`` on success or
+    ``{"ok": False, "error": ...}`` when the device call fails.
+    """
+    target = _clamp_brightness(value)
+    state = load_state()
+    if not await _send_brightness(gateway, target):
+        return {"ok": False, "error": "device call failed"}
+    state["brightness"] = target
+    save_state(state)
+    return {"ok": True, "brightness": target}
+
+
+async def apply_persisted_brightness(gateway: "Gateway") -> None:
+    """Re-assert the saved brightness after a device (re)connects.
+
+    Harmless even though the firmware restores its own NVS value on
+    boot: the two are kept in sync (every set_brightness saves NVS), so
+    this just confirms the user's choice. Mirrors
+    :func:`apply_persisted_volume`; errors degrade to WARN.
+    """
+    state = load_state()
+    target = state["brightness"]
+    await asyncio.sleep(_APPLY_VOLUME_DELAY_S)
+    for attempt in range(_APPLY_VOLUME_RETRIES + 1):
+        if not gateway.esp32.device_connected:
+            logger.info("control: device gone before brightness re-apply")
+            return
+        try:
+            if await _send_brightness(gateway, target):
+                logger.info("control: re-applied brightness=%d", target)
+                return
+        except Exception:
+            logger.exception("control: brightness re-apply raised")
+        if attempt < _APPLY_VOLUME_RETRIES:
+            await asyncio.sleep(_APPLY_VOLUME_DELAY_S)
+    logger.warning("control: brightness re-apply gave up after retries")
+
+
+async def _send_led_color(gateway: "Gateway", r: int, g: int, b: int) -> bool:
+    """Light all 12 LEDs one colour. True on success.
+
+    Uses ``set_all`` (not ``set_indicator``) so it does not re-arm the
+    firmware's idle-settle auto-reset timer — that is what lets a colour
+    persist instead of self-clearing ~60 s later.
+    """
+    _result, error = await gateway.esp32.call_tool(
+        _SET_ALL_LEDS_TOOL, {"r": r, "g": g, "b": b}
+    )
+    if error:
+        logger.warning("control: led set_all failed: %s", error)
+        return False
+    return True
+
+
+async def _send_led_clear(gateway: "Gateway") -> bool:
+    """Turn all LEDs off. True on success."""
+    _result, error = await gateway.esp32.call_tool(_CLEAR_LEDS_TOOL, {})
+    if error:
+        logger.warning("control: led clear failed: %s", error)
+        return False
+    return True
+
+
+def _led_slot(slot: Any) -> str | None:
+    """Validate a slot name, or None if it is not one of LED_SLOTS."""
+    return slot if slot in LED_SLOTS else None
+
+
+async def apply_led_state(gateway: "Gateway", slot: str) -> None:
+    """Light the LEDs for one phase ``slot`` (best-effort, never raises).
+
+    ``idle`` respects its on/off (off → clear); ``listening`` and
+    ``hermes`` always show their colour. Used by the voice-turn
+    orchestration and the on-connect / post-turn restore, so it must not
+    raise — see :func:`_best_effort_device_call`.
+    """
+    led = load_state()["led"]
+    cfg = led.get(slot, {})
+    if slot == "idle" and not cfg.get("on", False):
+        await _best_effort_device_call(gateway, _CLEAR_LEDS_TOOL, {}, "led:idle-off")
+        return
+    await _best_effort_device_call(
+        gateway,
+        _SET_ALL_LEDS_TOOL,
+        {"r": cfg.get("r", 0), "g": cfg.get("g", 0), "b": cfg.get("b", 0)},
+        f"led:{slot}",
+    )
+
+
+async def set_led(
+    gateway: "Gateway",
+    slot: Any,
+    *,
+    on: Any = None,
+    r: Any = 0,
+    g: Any = 0,
+    b: Any = 0,
+) -> dict[str, Any]:
+    """Persist one LED slot's colour (and, for ``idle``, on/off).
+
+    ``idle`` is applied to the device immediately (unless a voice turn
+    is in flight, where the turn owns the LED and the post-turn restore
+    will pick up the new idle). ``listening`` / ``hermes`` are
+    persisted only — they show during their phase or via
+    :func:`preview_led`. Returns ``{"ok": True, "led": {...}}`` or
+    ``{"ok": False, "error": ...}`` on a device-call failure.
+    """
+    name = _led_slot(slot)
+    if name is None:
+        return {"ok": False, "error": f"slot must be one of {list(LED_SLOTS)}"}
+    state = load_state()
+    led = state["led"]
+    colour = {"r": _clamp_rgb(r), "g": _clamp_rgb(g), "b": _clamp_rgb(b)}
+    if name == "idle":
+        idle_on = bool(on) if on is not None else led["idle"]["on"]
+        led["idle"] = {"on": idle_on, **colour}
+        # Apply live unless a turn owns the LED right now.
+        if not getattr(gateway, "voice_turn_active", False):
+            ok = (
+                await _send_led_color(gateway, **colour)
+                if idle_on
+                else await _send_led_clear(gateway)
+            )
+            if not ok:
+                return {"ok": False, "error": "device call failed"}
+    else:
+        led[name] = colour
+    state["led"] = led
+    save_state(state)
+    return {"ok": True, "led": led}
+
+
+async def preview_led(gateway: "Gateway", slot: Any) -> dict[str, Any]:
+    """Flash a slot's colour for ~1.5 s, then revert to the idle state.
+
+    Lets the dashboard show the listening / hermes colours, which would
+    otherwise only appear for ~1 s mid-conversation. Refused while a
+    voice turn owns the LED. Returns ``{"ok": True, "slot": ...}`` or an
+    error dict.
+    """
+    name = _led_slot(slot)
+    if name is None:
+        return {"ok": False, "error": f"slot must be one of {list(LED_SLOTS)}"}
+    if not gateway.esp32.device_connected:
+        return {"ok": False, "error": "no device connected"}
+    if getattr(gateway, "voice_turn_active", False):
+        return {"ok": False, "error": "busy (voice turn active)"}
+    await apply_led_state(gateway, name)
+    await asyncio.sleep(LED_PREVIEW_SECONDS)
+    await apply_led_state(gateway, "idle")
+    return {"ok": True, "slot": name}
+
+
+async def apply_persisted_led(gateway: "Gateway") -> None:
+    """Re-apply the saved idle LED colour after a device (re)connects.
+
+    The firmware boots with LEDs off, so only an "on" idle state needs
+    re-asserting. Mirrors :func:`apply_persisted_volume`; errors degrade
+    to WARN.
+    """
+    idle = load_state()["led"]["idle"]
+    if not idle["on"]:
+        return
+    await asyncio.sleep(_APPLY_VOLUME_DELAY_S)
+    for attempt in range(_APPLY_VOLUME_RETRIES + 1):
+        if not gateway.esp32.device_connected:
+            logger.info("control: device gone before LED re-apply")
+            return
+        try:
+            if await _send_led_color(gateway, idle["r"], idle["g"], idle["b"]):
+                logger.info(
+                    "control: re-applied idle LED rgb=(%d,%d,%d)",
+                    idle["r"], idle["g"], idle["b"],
+                )
+                return
+        except Exception:
+            logger.exception("control: LED re-apply raised")
+        if attempt < _APPLY_VOLUME_RETRIES:
+            await asyncio.sleep(_APPLY_VOLUME_DELAY_S)
+    logger.warning("control: LED re-apply gave up after retries")
+
+
+async def restore_idle_led(gateway: "Gateway") -> None:
+    """Restore the idle LED after a voice turn (best-effort).
+
+    Called from the hermes bridge's ``finally`` instead of a hard
+    "LEDs off": re-lights the user's idle colour, or clears when idle is
+    off. Never raises — a cosmetic restore must not break the turn
+    teardown. Thin alias over :func:`apply_led_state` for the idle slot.
+    """
+    await apply_led_state(gateway, "idle")
 
 
 async def set_head_angle(

@@ -70,6 +70,8 @@ class Gateway:
 
         await control.apply_persisted_volume(self)
         await control.apply_persisted_mic_gain(self)
+        await control.apply_persisted_brightness(self)
+        await control.apply_persisted_led(self)
 
     async def _on_listen_started(self) -> None:
         """Device-driven listen began — flash the listening status now.
@@ -78,10 +80,16 @@ class Gateway:
         so "きいてるよ" appears with the tap instead of one beat late.
         The hermes bridge re-sends the same status when the capture
         arrives; the double send is harmless (idempotent display update).
+
+        Also lights the "listening" LED colour now (overriding the
+        firmware's autonomous green) so the user-configured colour shows
+        from the moment recording starts; the post-turn restore returns
+        it to the idle state.
         """
         from . import control
 
         await control.set_device_status_text(self, control.STATUS_LISTENING)
+        await control.apply_led_state(self, "listening")
 
     @property
     def vision_url(self) -> str:

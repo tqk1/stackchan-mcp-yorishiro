@@ -709,6 +709,10 @@ async def test_control_status_connected_reports_full_payload() -> None:
     assert body["volume"] == 50  # default
     assert body["muted"] is False
     assert body["mic_gain"] == 30  # default
+    assert body["brightness"] == 75  # default (matches firmware NVS default)
+    assert body["led"]["idle"] == {"on": False, "r": 30, "g": 144, "b": 255}  # default
+    assert body["led"]["listening"] == {"r": 0, "g": 210, "b": 90}
+    assert body["led"]["hermes"] == {"r": 148, "g": 108, "b": 255}
     assert body["heartbeat"] == {"gestures": True, "speak": True, "interval_min": 30.0}
     assert body["proximity"] == {"enabled": True, "threshold": 600}
 
@@ -722,6 +726,8 @@ async def test_control_status_disconnected_nulls_device_fields() -> None:
     body = resp.json()
     assert body["esp32_connected"] is False
     assert body["volume"] is None
+    assert body["brightness"] is None  # live value unknown when no device
+    assert body["led"]["idle"]["on"] is False  # saved preference still surfaced
     assert body["heartbeat"] is None
     assert body["proximity"] is None
 
@@ -754,6 +760,136 @@ async def test_control_volume_503_when_disconnected() -> None:
     async with _client(app) as client:
         resp = await client.post("/control/volume", json={"volume": 70})
     assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_control_brightness_sets_and_persists() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/brightness", json={"brightness": 40})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "brightness": 40}
+    assert ("self.screen.set_brightness", {"brightness": 40}) in gateway.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_control_brightness_rejects_out_of_range() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/brightness", json={"brightness": 200})
+    assert resp.status_code == 400
+    assert resp.json()["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_control_brightness_503_when_disconnected() -> None:
+    gateway = ControlFakeGateway(connected=False)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/brightness", json={"brightness": 40})
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_control_led_idle_on_sets_all() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/led", json={"slot": "idle", "on": True, "r": 10, "g": 20, "b": 30}
+        )
+    assert resp.status_code == 200
+    assert resp.json()["led"]["idle"] == {"on": True, "r": 10, "g": 20, "b": 30}
+    assert ("self.led.set_all", {"r": 10, "g": 20, "b": 30}) in gateway.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_control_led_idle_off_clears() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/led", json={"slot": "idle", "on": False})
+    assert resp.status_code == 200
+    assert ("self.led.clear", {}) in gateway.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_control_led_listening_persists_without_device_call() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/led", json={"slot": "listening", "r": 5, "g": 6, "b": 7}
+        )
+    assert resp.status_code == 200
+    assert resp.json()["led"]["listening"] == {"r": 5, "g": 6, "b": 7}
+    assert gateway.esp32.calls == []  # listening is persisted only
+
+
+@pytest.mark.asyncio
+async def test_control_led_rejects_unknown_slot() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/led", json={"slot": "nope", "r": 1})
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_control_led_rejects_bad_rgb() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/led", json={"slot": "idle", "on": True, "r": 300, "g": 0, "b": 0}
+        )
+    assert resp.status_code == 400
+    assert resp.json()["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_control_led_idle_requires_boolean_on() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/led", json={"slot": "idle", "on": "yes"})
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_control_led_503_when_disconnected() -> None:
+    gateway = ControlFakeGateway(connected=False)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/led", json={"slot": "idle", "on": True})
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_control_led_test_previews_slot(monkeypatch) -> None:
+    from stackchan_mcp import control
+
+    monkeypatch.setattr(control, "LED_PREVIEW_SECONDS", 0)
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/led_test", json={"slot": "hermes"})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "slot": "hermes"}
+    # hermes colour shown, then revert to idle (default off -> clear).
+    assert ("self.led.set_all", {"r": 148, "g": 108, "b": 255}) in gateway.esp32.calls
+    assert ("self.led.clear", {}) in gateway.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_control_led_test_rejects_unknown_slot() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/led_test", json={"slot": "nope"})
+    assert resp.status_code == 400
 
 
 @pytest.mark.asyncio

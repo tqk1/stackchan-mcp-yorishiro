@@ -10,7 +10,31 @@
 
 ## 現役タスク（まだやるべき生きた未完了項目）
 
-### 0. 【次回最優先】review-cleanup の実機 flash + USB-reset ブロック調査
+### ★ 進行中: ダッシュボード機能拡張プロジェクト（全5フェーズ・/clear 境界で分割）
+
+前回コンテキスト逼迫の反省から、機能追加を5フェーズに分割し各完了で `/clear` して進める。
+計画全文: `~/.claude/plans/clear-100-200-floofy-shell.md`
+
+- [x] **フェーズ1: dashboard セクション骨組み整備＋デザインの型確立** — 7カテゴリカードに再編し、コンパクト＆洗練＋スタックちゃんぽさへ刷新（音量＋ミュート1行統合・大きい現在値・顔アバターで接続表示）。型 `.row`/`.row-val`/`.slider`/`.icon-btn`/`.sc-ava` を後続フェーズも踏襲。**ユーザー承認済（2026-06-14）**。worklog: `docs/worklog/2026-06-14-phase1-dashboard-sections.md`。
+- [~] **フェーズ2: 画面明るさ + LED 制御UI（着手中 2026-06-14）** — gateway(`control.py`/`http_server.py`)に HTTP制御追加 + dashboard ⑤デバイス調整カードに UI。firmware は既存MCPツール流用で **flash 不要**。LED UI は「カラーピッカー+オン/オフ」で確定（ユーザー選択）。
+  - 調査確定: 明るさ=firmware `self.screen.set_brightness`(0-100, **NVS自動永続**・既定75) / LED=`self.led.set_all`(全12同色 r/g/b 0-255)・`self.led.clear`(消灯)。voice turn 中は `set_indicator`(青)優先→終了 finally で idle 色へ復元する方針。
+  - [x] (a) `control.py`: `set_brightness`/`apply_persisted_brightness` + `set_led`/`apply_persisted_led`/`restore_idle_led`。`control_state.json` に `brightness`・`led` 追加（音量と同パターン）。
+  - [x] (b) `http_server.py`: `POST /control/brightness`・`POST /control/led` 追加 + `/control/status` に `brightness`(未接続時None)・`led` 同梱（status_api は汎用プロキシなので無改修）。
+  - [x] (c) `gateway.py` `_on_device_ready`: 接続時に明るさ・LED を復元（`apply_persisted_brightness`/`apply_persisted_led` 追加）。
+  - [x] (d) `hermes_bridge.py:277`: voice turn finally の強制消灯 → `restore_idle_led`（ユーザー設定色へ復元、off なら従来通り消灯）。
+  - [x] (e) `dashboard.html` ⑤カード: 明るさスライダー（既存型）+ LED カラーピッカー+オン/オフトグル + JS（`.color-swatch` 追加）。
+  - [x] (f) テスト: `test_control.py`(+14)・`test_http_server.py`(+8) に brightness/LED ケース追加。既存 load_state 完全一致テスト2件も新フィールド追従。
+  - [x] (g機械検証) `pytest` / `ruff clean` / dashboard JS構文・ID・タグ OK。worklog 作成済。
+  - [x] (実機E2E①初版) 明るさ/LED(単色) 実機目視 OK（ユーザー確認済 2026-06-14）。
+  - [x] (h) **LED を3状態に拡張**（ユーザー提案）: idle(通常・オン/オフ+色) / listening(聞き取り・準備中) / hermes(Hermes動作中) を各色設定可 + 「試」点灯ボタン。voice turn で `apply_led_state(slot)` でフェーズ点灯。ハードコード青を撤去し全色 `set_all` 化 → **60秒 idle-settle 問題が解消する見込み**。`control_state.json led` をネスト化(+旧形式マイグレーション)。`pytest 792 passed`/`ruff clean`/dashboard機械検証OK。
+  - [ ] (h実機検証) **gateway 再起動 → 3スロット色・試ボタン・会話時のフェーズ遷移・60秒問題解消 を実機確認**（ユーザー）。
+- [ ] **フェーズ3: 音量200 + 近接listen** — firmware変更まとめて **flash 1回**。音量はまず実機で codec(AW88298) レンジ計測。近接は首振り廃止→tap同等 listen、mode(reflex/listen/off) 切替。
+- [ ] **フェーズ4: サーバタブに Codex利用率 + Gemini API利用額** — dashboard。まず取得手段を調査（無ければ相談）。
+- [ ] **フェーズ5: dashboard 人間工学的仕上げ** — 全項目出揃い後に整理。完了後 **learning-report 1本**作成。
+
+確定方針: ウェイクワード「ハイ スタックちゃん」は今回スコープ外（microWakeWord は後日）。音量はデジタル増幅しない（安全側）。近接listen は手かざし(~10-15cm)=明示トリガー扱い。
+
+### 0. review-cleanup の実機 flash + USB-reset ブロック調査（※ CLAUDE.md 最終更新では flash+E2E 完了済み・要整合確認）
 
 2026-06-14 全体レビューで修正した heartbeat 会話割り込みバグ等（ブランチ `feature/review-cleanup`、3コミット済み・gateway pytest 756 passed・firmware ビルド成功）を **まだ実機に焼けていない**。
 
