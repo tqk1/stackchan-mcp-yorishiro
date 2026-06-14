@@ -28,7 +28,7 @@
   - [x] (実機E2E①初版) 明るさ/LED(単色) 実機目視 OK（ユーザー確認済 2026-06-14）。
   - [x] (h) **LED を3状態に拡張**（ユーザー提案）: idle(通常・オン/オフ+色) / listening(聞き取り・準備中) / hermes(Hermes動作中) を各色設定可 + 「試」点灯ボタン。voice turn で `apply_led_state(slot)` でフェーズ点灯。ハードコード青を撤去し全色 `set_all` 化 → **60秒 idle-settle 問題が解消する見込み**。`control_state.json led` をネスト化(+旧形式マイグレーション)。`pytest 792 passed`/`ruff clean`/dashboard機械検証OK。
   - [ ] (h実機検証) **gateway 再起動 → 3スロット色・試ボタン・会話時のフェーズ遷移・60秒問題解消 を実機確認**（ユーザー）。
-- [~] **フェーズ3（改訂）: 近接listen mode 切替** — firmware変更・**flash 1回**。計画: `~/.claude/plans/drifting-finding-wind.md`
+- [x] **フェーズ3完了: 近接listen mode + トグル + LED明るさ/横並び** — flash 1回・コミット+push `bf161b3`。計画: `~/.claude/plans/drifting-finding-wind.md`、worklog: `docs/worklog/2026-06-14-phase3-proximity-led.md`
   - **音量200は除外（ユーザー確定）**: ソース確定で `vol>=100` は 0dB クリップ＝100が物理最大、200は無意味（`esp_codec_dev.c` デフォルトカーブ `_get_vol_db` L99-101）。スライダー上限100据置。PA アナログゲインは歪みリスクで見送り。
   - 近接反応を mode 3択化（reflex/listen/**off**）、デフォルト listen、`enabled` 廃止し mode 一本化、NVS永続+旧enabled migration。
   - **追加要望（2026-06-14、セッション中にユーザーから）**:
@@ -39,10 +39,10 @@
   - [x] (B) gateway: stdio_server / http_server(control_proximity/_proximity_status) + **LED明るさ**（control.py `_scale_rgb`/`set_led_brightness`/2送信経路スケール、http `/control/led_brightness`）
   - [x] (C) gateway テスト: 近接mode + LED明るさ（計 798 passed）
   - [x] gateway pytest **798 passed** + ruff clean
-  - [ ] firmware Docker build（再ビルド中＝トグル反映）
+  - [x] firmware Docker build（warning0・v2.2.6_stackchan.zip）
   - [x] (D) dashboard: 近接 select 3択 + **LED 3列横並び**（led-cols）+ **LED明るさスライダー**（sc-led-bright）
-  - [ ] 実機 flash + E2E（migration/reflex/listen**トグル**/off/NVS保持/cooldown/LED明るさ/LED横並び/回帰）
-  - [ ] worklog + commit/push
+  - [x] 実機 flash + E2E（migration `mode=listen`/threshold824保持・トグル・reflex・off・LED明るさ・横並び・回帰）ユーザー「いい感じ」✅
+  - [x] worklog + commit/push（bf161b3）
 - [ ] **フェーズ4: サーバタブに Codex利用率 + Gemini API利用額** — dashboard。まず取得手段を調査（無ければ相談）。
 - [ ] **フェーズ5: dashboard 人間工学的仕上げ** — 全項目出揃い後に整理。完了後 **learning-report 1本**作成。
 
