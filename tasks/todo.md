@@ -1,3 +1,105 @@
+# 2026-06-14 セッション2 — ②ウェイクワード不発の決定的診断（計画承認済み）
+
+計画: `~/.claude/plans/shimmying-yawning-ripple.md`。ゴール=②の根本原因を**確定**する。
+
+## 今セッションのコード追跡結論（idle で WW を殺す経路は無い）
+- `EnableWakeWordDetection` 呼出元3つ（状態機械 / power_save_timer / sleep_timer）。stackchan は power_save_timer のみ使用、`PowerSaveTimer(-1,60,-1)`（cpu_max_freq=-1）で減光時 WW 無効化ブロック（power_save_timer.cc:78-98）を丸ごとスキップ。OnEnterSleepMode は画面減光のみ。→ **WW に無実**
+- 状態機械は idle で `EnableWakeWordDetection(true)`（application.cc:952）。`AudioInputTask` が `ReadAudioData`→`Feed` 連続呼出、input 無効なら自動再有効化（audio_service.cc:185-189）。15s 電源タイムアウトは last_input_time_ 毎更新で WW 稼働中は発火しない。→ **構造上 idle で WW 経路は生きている**
+- 残る唯一の未測定点＝「Feed に渡る音が実信号かゼロか」。既存 [DIAG] prob は TIMEOUT 時 get_results 空で原理的に不能。
+
+## チェックリスト
+- [x] S2-1: `custom_wake_word.cc` Feed に RMS 計装追加（detect 直前 chunk の peakRMS + input_enabled + running + detecting/timeout）。純追加ログ
+- [x] S2-2: 診断ビルド成功（exit0、xiaozhi.bin 3,599,728B、generated_assets.bin 3,983,046B=不変）
+- [x] S2-3: app-only flash（0x20000、Hash verified）+ シリアルキャプチャ（scratch/ww_serial_capture.py → ww_serial.log）
+- [x] **S2-4: 原因確定 = (A) MultiNet ピンイン認識限界**。直接測定結果:
+  - 静音 peakRMS ~12 / **input_enabled=1・detecting=31chunks/秒**（音声経路は完全健全、取りこぼし0）→ (C)入力ゼロは**否定**
+  - gain12dB 時の発話 peakRMS ~110（-49dBFS・弱すぎ）→ **mic_gain=12 は下げすぎ**と判明（STT精度にも悪影響のはず）
+  - `set_mic_gain 30` に実行時変更（再ビルド不要）→ 発話 peakRMS **608〜1164**（-29dBFS・健全）
+  - **健全レベルでも 12候補・閾値0.1 で検知ゼロ・prob全て0.000** → 「スタックちゃん」を中国語ピンインで MultiNet に載せる方式そのものの限界が確定
+- [x] **S2-5: 方針決定（ユーザー 2026-06-14）= ②はタップ/背面なで運用でクローズ**（両方正常動作・設計原則①と整合）。診断ログは custom_wake_word.cc を HEAD に revert して除去済み。将来は microWakeWord（TFLite・日本語学習可）が候補（別フェーズ）
+- [x] S2-6a: ①③④ ユーザー1次検証 — ①まだワンテンポ遅い / ③改善も中立が上向きすぎ→角度下げ要望 / ④未検証
+- 付記: mic_gain は現在 NVS=30（STT にも有効）。ダッシュボードのマイク感度スライダーで実行時調整可
+
+## S3: ①③④ フォロー + 首角度ダッシュボード調整機能（ユーザー提案、2026-06-14）
+ユーザー提案: 首の中立角度をダッシュボードのジョイスティックで実行時調整・保存（再ビルド不要に）。set_proximity_config と同じ NVS 流儀。UI=ジョイスティックパッド採用。
+- [x] S3-1: firmware（agent a05059）— 中立姿勢を NVS 永続化（namespace `stackchan_pose`、既定 yaw0/pitch38）。新ツール `self.robot.set_neutral_pose{yaw,pitch}`（clamp+NVS+即move）。boot/③TouchRevert/④idle settle の3経路を neutral_yaw_/pitch_ に差し替え（seed==target 不変条件維持）。get_head_angles に neutral 追加。**diff 精査OK**（ScheduleIdleSettle/Settings API/WriteHeadAngles 2引数 すべて存在確認）
+- [x] S3-2: gateway（agent a5b34d）— `POST /control/head`（ライブ=set_head_angles）+ `POST /control/neutral_pose`（保存=set_neutral_pose）+ stdio tool_map/宣言。**① 即時化**: esp32_client に on_listen_started フック→録音開始(state==start)の最速点で「きいてるよ」送出（hermes_bridge:344 の遅延送出が根因、既存は冪等で残置）。**749 passed(+18)・ruff OK**
+- [x] S3-3: dashboard（agent a6b314）— `~/razer-dashboard/dashboard.html`（git管理外・別repo）に「🕹 首の角度調整」ジョイスティックパッド。x→yaw/y→pitch、120ms throttle で /control/head ライブ、「デフォルトに保存」→/control/neutral_pose。status_api は汎用転送で改変不要。node/py チェックOK。bak-20260614
+- [x] S3-4: 最終 firmware ビルド成功（exit0、xiaozhi.bin 3,601,616B、assets 不変）。③38化+中立NVS化+診断ログ除去込み
+- [x] S3-5: カットオーバー: app-only flash（Hash verified）→ 再接続・mic_gain30 再適用確認 → ユーザーが gateway 再起動・ダッシュボード再読込
+- [x] S3-6: ユーザー検証「全ていい感じ」— ①即時化 / ジョイスティックでライブ+保存+③④が保存値に復帰 / ④60秒アイドル すべてOK
+- [~] S3-7: コミット（firmware+gateway = 本repo。dashboard = ~/razer-dashboard は**非git**＝ファイル編集が即デプロイ・コミット不要）+ worklog/CLAUDE.md/memory 確定（実施中）
+- 既知の軽微点: ジョイスティック初期ドット位置が pitch45（firmware既定38）。/control/status に neutral 未露出のため。動作には無影響（保存は正しい）。気になれば後で status に neutral 追加
+- 積み残し: **docs/phase-f-report.md（Phase F 全体の learning-report）未作成**
+
+---
+
+# ★次セッション最優先（2026-06-14 context clear 前メモ）
+
+## いまの状態（clear 後はここから）
+- **ブランチ feature/phase-f-dashboard。firmware 変更は未コミット（working tree on disk・git status で見える）**: `stackchan.cc`(①③④修正) と `custom_wake_word.cc`([DIAG]ログ)。意図的に未コミット（②調査中＋①③④ユーザー検証前）。
+- **flash 済み firmware = この未コミット版**（app-only 0x20000、3,599,312B、Hash verified）。assets 不変。gateway/status-api は最新コミット反映済みで再起動済み。device WS接続・36ツール。
+- 退避バイナリ: /tmp/xiaozhi.bin.flashed-0720（旧）。診断ログ: /tmp/boot_serial2.log（コマンド登録確認）、/tmp/greet_serial2.log。
+
+## やること（優先順）
+1. **① ③ ④ のユーザー実機検証**（flash 済み・未確認）:
+   - ① タップ→その場で「きいてるよ」/「考え中」が即出るか（1ターン遅延解消。`lv_refr_now` 修正）
+   - ③ 近接で上向き→**約3秒で正面復帰**するか（TouchRevertCb に WriteHeadAngles(0,45) 追加）
+   - ④ 60秒放置→首正面・表情idle・LED消灯に自動復帰するか（idle_settle_timer_ 新設）
+2. **② ウェイクワード不発の最終確定**（最有力＝アイドル時にマイク音声が WW 検出器に届いていない／ユーザー仮説）:
+   - 到達点: インフラ正常確定（mn7_cn・12ピンイン登録・閾値0.10、OOVシロ）。実発話でも検知ゼロ・[DIAG] prob=0.000。ただし prob=0.000 は「TIMEOUT時 get_results が空」=入力ゼロとは限らない（診断の限界）。
+   - 候補機構（investigator a95b07ed、未確定）: コーデック入力電源管理 `audio_service.cc:686`(AUDIO_POWER_TIMEOUT_MS=15000) が input 閉じる→`cores3_audio_codec.cc:263-267` `Read` は input_enabled_=false で dest 未書込=ゼロ。**論点**: アイドルでWW稼働中は ReadAudioData 連続呼び出しのはずで15sタイムアウトは発火しないはず→機構の発火条件が未確定。
+   - **次の一手（最優先・確定用）**: 次ビルドで「`wake_word_->Feed` に渡る data の RMS/エネルギー」+「codec `input_enabled_` 状態」を ESP_LOGI → アイドル時に MultiNet が実音声を受けているか/ゼロかを**直接**確認。
+   - 修正方向候補: `audio_service.cc:686` の無効化条件に `&& !IsWakeWordRunning()`(:119既存) を追加し、WW稼働中はマイク常時有効。warm-upフレーム破棄も検討。**確定してから直す**（場当たり禁止）。
+   - 方針判断（ユーザー未決）: 直すか / タップ・背面なで運用で②を区切るか。タップ/なでは正常動作。
+3. ①③④ をユーザー検証 OK なら**コミット**（[DIAG]ログは②継続のため残すか判断）→ worklog/phase-f-report.md（未作成）/CLAUDE.md/memory 確定。
+4. 記録の積み残し: **docs/phase-f-report.md は未作成**（bb31fa8 のメッセージは「新規」と書くが実体なし）。F/F-2/F-3 全体の learning-report。
+
+---
+
+# 2026-06-14 セッション再開 — Phase F 実機 flash + E2E + 記録確定
+
+前セッションが中断。状態を突き合わせて整理した結果（working tree クリーン・全コードコミット済み `bb31fa8`）:
+
+## 実態の補正（todo マーカーが実態より古かった）
+- **F / F-2 / F-3 の firmware・gateway コードは全てコミット済み**（`bb31fa8` がコード+worklog をまとめてコミット。コミットメッセージは "docs..." だが実体はコード多数）
+  - 下記 `[ ]`/`[~]` のうち **FB3（gateway 字幕/route_badge/led_indicator/audio_level）= コミット済み**、**F3-3（firmware set_mic_gain / SetInputGain）= コミット済み**。マーカーは「コード完了・実機反映未了」が正
+- **device は F4b（Phase F バグ修正版）までしか焼かれていない** → F-2/F-3 の firmware 追加（subtitle/route_badge/led_indicator/set_mic_gain）は**未 flash**。実機を最新コミットに追いつかせる flash が必須
+- **`docs/phase-f-report.md` は存在しない**（`bb31fa8` メッセージは「新規」と書くが実ファイル無し＝中断の痕跡）。learning-report は未作成
+
+## 今セッションのチェックリスト
+- [x] R1: firmware clean rebuild ✅（`release.py stackchan`、exit0。xiaozhi.bin 3,598,336B / 13% free、generated_assets.bin 3,983,046B でF-2と完全同一サイズ＝assets不変確定。WW設定 USE_CUSTOM=y/"su ta ke qiang"/閾値20/MN7 反映）
+- [x] R2: flash ✅（app-only 0x20000、3,598,336B、Hash verified、ハードリセット。assets/NVS 保持）
+- [x] R3: sudo restart ✅（07:23:45。gateway クリーン起動・ツール36個=新firmware・volume100/mic_gain18 再適用・gestures=off。status-api も再起動）。プロキシ /control/status → ok:true 確認
+- [ ] R4: 実機 E2E（下の集約チェックリスト R4-list）
+- [ ] R5: ウェイクワード/マイクゲイン チューニング（検知率・誤検知。不足ならピンイン qiang→chang / 閾値 0.2→0.12 再ビルド）
+- [ ] R6: 記録 — phase-f-report.md 新規作成（実機検証章は E2E 後）/ worklog 追記 / CLAUDE.md ステータス / memory
+
+## 実機FB（2026-06-14 E2E で4件、③以外は good）— firmware 1回の再ビルドに集約
+根本原因は調査3本で裏取り済み（debugger + investigator×2）。
+- [ ] FBa ①顔ステータス1ターン遅延: **firmware レンダリング起動漏れが主因**（gateway無罪・テスト済）。`SetStatusText`/`SetSubtitleText`/`SetRouteBadge`（stackchan.cc 4681/4747/4806）が LVGL ラベル更新後に再描画を強制しない。CoreS3 はタッチが LVGL indev 非登録・blink既定OFF・refreshタイマー自己pauseで listening 中に周期再描画なし → 次タップまで出ない。**修正=3setterに update_layout+invalidate+lv_refr_now**
+- [ ] FBb ③近接で上向きっぱなし: `TouchRevertCb`(stackchan.cc:4065)が表情だけidle復帰しサーボ角を戻さない。**修正=同関数に WriteHeadAngles(0,45)（中立 BOOT_INIT_YAW/PITCH）追加**。近接/なで共用タイマーで両方直る
+- [ ] FBc ④アイドル自動復帰（60秒）: 既存機構なし→新設。one-shot `idle_settle_timer_`、活動(近接/なで/タップ/move_head/set_indicator)で再武装、最後の操作から60s後に「首→中立・表情→idle・LED→消灯」を1回実行（one-shot＝連続buzz防止、中立なら動かさない）
+- [ ] FBd ②ウェイクワード診断ログ: オンデバイス学習は不可確定。現ファーム閾値=0.1（既に低い）。**custom_wake_word.cc:229 の ESP_MN_STATE_TIMEOUT に [DIAG] best_cmd/string/prob ログ追加**（ESP_LOGI）。焼いた後「スタックちゃん」と言って prob 実測 → 次の1回でピンイン/閾値を当て直す
+- [ ] FBe rebuild（release.py stackchan、~25分・app-only flash）→ シリアルで boot init（REJECTED/active commands）+ [DIAG] prob 観測 → ①③④再テスト
+
+### R4-list（F・F-2・F-3 統合 E2E）
+- [x] プロキシ疎通 `curl localhost:8080/control/status` → ok:true / esp32_connected ✅
+- [x] gateway 再起動後の音量再適用 ✅（re-applied volume=100）/ mic_gain 再適用・NVS永続 ✅（re-applied mic_gain=18）
+- [x] 仕草トグル OFF で顔振り停止（heartbeat gestures=off 起動ログ確認。ON 復活は実機で要確認）
+- [ ] ダッシュボード: スタックちゃんカード表示・タブ順序（左サーバー/右スタックちゃん、初期スタックちゃん）
+- [ ] 音量スライダー→実機音量 / ミュート→無音→解除で復帰
+- [ ] 顔ステータス: 聞き取り→「きいてるよ」→「考え中」→（検索で「調べ中」）→消去。タップ起動でも同遷移
+- [ ] 字幕（reply 下部2-3行）/ route バッジ "H" / Hermes 時 H+青LED
+- [ ] 会話ログ欄（route バッジ H=青/ローカル=緑）/ マイクメーター（録音中バー）
+- [ ] マイク感度スライダー→実機 mic_gain 反映（スライダー操作で即変化）
+- [ ] 緑LED 3経路統一（タップ/ウェイクワード/聞き取りボタンで点灯）← F4b で未確認
+- [ ] 近接トグル/閾値→手かざしリフレックス即反映
+- [ ] **ウェイクワード「スタックちゃん」検知・夫婦会話での誤検知を数時間観察**
+- [ ] 日本語ステータスが□にならない / 日付復唱バグ（短文に日付混入しない・「何曜日？」で即答）
+
+---
+
 # Phase F-3 — マイク感度調整・会話ログ・タブ順序 + ウェイクワード不反応の真因対策（2026-06-13、計画承認済み）
 
 F-2 実機 E2E でユーザー確認: 字幕 ✅ / H+青LED ✅ / マイクメーター ✅ / 日付バグ修正 ✅ / 緑LED ✅。**タブ順序は入れ替え要望**。加えて追加4要望。
