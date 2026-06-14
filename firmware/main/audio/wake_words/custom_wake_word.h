@@ -65,7 +65,7 @@ private:
     std::condition_variable wake_word_cv_;
 
     void StoreWakeWordData(const std::vector<int16_t>& data);
-    void ParseWakenetModelConfig();
+    bool ParseWakenetModelConfig();
 };
 
 #endif

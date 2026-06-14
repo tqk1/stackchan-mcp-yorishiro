@@ -34,19 +34,19 @@ CustomWakeWord::~CustomWakeWord() {
     }
 }
 
-void CustomWakeWord::ParseWakenetModelConfig() {
+bool CustomWakeWord::ParseWakenetModelConfig() {
     // Read index.json
     auto& assets = Assets::GetInstance();
     void* ptr = nullptr;
     size_t size = 0;
     if (!assets.GetAssetData("index.json", ptr, size)) {
         ESP_LOGE(TAG, "Failed to read index.json");
-        return;
+        return false;
     }
     cJSON* root = cJSON_ParseWithLength(static_cast<char*>(ptr), size);
     if (root == nullptr) {
         ESP_LOGE(TAG, "Failed to parse index.json");
-        return;
+        return false;
     }
     cJSON* multinet_model = cJSON_GetObjectItem(root, "multinet_model");
     if (cJSON_IsObject(multinet_model)) {
@@ -79,6 +79,7 @@ void CustomWakeWord::ParseWakenetModelConfig() {
         }
     }
     cJSON_Delete(root);
+    return true;
 }
 
 
@@ -91,33 +92,14 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
         models_ = esp_srmodel_init("model");
     } else {
         models_ = models_list;
-        ParseWakenetModelConfig();
+        // index.json のパースに失敗、またはコマンドが 1 つも登録できなかった場合は
+        // commands_ が空のまま Initialize が成功してしまい、ウェイクワードが永遠に
+        // 検出されない「無言詰まり」になる。ここで明示的に失敗させる。
+        if (!ParseWakenetModelConfig() || commands_.empty()) {
+            ESP_LOGE(TAG, "Failed to load wake word commands from index.json");
+            return false;
+        }
     }
-
-#ifdef CONFIG_CUSTOM_WAKE_WORD
-    // ===================================================================
-    // [TEST BUILD ONLY] ピンイン近似の実機探索用 複数候補一括登録
-    // -------------------------------------------------------------------
-    // 実機は models_list != nullptr 経路(ParseWakenetModelConfig)を通り、index.json 由来の
-    // 単一コマンド(su ta ke qiang)/閾値(0.2)が commands_ / threshold_ に入る。ここでそれを
-    // テスト候補12個・閾値0.1で上書きする(両経路をカバー)。全て action="wake" なので
-    // どれが鳴っても既存の StartListening 経路に到達する。検知時ログ
-    // "Custom wake word detected: ... string=.." で当たり候補を判別できる。
-    //
-    // !!! これはテスト専用 !!! 当たり発見後は 1〜2 候補へ絞り閾値を上げ、
-    // config.json の単一 CONFIG_CUSTOM_WAKE_WORD 方式に戻すこと。
-    // ===================================================================
-    commands_.clear();
-    static const char* kTestWakeWordCandidates[] = {
-        "su ta ke qiang", "su ta ku chang", "su ta ku qiang", "su ta ke chang",
-        "su da ku chang", "si ta ku chang", "su ta ku qian", "su ta ka chang",
-        "su ta ku jiang", "su ta ke qian", "su ta ku zhang", "su ta ku chuang",
-    };
-    threshold_ = 0.1f;  // [TEST] 敏感側
-    for (const char* cand : kTestWakeWordCandidates) {
-        commands_.push_back({cand, cand, "wake"});
-    }
-#endif
 
     if (models_ == nullptr || models_->num == -1) {
         ESP_LOGE(TAG, "Failed to initialize wakenet model");
@@ -139,30 +121,16 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
     multinet_ = esp_mn_handle_from_name(mn_name_);
     multinet_model_data_ = multinet_->create(mn_name_, duration_);
     multinet_->set_det_threshold(multinet_model_data_, threshold_);
-    ESP_LOGI(TAG, "[TEST] det_threshold set to %.2f", threshold_);
     // config.json 由来の単一登録と競合しないよう、登録前に既存コマンドを必ずクリアする。
     esp_mn_commands_clear();
     for (int i = 0; i < commands_.size(); i++) {
         esp_mn_commands_add(i + 1, commands_[i].command.c_str());
     }
-    // esp_mn_commands_update() は音素辞書に存在しない（=登録できなかった）候補を
-    // esp_mn_error_t.phrases で返す。当たり探索のため、弾かれた候補を明示ログする。
-    // [TEST BUILD ONLY] 本番（単一候補）に戻す際はこのエラーログ処理も不要。
     esp_mn_error_t* mn_error = esp_mn_commands_update();
     if (mn_error != nullptr && mn_error->num > 0) {
-        ESP_LOGW(TAG, "[TEST] %d wake-word candidate(s) REJECTED (out-of-vocabulary phonemes):", mn_error->num);
-        for (int i = 0; i < mn_error->num; i++) {
-            if (mn_error->phrases[i] != nullptr && mn_error->phrases[i]->string != nullptr) {
-                ESP_LOGW(TAG, "[TEST]   REJECTED: command_id=%d, string=\"%s\"",
-                         mn_error->phrases[i]->command_id, mn_error->phrases[i]->string);
-            }
-        }
-    } else {
-        ESP_LOGI(TAG, "[TEST] All %d wake-word candidate(s) registered successfully", (int)commands_.size());
+        ESP_LOGW(TAG, "%d wake word command(s) failed to register (out-of-vocabulary phonemes)", mn_error->num);
     }
 
-    // print_active_speech_commands は実際に有効化された（登録成功した）コマンド一覧を出す。
-    // 弾かれた候補は上の REJECTED ログに出るので、両方を突き合わせて判定できる。
     multinet_->print_active_speech_commands(multinet_model_data_);
     return true;
 }
