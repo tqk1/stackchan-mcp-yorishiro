@@ -69,6 +69,7 @@ import json
 import logging
 import os
 import random
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -356,6 +357,12 @@ class HeartbeatRunner:
     def _skip_reason(self) -> str | None:
         if not self._gateway.esp32.device_connected:
             return "no device connected"
+        # A voice turn holds no tts_lock while it is in STT / Hermes
+        # (the lock only covers TTS playback), so check the bridge's
+        # own flag too — a heartbeat gesture must never land mid-turn
+        # (design principle #1: never interrupt the conversation).
+        if getattr(self._gateway, "voice_turn_active", False):
+            return "voice turn active"
         if self._gateway.esp32.tts_lock.locked():
             return "audio pipeline busy"
         if is_quiet(self._now(), self._quiet):
@@ -541,13 +548,22 @@ class HeartbeatRunner:
             return {}
 
     def _save_state(self) -> None:
+        # Atomic write (write-temp + os.replace), same flavour as the
+        # control state file (stackchan_mcp.control.save_state): a crash
+        # mid-write must not truncate the day's speak-count / reminded
+        # flags into garbage.
         assert self._speak is not None
         path = self._speak.state_path
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(self._state, ensure_ascii=False), "utf-8"
-            )
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                    json.dump(self._state, fp, ensure_ascii=False)
+                os.replace(tmp, path)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
         except OSError as exc:
             logger.warning("heartbeat: cannot write state file %s (%s)", path, exc)
 

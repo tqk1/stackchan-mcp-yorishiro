@@ -140,6 +140,24 @@ DATE_QUERY_MARKERS = (
 )
 
 
+def _env_float(name: str, default: float) -> float:
+    """A numeric env var in seconds, warning and falling back on garbage.
+
+    A non-numeric value (a config typo) would otherwise raise on every
+    turn and silently push the whole conversation onto the slow Hermes
+    path; warn once-per-turn and fall back so the misconfiguration is
+    visible in the logs instead.
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("local LLM: invalid %s=%r; using %s", name, raw, default)
+        return default
+
+
 def is_enabled() -> bool:
     """True when local routing is opted in via STACKCHAN_LOCAL_LLM_MODEL."""
     return bool(os.getenv("STACKCHAN_LOCAL_LLM_MODEL", "").strip())
@@ -223,9 +241,8 @@ async def ask_local(text: str, *, system_prompt: str) -> str:
     base_url = os.getenv(
         "STACKCHAN_LOCAL_LLM_URL", DEFAULT_LOCAL_LLM_URL
     ).rstrip("/")
-    timeout_s = float(
-        os.getenv("STACKCHAN_LOCAL_LLM_TIMEOUT_S", "")
-        or DEFAULT_LOCAL_LLM_TIMEOUT_S
+    timeout_s = _env_float(
+        "STACKCHAN_LOCAL_LLM_TIMEOUT_S", DEFAULT_LOCAL_LLM_TIMEOUT_S
     )
     keep_alive = (
         os.getenv("STACKCHAN_LOCAL_LLM_KEEP_ALIVE", "")

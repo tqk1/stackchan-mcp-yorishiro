@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -9,9 +10,11 @@ from aiohttp import web
 
 from stackchan_mcp import hermes_bridge, local_llm
 from stackchan_mcp.local_llm import (
+    DEFAULT_LOCAL_LLM_TIMEOUT_S,
     LOCAL_MAX_CHARS,
     ROUTE_HERMES,
     ROUTE_LOCAL,
+    _env_float,
     _is_date_query,
     ask_local,
     decide_route,
@@ -159,6 +162,55 @@ def test_is_enabled_requires_model_env(monkeypatch):
     assert is_enabled() is False
     monkeypatch.setenv("STACKCHAN_LOCAL_LLM_MODEL", "some-model:q4")
     assert is_enabled() is True
+
+
+# --- _env_float (timeout parse guard) ----------------------------------------
+
+
+def test_env_float_uses_default_when_unset(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_LOCAL_LLM_TIMEOUT_S", raising=False)
+    assert _env_float("STACKCHAN_LOCAL_LLM_TIMEOUT_S", 10.0) == 10.0
+
+
+def test_env_float_parses_valid_value(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_LOCAL_LLM_TIMEOUT_S", "3.5")
+    assert _env_float("STACKCHAN_LOCAL_LLM_TIMEOUT_S", 10.0) == 3.5
+
+
+def test_env_float_invalid_falls_back_and_warns(monkeypatch, caplog):
+    """A non-numeric timeout must not raise; warn and use the default."""
+    monkeypatch.setenv("STACKCHAN_LOCAL_LLM_TIMEOUT_S", "abc")
+    with caplog.at_level(logging.WARNING):
+        value = _env_float(
+            "STACKCHAN_LOCAL_LLM_TIMEOUT_S", DEFAULT_LOCAL_LLM_TIMEOUT_S
+        )
+    assert value == DEFAULT_LOCAL_LLM_TIMEOUT_S
+    assert "STACKCHAN_LOCAL_LLM_TIMEOUT_S" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ask_local_survives_invalid_timeout_env(
+    monkeypatch, aiohttp_unused_port
+):
+    """A garbage timeout env must not abort the call — it falls back to
+    the default and the turn still completes (rather than raising
+    ValueError and silently forcing every turn onto Hermes)."""
+
+    async def handle(request: web.Request) -> web.Response:
+        await request.read()
+        return web.json_response(
+            {"message": {"role": "assistant", "content": "やあ"}}
+        )
+
+    runner, base_url = await _run_ollama_stub(handle, aiohttp_unused_port)
+    monkeypatch.setenv("STACKCHAN_LOCAL_LLM_MODEL", "test-model:q4")
+    monkeypatch.setenv("STACKCHAN_LOCAL_LLM_URL", base_url)
+    monkeypatch.setenv("STACKCHAN_LOCAL_LLM_TIMEOUT_S", "abc")
+    try:
+        reply = await ask_local("おはよう", system_prompt="短く。")
+    finally:
+        await runner.cleanup()
+    assert reply == "やあ"
 
 
 # --- ask_local (Ollama /api/chat) ---------------------------------------------

@@ -166,6 +166,19 @@ async def test_mute_twice_keeps_original_pre_mute_volume():
     assert control.load_state()["pre_mute_volume"] == 70
 
 
+@pytest.mark.asyncio
+async def test_concurrent_mute_unmute_preserve_pre_mute_volume():
+    # mute/unmute do a read-modify-write under _mute_lock; firing them
+    # concurrently must not stash 0 into pre_mute_volume and lose the
+    # real level. Whichever wins, the stashed volume stays 75.
+    gw = FakeGateway()
+    await control.set_volume(gw, 75)
+    import asyncio
+
+    await asyncio.gather(control.mute(gw), control.unmute(gw))
+    assert control.load_state()["pre_mute_volume"] == 75
+
+
 # ---- apply_persisted_volume ------------------------------------------
 
 

@@ -105,6 +105,11 @@ _LED_INDICATOR_TOOL = "self.led.set_indicator"
 _APPLY_VOLUME_DELAY_S = 1.5
 _APPLY_VOLUME_RETRIES = 1
 
+#: Serialises mute/unmute. Both do a read-modify-write on the state file
+#: (load_state → _send_volume → save_state); two dashboard taps racing
+#: could otherwise stash 0 into pre_mute_volume and lose the real level.
+_mute_lock = asyncio.Lock()
+
 
 def _state_path() -> Path:
     return Path(
@@ -229,27 +234,29 @@ async def set_volume(gateway: "Gateway", volume: Any) -> dict[str, Any]:
 
 async def mute(gateway: "Gateway") -> dict[str, Any]:
     """Mute the speaker, stashing the current volume for restore."""
-    state = load_state()
-    if not state["muted"]:
-        state["pre_mute_volume"] = state["volume"]
-    if not await _send_volume(gateway, 0):
-        return {"ok": False, "error": "device call failed"}
-    state["volume"] = 0
-    state["muted"] = True
-    save_state(state)
-    return {"ok": True, "volume": 0, "muted": True}
+    async with _mute_lock:
+        state = load_state()
+        if not state["muted"]:
+            state["pre_mute_volume"] = state["volume"]
+        if not await _send_volume(gateway, 0):
+            return {"ok": False, "error": "device call failed"}
+        state["volume"] = 0
+        state["muted"] = True
+        save_state(state)
+        return {"ok": True, "volume": 0, "muted": True}
 
 
 async def unmute(gateway: "Gateway") -> dict[str, Any]:
     """Restore the volume stashed by :func:`mute`."""
-    state = load_state()
-    restore = _clamp_volume(state.get("pre_mute_volume", DEFAULT_VOLUME))
-    if not await _send_volume(gateway, restore):
-        return {"ok": False, "error": "device call failed"}
-    state["volume"] = restore
-    state["muted"] = False
-    save_state(state)
-    return {"ok": True, "volume": restore, "muted": False}
+    async with _mute_lock:
+        state = load_state()
+        restore = _clamp_volume(state.get("pre_mute_volume", DEFAULT_VOLUME))
+        if not await _send_volume(gateway, restore):
+            return {"ok": False, "error": "device call failed"}
+        state["volume"] = restore
+        state["muted"] = False
+        save_state(state)
+        return {"ok": True, "volume": restore, "muted": False}
 
 
 async def apply_persisted_volume(gateway: "Gateway") -> None:

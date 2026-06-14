@@ -151,6 +151,18 @@ def test_skip_in_quiet_hours(monkeypatch):
     assert runner._skip_reason() is None
 
 
+def test_skip_during_voice_turn():
+    # A voice turn (STT → Hermes) holds no tts_lock, so the heartbeat
+    # must consult the bridge's voice_turn_active flag too — otherwise a
+    # gesture lands mid-conversation (design principle #1).
+    gw = FakeGateway()
+    gw.voice_turn_active = True
+    runner = make_runner(gw)
+    assert runner._skip_reason() == "voice turn active"
+    gw.voice_turn_active = False
+    assert runner._skip_reason() is None
+
+
 # ---- gestures --------------------------------------------------------
 
 
@@ -568,3 +580,29 @@ async def test_tick_speak_suppressed_then_gesture_fallback(tmp_path, monkeypatch
     runner = make_runner(gw, speak=make_speak(tmp_path))
     monkeypatch.setattr(hb, "is_recording", lambda: True)
     assert await runner._tick_speak() is False
+
+
+# ---- Phase E: state persistence --------------------------------------
+
+
+def test_save_state_is_atomic(tmp_path, monkeypatch):
+    # The write must go through os.replace so a crash mid-write cannot
+    # truncate the state file (same flavour as control.save_state).
+    state_path = tmp_path / "state.json"
+    runner = make_runner(speak=make_speak(tmp_path, state_path=state_path))
+    runner._state = {"speak_count_date": "2026-06-14", "speak_count": 1}
+
+    replaced: list[tuple[str, str]] = []
+    real_replace = hb.os.replace
+
+    def spy_replace(src, dst):
+        replaced.append((str(src), str(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(hb.os, "replace", spy_replace)
+    runner._save_state()
+
+    assert replaced and replaced[-1][1] == str(state_path)
+    assert json.loads(state_path.read_text("utf-8")) == runner._state
+    # No stray temp files left behind in the state directory.
+    assert list(tmp_path.glob("*.tmp")) == []
