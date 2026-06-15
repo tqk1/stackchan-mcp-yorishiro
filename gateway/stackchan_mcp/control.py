@@ -46,6 +46,15 @@ logger = logging.getLogger(__name__)
 #: tests / non-default deployments via ``STACKCHAN_CONTROL_STATE``.
 DEFAULT_STATE_PATH = "~/.stackchan/control_state.json"
 
+#: Where named mode presets live (one JSON file per preset). Overridable
+#: for tests via ``STACKCHAN_PRESETS_DIR``. Each preset is a snapshot of
+#: the dashboard-controllable settings (volume/mic/brightness/LED/
+#: proximity/heartbeat) that :func:`apply_preset` re-sends in one shot.
+DEFAULT_PRESETS_PATH = "~/.stackchan/presets"
+
+#: Upper bound on a preset name's length (the name doubles as filename).
+MAX_PRESET_NAME_LEN = 32
+
 #: Default volume applied when no state file exists yet.
 DEFAULT_VOLUME = 50
 
@@ -133,6 +142,10 @@ MAX_HEAD_PITCH = 85
 _SUBTITLE_TOOL = "self.display.set_subtitle"
 _ROUTE_BADGE_TOOL = "self.display.set_route_badge"
 _LED_INDICATOR_TOOL = "self.led.set_indicator"
+#: Touch/proximity config tool (yorishiro fork). Full device name so the
+#: control layer can use ``call_tool`` directly (mirrors the short-name →
+#: full-name mapping in stdio_server's dispatch table).
+_SET_PROXIMITY_TOOL = "self.touch.set_proximity_config"
 
 #: How long to wait before re-applying the persisted volume on connect,
 #: and how many times to retry. The codec init can swallow a set_volume
@@ -144,6 +157,11 @@ _APPLY_VOLUME_RETRIES = 1
 #: (load_state → _send_volume → save_state); two dashboard taps racing
 #: could otherwise stash 0 into pre_mute_volume and lose the real level.
 _mute_lock = asyncio.Lock()
+
+#: Serialises preset application. ``apply_preset`` re-sends a whole batch
+#: of settings; two concurrent applies (or an apply racing a voice turn)
+#: would interleave device calls and corrupt the LED / volume state.
+_preset_lock = asyncio.Lock()
 
 
 def _state_path() -> Path:
@@ -910,3 +928,262 @@ async def trigger_listen(gateway: "Gateway") -> dict[str, Any]:
         logger.warning("control: trigger_listen failed: %s", exc)
         return {"ok": False, "error": str(exc)}
     return {"ok": True}
+
+
+# ---- Mode presets (yorishiro fork) -----------------------------------
+#
+# A "mode" is a named snapshot of the dashboard-controllable settings the
+# user can re-apply in one shot. The snapshot is assembled by the HTTP
+# layer (which owns the device query for proximity and the heartbeat
+# runner) and handed to :func:`save_preset`; :func:`apply_preset` re-sends
+# it via the same setters the dashboard uses. Stored one JSON file per
+# preset under ``~/.stackchan/presets`` (atomic write, same flavour as the
+# control state file). The head's neutral pose is intentionally excluded —
+# it depends on where the device is physically placed.
+
+
+def _presets_dir() -> Path:
+    return Path(
+        os.getenv("STACKCHAN_PRESETS_DIR", "") or DEFAULT_PRESETS_PATH
+    ).expanduser()
+
+
+def normalize_preset_name(name: Any) -> str | None:
+    """Validate a preset name, returning it trimmed or None if unsafe.
+
+    The name doubles as a filename, so this rejects empties, over-long
+    names, path separators, ``.``/``..``, leading dots and control
+    characters to keep the file inside the presets directory (no
+    traversal). Unicode (e.g. Japanese) names are allowed.
+    """
+    if not isinstance(name, str):
+        return None
+    trimmed = name.strip()
+    if not trimmed or len(trimmed) > MAX_PRESET_NAME_LEN:
+        return None
+    if trimmed in (".", "..") or trimmed.startswith("."):
+        return None
+    if any(ch in trimmed for ch in ("/", "\\", "\x00")):
+        return None
+    if any(ord(ch) < 0x20 for ch in trimmed):
+        return None
+    return trimmed
+
+
+def _preset_file(name: str) -> Path:
+    return _presets_dir() / f"{name}.json"
+
+
+def _sanitize_snapshot(snapshot: Any) -> dict[str, Any]:
+    """Keep only the preset-relevant settings, clamped / validated.
+
+    Mirrors :func:`save_state`'s clamping for the gateway-owned fields and
+    validates the device-sourced proximity / heartbeat blocks. Drops
+    everything else (e.g. heartbeat ``speak`` / ``interval_min``), so a
+    preset only carries what :func:`apply_preset` knows how to restore.
+    """
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    out: dict[str, Any] = {}
+    if "volume" in snap:
+        out["volume"] = _clamp_volume(snap["volume"])
+    if "muted" in snap:
+        out["muted"] = bool(snap["muted"])
+    if "pre_mute_volume" in snap:
+        out["pre_mute_volume"] = _clamp_volume(snap["pre_mute_volume"])
+    if "mic_gain" in snap:
+        out["mic_gain"] = _clamp_mic_gain(snap["mic_gain"])
+    if "brightness" in snap:
+        out["brightness"] = _clamp_brightness(snap["brightness"])
+    if "led" in snap:
+        out["led"] = _normalize_led(snap["led"])
+    prox = snap.get("proximity")
+    if (
+        isinstance(prox, dict)
+        and prox.get("mode") in ("reflex", "listen", "off")
+        and isinstance(prox.get("threshold"), int)
+        and not isinstance(prox.get("threshold"), bool)
+    ):
+        out["proximity"] = {
+            "mode": prox["mode"],
+            "threshold": min(max(prox["threshold"], 0), 2047),
+        }
+    hb = snap.get("heartbeat")
+    if isinstance(hb, dict) and isinstance(hb.get("gestures"), bool):
+        out["heartbeat"] = {"gestures": hb["gestures"]}
+    return out
+
+
+async def save_preset(
+    name: Any, snapshot: dict[str, Any], *, overwrite: bool = False
+) -> dict[str, Any]:
+    """Persist ``snapshot`` as a named preset (atomic write).
+
+    Returns ``{"ok": True, "preset": name}`` or an error dict (invalid
+    name / already exists / write failure).
+    """
+    safe = normalize_preset_name(name)
+    if safe is None:
+        return {"ok": False, "error": "invalid preset name"}
+    path = _preset_file(safe)
+    if path.exists() and not overwrite:
+        return {"ok": False, "error": f"preset '{safe}' already exists"}
+    payload = {
+        "name": safe,
+        "ts": time.time(),
+        "settings": _sanitize_snapshot(snapshot),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                json.dump(payload, fp, ensure_ascii=False)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    except OSError as exc:
+        logger.warning("control: cannot write preset %s (%s)", path, exc)
+        return {"ok": False, "error": "cannot write preset"}
+    return {"ok": True, "preset": safe}
+
+
+def load_preset(name: Any) -> dict[str, Any] | None:
+    """Read a preset file, or None if missing / unreadable / invalid."""
+    safe = normalize_preset_name(name)
+    if safe is None:
+        return None
+    try:
+        data = json.loads(_preset_file(safe).read_text("utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        logger.warning("control: unreadable preset %s (%s)", safe, exc)
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def list_presets() -> list[dict[str, Any]]:
+    """List saved presets as ``[{"name", "ts"}]`` (name-sorted)."""
+    directory = _presets_dir()
+    if not directory.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for file in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(file.read_text("utf-8"))
+            out.append({"name": data.get("name", file.stem), "ts": data.get("ts")})
+        except (OSError, ValueError):
+            out.append({"name": file.stem, "ts": None})
+    return out
+
+
+async def delete_preset(name: Any) -> dict[str, Any]:
+    """Delete a named preset file."""
+    safe = normalize_preset_name(name)
+    if safe is None:
+        return {"ok": False, "error": "invalid preset name"}
+    path = _preset_file(safe)
+    if not path.exists():
+        return {"ok": False, "error": f"preset '{safe}' not found"}
+    try:
+        path.unlink()
+    except OSError as exc:
+        logger.warning("control: cannot delete preset %s (%s)", path, exc)
+        return {"ok": False, "error": "cannot delete preset"}
+    return {"ok": True, "preset": safe}
+
+
+async def apply_preset(gateway: "Gateway", name: Any) -> dict[str, Any]:
+    """Re-apply a saved preset's settings to the device.
+
+    Serialised with :data:`_preset_lock` and refused mid voice-turn.
+    Re-sends each setting via the same setters the dashboard uses;
+    per-setting failures are collected so a partial apply still reports
+    what failed (``{"ok": False, "error": "partial apply", "failed": [...]}``).
+    """
+    safe = normalize_preset_name(name)
+    if safe is None:
+        return {"ok": False, "error": "invalid preset name"}
+    async with _preset_lock:
+        if getattr(gateway, "voice_turn_active", False):
+            return {"ok": False, "error": "busy (voice turn active)"}
+        data = load_preset(safe)
+        if data is None:
+            return {"ok": False, "error": f"preset '{safe}' not found"}
+        settings = data.get("settings")
+        if not isinstance(settings, dict):
+            return {"ok": False, "error": "preset has no settings"}
+        failed: list[str] = []
+
+        # Volume (+ mute): restore the real level first, then mute on top
+        # so a later unmute returns to the right place.
+        if "volume" in settings or "muted" in settings:
+            base = settings.get(
+                "pre_mute_volume", settings.get("volume", DEFAULT_VOLUME)
+            )
+            if settings.get("muted"):
+                if not (await set_volume(gateway, base)).get("ok"):
+                    failed.append("volume")
+                elif not (await mute(gateway)).get("ok"):
+                    failed.append("mute")
+            elif not (await set_volume(gateway, settings.get("volume", base))).get(
+                "ok"
+            ):
+                failed.append("volume")
+
+        if "mic_gain" in settings and not (
+            await set_mic_gain(gateway, settings["mic_gain"])
+        ).get("ok"):
+            failed.append("mic_gain")
+
+        if "brightness" in settings and not (
+            await set_brightness(gateway, settings["brightness"])
+        ).get("ok"):
+            failed.append("brightness")
+
+        led = settings.get("led")
+        if isinstance(led, dict):
+            if "brightness" in led and not (
+                await set_led_brightness(gateway, led["brightness"])
+            ).get("ok"):
+                failed.append("led.brightness")
+            for slot in LED_SLOTS:
+                cfg = led.get(slot)
+                if not isinstance(cfg, dict):
+                    continue
+                on = cfg.get("on") if slot == "idle" else None
+                result = await set_led(
+                    gateway,
+                    slot,
+                    on=on,
+                    r=cfg.get("r", 0),
+                    g=cfg.get("g", 0),
+                    b=cfg.get("b", 0),
+                )
+                if not result.get("ok"):
+                    failed.append(f"led.{slot}")
+
+        prox = settings.get("proximity")
+        if isinstance(prox, dict) and "mode" in prox and "threshold" in prox:
+            _result, error = await gateway.esp32.call_tool(
+                _SET_PROXIMITY_TOOL,
+                {"mode": prox["mode"], "threshold": prox["threshold"]},
+            )
+            if error:
+                failed.append("proximity")
+
+        hb = settings.get("heartbeat")
+        if isinstance(hb, dict) and "gestures" in hb:
+            runner = getattr(gateway, "_heartbeat", None)
+            if runner is not None:
+                runner.set_gestures(bool(hb["gestures"]))
+
+        if failed:
+            return {
+                "ok": False,
+                "error": "partial apply",
+                "failed": failed,
+                "preset": safe,
+            }
+        return {"ok": True, "preset": safe, "applied": True}

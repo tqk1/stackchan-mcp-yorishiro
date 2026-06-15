@@ -203,6 +203,32 @@ async def _build_control_status(gateway: Any) -> dict[str, Any]:
     }
 
 
+async def _build_preset_snapshot(gateway: Any) -> dict[str, Any]:
+    """Snapshot the current dashboard-controllable settings for a preset.
+
+    Reuses the same sources as :func:`_build_control_status`: the gateway
+    control state plus the device-queried proximity and the heartbeat
+    runner. The head's neutral pose is intentionally excluded (it depends
+    on where the device is placed). ``control.save_preset`` sanitises this.
+    """
+    state = control.load_state()
+    snapshot: dict[str, Any] = {
+        "volume": state["volume"],
+        "muted": state["muted"],
+        "pre_mute_volume": state["pre_mute_volume"],
+        "mic_gain": state["mic_gain"],
+        "brightness": state["brightness"],
+        "led": state["led"],
+    }
+    proximity = await _proximity_status(gateway)
+    if proximity is not None:
+        snapshot["proximity"] = proximity
+    heartbeat = _heartbeat_status(gateway)
+    if heartbeat is not None and "gestures" in heartbeat:
+        snapshot["heartbeat"] = {"gestures": heartbeat["gestures"]}
+    return snapshot
+
+
 def _heartbeat_status(gateway: Any) -> dict[str, Any] | None:
     runner = getattr(gateway, "_heartbeat", None)
     if runner is None:
@@ -480,6 +506,53 @@ def build_app(
             return _control_error(f"say failed: {exc}", status=502)
         return _control_json({"ok": True, "tts": result})
 
+    # ---- Mode presets (yorishiro fork) --------------------------------
+    async def control_presets_list(_request: Request) -> JSONResponse:
+        return _control_json({"ok": True, "presets": await control.list_presets()})
+
+    async def control_presets_save(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            # Need the device to snapshot proximity, so require connection.
+            return _control_error("no device connected", status=503)
+        name = control.normalize_preset_name(body.get("name"))
+        if name is None:
+            return _control_error(
+                "name must be 1..32 chars without / \\ or ..", status=400
+            )
+        snapshot = await _build_preset_snapshot(gateway)
+        result = await control.save_preset(
+            name, snapshot, overwrite=bool(body.get("overwrite", False))
+        )
+        if result.get("ok"):
+            return _control_json(result)
+        status = 409 if "already exists" in result.get("error", "") else 502
+        return _control_json(result, status=status)
+
+    async def control_presets_apply(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        name = control.normalize_preset_name(body.get("name"))
+        if name is None:
+            return _control_error("invalid preset name", status=400)
+        result = await control.apply_preset(gateway, name)
+        if result.get("ok"):
+            return _control_json(result)
+        err = result.get("error", "")
+        status = 404 if "not found" in err else 409 if "busy" in err else 502
+        return _control_json(result, status=status)
+
+    async def control_presets_delete(request: Request) -> JSONResponse:
+        body = await _read_json_body(request)
+        name = control.normalize_preset_name(body.get("name"))
+        if name is None:
+            return _control_error("invalid preset name", status=400)
+        result = await control.delete_preset(name)
+        if result.get("ok"):
+            return _control_json(result)
+        return _control_json(result, status=404)
+
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
         dispatcher_task: asyncio.Task[None] | None = None
@@ -532,6 +605,26 @@ def build_app(
         Route("/control/heartbeat", endpoint=control_heartbeat, methods=["POST"]),
         Route("/control/avatar", endpoint=control_avatar, methods=["POST"]),
         Route("/control/say", endpoint=control_say, methods=["POST"]),
+        Route(
+            "/control/presets/list",
+            endpoint=control_presets_list,
+            methods=["GET"],
+        ),
+        Route(
+            "/control/presets/save",
+            endpoint=control_presets_save,
+            methods=["POST"],
+        ),
+        Route(
+            "/control/presets/apply",
+            endpoint=control_presets_apply,
+            methods=["POST"],
+        ),
+        Route(
+            "/control/presets/delete",
+            endpoint=control_presets_delete,
+            methods=["POST"],
+        ),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.command_queue = queue

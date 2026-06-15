@@ -683,6 +683,7 @@ def _control_state_path(monkeypatch, tmp_path):
     monkeypatch.setenv(
         "STACKCHAN_CONTROL_STATE", str(tmp_path / "control_state.json")
     )
+    monkeypatch.setenv("STACKCHAN_PRESETS_DIR", str(tmp_path / "presets"))
 
 
 def _build_control_app(gateway, *, token: str | None = None):
@@ -1314,3 +1315,108 @@ async def test_control_conversation_requires_token() -> None:
         )
     assert missing.status_code == 401
     assert ok.status_code == 200
+
+
+# ---- mode presets -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_control_presets_save_and_list() -> None:
+    gateway = ControlFakeGateway(heartbeat=FakeHeartbeat(gestures=True))
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        await client.post("/control/volume", json={"volume": 70})
+        saved = await client.post("/control/presets/save", json={"name": "夜"})
+        listed = await client.get("/control/presets/list")
+    assert saved.status_code == 200
+    assert saved.json()["ok"] is True
+    body = listed.json()
+    assert body["ok"] is True
+    assert [p["name"] for p in body["presets"]] == ["夜"]
+
+
+@pytest.mark.asyncio
+async def test_control_presets_save_requires_device() -> None:
+    gateway = ControlFakeGateway(connected=False)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/presets/save", json={"name": "x"})
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_control_presets_save_rejects_bad_name() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/presets/save", json={"name": "../x"})
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_control_presets_save_conflict_without_overwrite() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        first = await client.post("/control/presets/save", json={"name": "m"})
+        dup = await client.post("/control/presets/save", json={"name": "m"})
+        forced = await client.post(
+            "/control/presets/save", json={"name": "m", "overwrite": True}
+        )
+    assert first.status_code == 200
+    assert dup.status_code == 409
+    assert forced.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_control_presets_apply_resends_and_reports() -> None:
+    from stackchan_mcp import control
+
+    gateway = ControlFakeGateway(heartbeat=FakeHeartbeat(gestures=False))
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        await client.post("/control/volume", json={"volume": 80})
+        await client.post("/control/presets/save", json={"name": "scene"})
+        await client.post("/control/volume", json={"volume": 20})
+        gateway.esp32.calls.clear()
+        applied = await client.post("/control/presets/apply", json={"name": "scene"})
+    assert applied.status_code == 200
+    assert applied.json()["ok"] is True
+    tools = [name for name, _ in gateway.esp32.calls]
+    assert "self.audio_speaker.set_volume" in tools
+    assert "self.touch.set_proximity_config" in tools
+    assert control.load_state()["volume"] == 80
+
+
+@pytest.mark.asyncio
+async def test_control_presets_apply_not_found() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/presets/apply", json={"name": "ghost"})
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_control_presets_apply_busy_during_voice_turn() -> None:
+    gateway = ControlFakeGateway()
+    gateway.voice_turn_active = True
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        await client.post("/control/presets/save", json={"name": "scene"})
+        resp = await client.post("/control/presets/apply", json={"name": "scene"})
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_control_presets_delete() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        await client.post("/control/presets/save", json={"name": "m"})
+        deleted = await client.post("/control/presets/delete", json={"name": "m"})
+        missing = await client.post("/control/presets/delete", json={"name": "m"})
+        listed = await client.get("/control/presets/list")
+    assert deleted.status_code == 200
+    assert missing.status_code == 404
+    assert listed.json()["presets"] == []

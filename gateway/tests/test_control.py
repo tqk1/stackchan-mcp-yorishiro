@@ -33,10 +33,11 @@ class FakeGateway:
 
 @pytest.fixture(autouse=True)
 def _isolate_state(monkeypatch, tmp_path):
-    """Point the control state file at a tmp path for every test."""
+    """Point the control state + presets at tmp paths for every test."""
     monkeypatch.setenv(
         "STACKCHAN_CONTROL_STATE", str(tmp_path / "control_state.json")
     )
+    monkeypatch.setenv("STACKCHAN_PRESETS_DIR", str(tmp_path / "presets"))
 
 
 # ---- state persistence ------------------------------------------------
@@ -863,3 +864,163 @@ def test_get_audio_level_reports_level_when_recording(monkeypatch):
     monkeypatch.setattr(audio_stream, "get_input_level", lambda: 0.42)
     result = control.get_audio_level()
     assert result == {"ok": True, "recording": True, "level": 0.42}
+
+
+# ---- mode presets -----------------------------------------------------
+
+
+def _sample_snapshot() -> dict:
+    return {
+        "volume": 65,
+        "muted": False,
+        "pre_mute_volume": 65,
+        "mic_gain": 18,
+        "brightness": 40,
+        "led": {
+            "brightness": 80,
+            "idle": {"on": True, "r": 10, "g": 20, "b": 30},
+            "listening": {"r": 1, "g": 2, "b": 3},
+            "hermes": {"r": 4, "g": 5, "b": 6},
+        },
+        "proximity": {"mode": "listen", "threshold": 700},
+        "heartbeat": {"gestures": True},
+    }
+
+
+class _FakeRunner:
+    def __init__(self, gestures: bool = False) -> None:
+        self.gestures_enabled = gestures
+        self.set_calls: list[bool] = []
+
+    def set_gestures(self, enabled: bool) -> None:
+        self.gestures_enabled = bool(enabled)
+        self.set_calls.append(bool(enabled))
+
+
+@pytest.mark.asyncio
+async def test_save_preset_writes_sanitized_file(tmp_path):
+    result = await control.save_preset("おやすみ", _sample_snapshot())
+    assert result == {"ok": True, "preset": "おやすみ"}
+    path = tmp_path / "presets" / "おやすみ.json"
+    assert path.exists()
+    data = json.loads(path.read_text("utf-8"))
+    assert data["name"] == "おやすみ"
+    settings = data["settings"]
+    assert settings["volume"] == 65
+    assert settings["proximity"] == {"mode": "listen", "threshold": 700}
+    assert settings["heartbeat"] == {"gestures": True}
+    # neutral_pose / face etc are never carried into a preset.
+    assert "neutral_pose" not in settings
+
+
+@pytest.mark.asyncio
+async def test_save_preset_rejects_unsafe_name():
+    for bad in ("", "   ", "../evil", "a/b", "a\\b", ".", "..", ".hidden", "x" * 33):
+        result = await control.save_preset(bad, _sample_snapshot())
+        assert result["ok"] is False, bad
+
+
+@pytest.mark.asyncio
+async def test_save_preset_no_overwrite_then_overwrite():
+    first = await control.save_preset("m", _sample_snapshot())
+    assert first["ok"] is True
+    again = await control.save_preset("m", _sample_snapshot())
+    assert again["ok"] is False
+    assert "exists" in again["error"]
+    forced = await control.save_preset("m", _sample_snapshot(), overwrite=True)
+    assert forced["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_list_and_delete_presets():
+    await control.save_preset("a", _sample_snapshot())
+    await control.save_preset("b", _sample_snapshot())
+    names = [p["name"] for p in await control.list_presets()]
+    assert names == ["a", "b"]  # name-sorted
+    deleted = await control.delete_preset("a")
+    assert deleted["ok"] is True
+    assert [p["name"] for p in await control.list_presets()] == ["b"]
+    missing = await control.delete_preset("a")
+    assert missing["ok"] is False
+    assert "not found" in missing["error"]
+
+
+@pytest.mark.asyncio
+async def test_list_presets_empty_when_dir_missing():
+    assert await control.list_presets() == []
+
+
+@pytest.mark.asyncio
+async def test_apply_preset_resends_settings_and_restores_state():
+    gw = FakeGateway()
+    gw._heartbeat = _FakeRunner(gestures=False)
+    await control.save_preset("scene", _sample_snapshot())
+    # drift current state away from the preset
+    await control.set_volume(gw, 10)
+    await control.set_brightness(gw, 5)
+    gw.esp32.calls.clear()
+
+    result = await control.apply_preset(gw, "scene")
+    assert result["ok"] is True
+    assert result["applied"] is True
+
+    tools = [name for name, _ in gw.esp32.calls]
+    assert control._SET_VOLUME_TOOL in tools
+    assert control._SET_MIC_GAIN_TOOL in tools
+    assert control._SET_BRIGHTNESS_TOOL in tools
+    assert control._SET_ALL_LEDS_TOOL in tools  # idle on → set_all
+    assert control._SET_PROXIMITY_TOOL in tools
+
+    # gateway-owned state restored to the preset
+    state = control.load_state()
+    assert state["volume"] == 65
+    assert state["mic_gain"] == 18
+    assert state["brightness"] == 40
+    assert state["led"]["brightness"] == 80
+    assert state["led"]["idle"] == {"on": True, "r": 10, "g": 20, "b": 30}
+    # heartbeat gestures applied via the runner
+    assert gw._heartbeat.gestures_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_apply_preset_muted_restores_mute_state():
+    gw = FakeGateway()
+    snap = _sample_snapshot()
+    snap["muted"] = True
+    snap["volume"] = 0
+    snap["pre_mute_volume"] = 55
+    await control.save_preset("quiet", snap)
+    result = await control.apply_preset(gw, "quiet")
+    assert result["ok"] is True
+    state = control.load_state()
+    assert state["muted"] is True
+    assert state["volume"] == 0
+    assert state["pre_mute_volume"] == 55
+
+
+@pytest.mark.asyncio
+async def test_apply_preset_not_found():
+    gw = FakeGateway()
+    result = await control.apply_preset(gw, "nope")
+    assert result["ok"] is False
+    assert "not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_apply_preset_refused_during_voice_turn():
+    gw = FakeGateway()
+    gw.voice_turn_active = True
+    await control.save_preset("scene", _sample_snapshot())
+    result = await control.apply_preset(gw, "scene")
+    assert result["ok"] is False
+    assert "busy" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_apply_preset_reports_device_failures():
+    gw = FakeGateway(fail=True)
+    await control.save_preset("scene", _sample_snapshot())
+    result = await control.apply_preset(gw, "scene")
+    assert result["ok"] is False
+    assert result["error"] == "partial apply"
+    assert "volume" in result["failed"]
