@@ -1,21 +1,81 @@
 [English](README.md) | **日本語**
 
-# stackchan-mcp
+# stackchan-mcp-yorishiro
 
-**M5Stack 公式 [StackChan](https://docs.m5stack.com/ja/StackChan)** (2025年 Kickstarter 出荷キット) を任意の LLM クライアントから操作するための MCP (Model Context Protocol) ブリッジ。
+> **依代（よりしろ）** — 自律エージェントに身体を与える。
 
-> [stack-chan プロジェクト](https://github.com/stack-chan/stack-chan)（ししかわ／石川真也 さんが 2021 年に公開）のコミュニティから生まれ、M5Stack 公式が製品化した StackChan キットを対象としています。
+[![build](https://github.com/tqk1/stackchan-mcp-yorishiro/actions/workflows/build.yml/badge.svg?branch=develop)](https://github.com/tqk1/stackchan-mcp-yorishiro/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![firmware: GPL-3.0 opt-in](https://img.shields.io/badge/firmware-MIT%20%C2%B7%20GPL--3.0%20opt--in-blue.svg)](firmware/main/boards/stackchan/SCServo_lib_LICENSE.txt)
+
+**stackchan-mcp-yorishiro** は [kisaragi-mochi/stackchan-mcp](https://github.com/kisaragi-mochi/stackchan-mcp) のハードフォークです。
+
+上流は、任意の LLM クライアントから [M5Stack StackChan](https://docs.m5stack.com/ja/StackChan) を**オンデマンドで**操作する、開発者向けの綺麗な **MCP (Model Context Protocol) ブリッジ**です。本フォークはそのブリッジを、**常駐する物理的なコンパニオン**へと育てます — 自律エージェントが StackChan に*宿り*、触れれば聞き、自分の声で答え、手をかざせば自分から反応し、家電操作のような用事をこなし、ときには自分のタイミングで話しかけてくる存在です。
+
+> *依代（よりしろ）* は、神霊を招いて宿らせる対象を指す言葉です。ここでの「霊」は自律エージェント（本プロジェクトでは [Hermes](https://nousresearch.com/) ベースのエージェント）であり、StackChan はそれが宿る器です。
+
+> ⚠️ **これは方向性を意図的に分岐させた、こだわりの個人フォーク**です。綺麗な開発者向け MCP ブリッジが欲しいだけなら、[upstream](https://github.com/kisaragi-mochi/stackchan-mcp) をそのまま使ってください。エージェント固有の改造を上流へ push することはしませんが、上流の改善（特に音声系）は積極的に取り込みます — [`docs/firmware-sync.md`](docs/firmware-sync.md) 参照。
+
+## 謝辞
+
+このフォークは、先人たちの仕事の上にまるごと成り立っています。深く感謝します:
+
+- **[kisaragi-mochi/stackchan-mcp](https://github.com/kisaragi-mochi/stackchan-mcp)**（MIT） — 直接の上流。本フォークが土台にしている gateway アーキテクチャ・MCP ツール群・ファームウェア統合は、すべて彼らの仕事です。
+- **[78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)**（MIT） — デバイスファームウェアの基盤となった ESP32 LLM クライアントファームウェア（[kisaragi-mochi/xiaozhi-esp32](https://github.com/kisaragi-mochi/xiaozhi-esp32) フォーク経由で取り込み）。
+- **[stack-chan プロジェクト](https://github.com/stack-chan/stack-chan)**（ししかわ／石川真也 さん） — StackChan そのものと、それを取り巻く OSS 文化の発端（2021 年）。
+- **[m5stack-avatar](https://github.com/stack-chan/m5stack-avatar)**、**[Feetech](https://www.feetechrc.com/)** SCServo SDK、そして公式 StackChan キットとハードウェアを提供する **[M5Stack](https://m5stack.com/)**。
+
+彼らの仕事なしに、これは存在しません。🙏
+
+## 上流との違い
+
+| | 上流 (`stackchan-mcp`) | 本フォーク (`yorishiro`) |
+|---|---|---|
+| 主な用途 | LLM クライアントが**オンデマンドで**叩く綺麗な MCP ツール面 | 自律エージェントが宿る**常駐型の身体化コンパニオン** |
+| 音声 | `say` / `listen` ツール | **タップ → STT → エージェント → TTS** の会話ループ（ローカル優先） |
+| 自律性 | なし（reactive なツールのみ） | デバイス内反射 + opt-in の **heartbeat**（価値があるときだけ話す） |
+| デバイスの外 | — | **家電操作**（SwitchBot）・Web 検索・ノート・**コンパニオンダッシュボード** |
+
+## 機能
+
+Phase A〜F を通じて積み上げてきました（全体像は [ドキュメント索引](#ドキュメント索引) を参照）:
+
+- 🗣️ **音声対話** — 画面タップ（または背面なで）で録音し、文字起こし（whisper / faster-whisper）して考え、TTS（VOICEVOX）で声を返す。常時聞き取りはしない。
+- ⚡ **ローカル優先の応答ルーティング** — 短く単純な発話は小さな**ローカル LLM**（~0.5 秒）が答え、しっかり考える必要があるものはメインエージェントへ。失敗時は自動フォールバック。ダッシュボードのトグルで、すべてをメインエージェントに固定することもできる。
+- 👋 **ファーム自律の反射** — 近接センサ（LTR-553）による手かざし視線反射を**デバイス内で完結**（エージェントへの往復なし）。タップ／なでのタッチもローカルで検知。閾値は実行時に変更でき、NVS に永続化。
+- 💓 **通知型 heartbeat**（opt-in） — 低頻度のアイドル仕草に加え、ときおり**音声で通知**（朝の降水確認・夜のノート）。静かな時間帯・クールダウン・1日の上限つき。会話中は決して割り込まない。
+- 🏠 **家電操作** — SwitchBot Cloud API で家電を操作（一覧／状態／コマンド送信）。
+- 📱 **コンパニオンダッシュボード** — 音量・マイク感度・明るさ・LED・首の向き・近接をその場で調整できるスマホ向け Web パネル（別管理）。**モードプリセット**の保存／適用、応答モードや通知のトグルも。
+- 🎛️ **デバイス内カスタマイズ** — 首の中立姿勢・カスタムウェイクワード・アバターを NVS 永続で保持し、可能な範囲で再書き込みなしに調整。
+
+## アーキテクチャ
 
 ```
-┌─────────────┐     stdio MCP      ┌──────────────┐    WebSocket MCP    ┌──────────────┐
-│ MCP client  │ ─────────────────▶ │   gateway    │ ──────────────────▶ │ ESP32 (CoreS3│
-│ (Claude等)  │ ◀───────────────── │  (Python)    │ ◀────────────────── │  +StackChan) │
-└─────────────┘                    │              │                     └──────────────┘
-                                   │  /capture    │ ◀── HTTP POST (JPEG) ──┘
-                                   └──────────────┘
+       ┌──────────────────────────────────────────────┐
+       │  Autonomous agent (Hermes-based)             │
+       │  — runs on your own server                   │
+       └──────────────────────┬───────────────────────┘
+                              │  stdio MCP (or streamable-http)
+                              ▼
+       ┌──────────────────────────────────────────────┐     HTTP
+       │  gateway (Python · this repo)                │ ─────────▶ whisper / faster-whisper (STT)
+       │                                              │ ─────────▶ VOICEVOX (TTS)
+       │  · MCP tool surface   · response routing     │ ─────────▶ SwitchBot Cloud (smart home)
+       │  · voice-turn loop    · heartbeat            │ ◀─ control ─ companion dashboard (separate)
+       └──────────────────────┬───────────────────────┘
+                              │  WebSocket MCP  +  HTTP /capture (JPEG)
+                              ▼
+       ┌──────────────────────────────────────────────┐
+       │  StackChan firmware (ESP32-S3 CoreS3)        │
+       │  xiaozhi-esp32 fork                          │
+       │  · avatar / face-status   · wake word        │
+       │  · proximity & touch reflexes (on-device)    │
+       └──────────────────────────────────────────────┘
 ```
 
-任意の MCP クライアント (Claude Code / Claude Desktop / 他) から、首振り・カメラ撮影・タッチセンサ・アバター表情切替などの StackChan 操作を呼び出せる。
+ホスト・IP アドレス・トークンはローカルで設定し、コミットしません — [`docs/architecture.md`](docs/architecture.md) と [`docs/remote-access.md`](docs/remote-access.md) を参照。
+
+任意の MCP クライアント (Claude Code / Claude Desktop / 他) から、首振り・カメラ撮影・タッチ読み取り・アバター/LED 制御・`say` / `listen` などの StackChan 操作を直接呼び出すこともできます。ツール一覧は下記。
 
 ## 構成
 
@@ -71,11 +131,11 @@
 
 ### 1. ファームウェア書き込み (CoreS3)
 
-書き込み方法は 2 通り。エンドユーザーには **オプション A**（事前ビルド済みバイナリ）が手早く、ツールチェーンのセットアップ不要。コントリビュータがソースからビルドしたい場合は **オプション B**。
+> **本フォークでは、ソースからビルドしてください（オプション B）。** yorishiro のファームウェアには、近接リフレックスの調整・カスタムウェイクワード・首の中立姿勢の永続化・画面上のステータス表示・LED の「聞き取り中」モードといった**デバイス内機能**が追加されており、これらは上流の事前ビルド済みバイナリには**含まれません**。下記のオプション A は*上流のベースファームウェア*を焼くもので、最初の動作確認には十分ですが、これらの追加機能は入りません。
 
-#### オプション A: 事前ビルド済みバイナリを焼く（エンドユーザー向け、推奨）
+#### オプション A: 上流の事前ビルド済みバイナリを焼く（ベースファーム / yorishiro 機能なし）
 
-[Releases ページ](https://github.com/kisaragi-mochi/stackchan-mcp/releases) から最新の `firmware-v*` リリースを開き、`merged-binary.bin`（必要なら `xiaozhi.bin` も）をダウンロード。あとは `esptool.py` で焼くだけ:
+上流の [Releases ページ](https://github.com/kisaragi-mochi/stackchan-mcp/releases) から最新の `firmware-v*` リリースを開き、`merged-binary.bin`（必要なら `xiaozhi.bin` も）をダウンロード。あとは `esptool.py` で焼くだけ:
 
 ```bash
 # --port は使っている OS のシリアルデバイス名に置き換えてください:
@@ -94,7 +154,7 @@ esptool.py --chip esp32s3 --port /dev/cu.usbmodem1101 -b 460800 \
 
 ESP-IDF や Docker のセットアップは不要。
 
-#### オプション B: ソースから Docker でビルド（コントリビュータ向け）
+#### オプション B: ソースから Docker でビルド（本フォーク推奨）
 
 このリポジトリは `firmware/components/` 配下に git submodule を使っています。
 `--recursive` を付けずに clone した場合は、先に初期化してください:
@@ -239,11 +299,9 @@ EOF
 
 ### 2. ゲートウェイ起動
 
-ゲートウェイは PyPI で公開されているパッケージをインストールする方法
-(エンドユーザー向け) と、このリポジトリのチェックアウトから動かす方法
-(`main` を追いたいコントリビュータ向け) のどちらでも使えます。
+> **本フォークでは、このリポジトリの `gateway/` から動かしてください（オプション B）。** PyPI で公開されている `stackchan-mcp` パッケージは**上流の** gateway で、yorishiro の追加機能（応答ルーティング・SwitchBot・heartbeat・ダッシュボード制御 API）を含みません。上流の gateway が欲しい場合のみ PyPI パッケージを使ってください。
 
-#### オプション A: ツールとしてインストール (エンドユーザー向け、推奨)
+#### オプション A: 上流をツールとしてインストール (上流 gateway のみ)
 
 システム Python や他の Python プロジェクトと衝突しない、隔離された
 インストールを行うには、以下のいずれかを使います:
@@ -269,7 +327,7 @@ Python に対して直接 `pip install` するのは避けてください (PEP 6
 `STACKCHAN_TOKEN` / `VISION_HOST` 等の設定値は、環境変数・シェル・
 カレントディレクトリの `.env` ファイルのいずれからでも渡せます。
 
-#### オプション B: ソースから uv で起動 (コントリビュータ向け)
+#### オプション B: ソースから uv で起動 (本フォーク推奨)
 
 ```bash
 cd gateway
@@ -757,6 +815,31 @@ M5Stack 公式ドキュメントには以下の警告があります:
 X 軸 (yaw、`-90..+90°`) には同等のハードウェア制限はなく — M5Stack 公式が「X 軸には角度制限は不要」と明記しています — 宣言範囲全体を使えます。
 
 下限の経緯は [#80](https://github.com/kisaragi-mochi/stackchan-mcp/issues/80)、2 層ガードへの拡張 (firmware ハードクランプ `30°` → `88°`、M5Stack 推奨 `5..85°` をソフトシグナル層に格上げ) は [#98](https://github.com/kisaragi-mochi/stackchan-mcp/issues/98) を参照してください。
+
+## 設計原則
+
+身体化を「速く・予測可能で・邪魔をしない」ものに保つための、いくつかのルールです:
+
+1. **明示的トリガーのみ** — 常時起動の音声検出（VAD）は使わない。明示的なトリガー（画面タップ・背面なで・任意のウェイクワード）でのみ聞き取りを開始する。
+2. **低レベルの反射はデバイス側で** — 近接視線・タッチ反応などの反射はファームウェアで処理し、エージェントを経由させない。即応性を保ち、ちょっとした仕草にトークンを使わない。
+3. **解釈だけをエージェントへ** — 会話・判断・家電操作・検索といった「解釈の要るもの」だけをエージェントに渡す。生のセンサノイズは渡さない。
+4. **エージェントは reactive のまま** — 自律性（heartbeat）はエージェント本体を改造せず、独立した opt-in かつレート制限つきの層として実装する。
+5. **まずレイテンシ優先（暫定）** — 音声品質より応答速度を優先。高品質なハイブリッド経路は将来の課題とする。
+
+## ドキュメント索引
+
+設計メモ・各 Phase の振り返り・作業ログ一式は [`docs/`](docs/) にあります — まずは [`docs/README.md`](docs/README.md) から。主なもの:
+
+- [`docs/architecture.md`](docs/architecture.md) — コンポーネント図・ツール名マッピング・写真フロー・認証・接続ライフサイクル。
+- [`docs/firmware-sync.md`](docs/firmware-sync.md) — 上流 xiaozhi-esp32 / kisaragi-mochi の変更を downstream に取り込む手順。
+- [`docs/remote-access.md`](docs/remote-access.md) — LAN 外から gateway へ到達する方法（Tailscale Funnel）。
+- **開発の物語** — デバイスは Phase A〜F を通じて育ちました:
+  [A](docs/phase-a-report.md) 器を起こす ·
+  [B](docs/phase-b-report.md) 聞いて・考えて・喋る ·
+  [C](docs/phase-c-report.md) 速く答えて家電を操る ·
+  [D](docs/phase-d-report.md) ひとりで動き道具を使う ·
+  [E](docs/phase-e-report.md) 価値があるときだけ話す ·
+  [F](docs/phase-f-report.md) スマホから整える。
 
 ## ライセンス
 

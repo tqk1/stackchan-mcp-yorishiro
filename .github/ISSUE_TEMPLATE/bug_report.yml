@@ -1,0 +1,127 @@
+name: Bug report
+description: Report a reproducible problem in the gateway or firmware.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please keep the report focused
+        on public, technical context that helps another builder reproduce the
+        problem.
+
+        For a suspected **security vulnerability**, do not file a public issue.
+        See [SECURITY.md](https://github.com/tqk1/stackchan-mcp-yorishiro/blob/develop/SECURITY.md) instead.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I reproduced this against the current `develop` branch.
+          required: false
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A clear, concise description of what is wrong.
+      placeholder: e.g. "move_head ignores the pitch argument after a reconnect."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps. Include the MCP tool call(s) or commands you ran.
+      placeholder: |
+        1. Start the gateway with `uv run ...`
+        2. Connect the device
+        3. Call `move_head` with ...
+        4. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      description: Which part of the repository does this involve?
+      multiple: true
+      options:
+        - gateway (Python MCP gateway)
+        - firmware (ESP32 / StackChan board)
+        - docs
+        - build / CI
+        - not sure
+    validations:
+      required: true
+  - type: input
+    id: gateway-version
+    attributes:
+      label: Gateway version / commit
+      description: Output of `git rev-parse --short HEAD`, a tag, or "n/a".
+      placeholder: e.g. develop @ abc1234
+    validations:
+      required: false
+  - type: input
+    id: firmware-version
+    attributes:
+      label: Firmware version / release archive
+      description: e.g. the `releases/*.zip` you flashed, a tag, or "n/a".
+      placeholder: e.g. v2.2.6_stackchan
+    validations:
+      required: false
+  - type: input
+    id: host-os
+    attributes:
+      label: Host OS / runtime
+      description: OS and version where the gateway runs, plus Python / Docker / ESP-IDF versions if relevant.
+      placeholder: e.g. Ubuntu 24.04, Python 3.12, espressif/idf:v5.5.2
+    validations:
+      required: false
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware setup
+      description: |
+        For device-related bugs, describe your hardware. If you do not have
+        hardware and the bug is gateway-only, write "gateway only, no device".
+      placeholder: |
+        - Board: M5Stack CoreS3
+        - Kit: M5Stack official StackChan (Kickstarter 2025)
+        - Neck servos: SCS0009 x2 (yaw + pitch)
+        - Extras connected: camera, proximity sensor, etc.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Relevant gateway logs and/or firmware serial output. Paste as text in a
+        code block, not as a screenshot. Redact anything private (IPs, hostnames,
+        tokens) before pasting.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Anything else that helps — screenshots of on-screen avatar state, frequency, regressions, etc.
+    validations:
+      required: false

@@ -1,21 +1,81 @@
 **English** | [日本語](README.ja.md)
 
-# stackchan-mcp
+# stackchan-mcp-yorishiro
 
-An MCP (Model Context Protocol) bridge for the **M5Stack official [StackChan](https://docs.m5stack.com/ja/StackChan)** (2025 Kickstarter shipping kit), letting any LLM client drive the device.
+> **依代 (yorishiro)** — giving an autonomous agent a body.
 
-> Born out of the [stack-chan project](https://github.com/stack-chan/stack-chan) community (originated by Shinya Ishikawa in 2021). This repository targets the M5Stack official StackChan kit that grew out of that lineage.
+[![build](https://github.com/tqk1/stackchan-mcp-yorishiro/actions/workflows/build.yml/badge.svg?branch=develop)](https://github.com/tqk1/stackchan-mcp-yorishiro/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![firmware: GPL-3.0 opt-in](https://img.shields.io/badge/firmware-MIT%20%C2%B7%20GPL--3.0%20opt--in-blue.svg)](firmware/main/boards/stackchan/SCServo_lib_LICENSE.txt)
+
+**stackchan-mcp-yorishiro** is a hard fork of [kisaragi-mochi/stackchan-mcp](https://github.com/kisaragi-mochi/stackchan-mcp).
+
+The upstream project is a clean, developer-facing **MCP (Model Context Protocol) bridge** that lets any LLM client drive an [M5Stack StackChan](https://docs.m5stack.com/ja/StackChan) on demand. This fork grows that bridge into a **standalone, always-present physical companion**: an autonomous agent that *lives in* the StackChan. It listens when you touch it, answers in its own voice, reacts to your hand on its own, runs errands like smart-home control, and can even speak up on its own schedule.
+
+> *依代 (yorishiro)* is a Japanese word for an object a spirit is invited to dwell in. Here the "spirit" is an autonomous agent (a [Hermes](https://nousresearch.com/)-based agent in this project's setup), and the StackChan is the vessel it inhabits.
+
+> ⚠️ **This is an opinionated personal fork** that intentionally diverges from upstream in direction. If you just want the clean developer-facing MCP bridge, use [upstream](https://github.com/kisaragi-mochi/stackchan-mcp) directly. This fork does not push its agent-specific changes back upstream, but it actively merges upstream's improvements (especially the audio stack) downstream — see [`docs/firmware-sync.md`](docs/firmware-sync.md).
+
+## Acknowledgements
+
+This fork stands entirely on the shoulders of others. Deep thanks to:
+
+- **[kisaragi-mochi/stackchan-mcp](https://github.com/kisaragi-mochi/stackchan-mcp)** (MIT) — the direct upstream. The gateway architecture, the MCP tool surface, and the firmware integration this fork builds on are theirs.
+- **[78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)** (MIT) — the ESP32 LLM-client firmware the device firmware is based on (taken in via the [kisaragi-mochi/xiaozhi-esp32](https://github.com/kisaragi-mochi/xiaozhi-esp32) fork).
+- **[stack-chan project](https://github.com/stack-chan/stack-chan)** by Shinya Ishikawa (ししかわ) — the originator (2021) of StackChan and the open-source culture around it.
+- **[m5stack-avatar](https://github.com/stack-chan/m5stack-avatar)**, the **[Feetech](https://www.feetechrc.com/)** SCServo SDK, and **[M5Stack](https://m5stack.com/)** for the hardware and the official StackChan kit.
+
+None of this would exist without their work. 🙏
+
+## How this fork differs from upstream
+
+| | upstream (`stackchan-mcp`) | this fork (`yorishiro`) |
+|---|---|---|
+| Primary use | A clean MCP tool surface an LLM client drives **on demand** | A **standalone embodied companion** an autonomous agent inhabits |
+| Voice | `say` / `listen` tools | A full **touch → STT → agent → TTS** conversation loop, local-first |
+| Autonomy | none (reactive tools only) | on-device reflexes + opt-in **heartbeat** (speaks only when it matters) |
+| Beyond the device | — | **smart-home** (SwitchBot), web search, notes, a **companion dashboard** |
+
+## Features
+
+Built up across phases A–F (see the [Documentation map](#documentation-map) for the full story):
+
+- 🗣️ **Voice conversation** — tap the screen (or stroke the back of the head); it records, transcribes (whisper / faster-whisper), thinks, and speaks back via TTS (VOICEVOX). No always-on listening.
+- ⚡ **Local-first response routing** — short, simple utterances are answered by a small **local LLM** (~0.5 s); anything that needs real thought is routed to the main agent, with automatic fallback. A dashboard toggle can pin everything to the main agent.
+- 👋 **Firmware-autonomous reflexes** — a proximity sensor (LTR-553) drives a hand-wave gaze reflex **entirely on-device** (no round-trip to the agent); touch (tap / stroke) is sensed locally too. Thresholds are runtime-configurable and persisted to NVS.
+- 💓 **Notify-style heartbeat** *(opt-in)* — low-frequency idle gestures, plus occasional **spoken notifications** (morning rain check, evening notes) with quiet hours, cooldowns, and a daily cap. Never interrupts an active conversation.
+- 🏠 **Smart-home control** — drive appliances through the SwitchBot Cloud API (list / status / send command).
+- 📱 **Companion dashboard** — a phone-friendly web panel (maintained separately) to tune volume, mic gain, brightness, LEDs, neck pose and proximity live; save/apply **mode presets**; toggle response mode and notifications.
+- 🎛️ **On-device customization** — neutral head pose, custom wake word, and avatar, NVS-persisted and adjustable without reflashing where possible.
+
+## Architecture
 
 ```
-┌─────────────┐     stdio MCP      ┌──────────────┐    WebSocket MCP    ┌──────────────┐
-│ MCP client  │ ─────────────────▶ │   gateway    │ ──────────────────▶ │ ESP32 (CoreS3│
-│ (e.g.Claude)│ ◀───────────────── │  (Python)    │ ◀────────────────── │  +StackChan) │
-└─────────────┘                    │              │                     └──────────────┘
-                                   │  /capture    │ ◀── HTTP POST (JPEG) ──┘
-                                   └──────────────┘
+       ┌──────────────────────────────────────────────┐
+       │  Autonomous agent (Hermes-based)             │
+       │  — runs on your own server                   │
+       └──────────────────────┬───────────────────────┘
+                              │  stdio MCP (or streamable-http)
+                              ▼
+       ┌──────────────────────────────────────────────┐     HTTP
+       │  gateway (Python · this repo)                │ ─────────▶ whisper / faster-whisper (STT)
+       │                                              │ ─────────▶ VOICEVOX (TTS)
+       │  · MCP tool surface   · response routing     │ ─────────▶ SwitchBot Cloud (smart home)
+       │  · voice-turn loop    · heartbeat            │ ◀─ control ─ companion dashboard (separate)
+       └──────────────────────┬───────────────────────┘
+                              │  WebSocket MCP  +  HTTP /capture (JPEG)
+                              ▼
+       ┌──────────────────────────────────────────────┐
+       │  StackChan firmware (ESP32-S3 CoreS3)        │
+       │  xiaozhi-esp32 fork                          │
+       │  · avatar / face-status   · wake word        │
+       │  · proximity & touch reflexes (on-device)    │
+       └──────────────────────────────────────────────┘
 ```
 
-From any MCP client (Claude Code / Claude Desktop / others) you can call StackChan operations such as head movement, camera capture, touch sensor reads, and avatar expression switches.
+Hosts, IP addresses and tokens are configured locally and never committed — see [`docs/architecture.md`](docs/architecture.md) and [`docs/remote-access.md`](docs/remote-access.md).
+
+From any MCP client (Claude Code / Claude Desktop / others) you can also drive StackChan operations directly — head movement, camera capture, touch reads, avatar/LED control, `say` / `listen`. The full tool list is below.
 
 ## Repository layout
 
@@ -71,11 +131,11 @@ See `gateway/README.md` for full schemas.
 
 ### 1. Flash the firmware (CoreS3)
 
-There are two paths. **Option A** is recommended for first-time users — no toolchain setup needed. **Option B** is for contributors who want to build from source.
+> **For this fork, build from source (Option B).** The yorishiro firmware adds on-device features — proximity reflex tuning, a custom wake word, neutral-pose persistence, on-screen status text, an LED "listening" mode — that are **not** in upstream's pre-built binaries. Option A below flashes the *upstream base firmware* and is fine for a first smoke-test, but it will not include those additions.
 
-#### Option A: Flash a pre-built binary (recommended for end users)
+#### Option A: Flash a pre-built upstream binary (base firmware, no yorishiro additions)
 
-Download the latest firmware bundle from the [Releases page](https://github.com/kisaragi-mochi/stackchan-mcp/releases) — pick the most recent `firmware-v*` release and grab `merged-binary.bin` (and optionally `xiaozhi.bin`). Then flash with `esptool.py`:
+Download the latest firmware bundle from upstream's [Releases page](https://github.com/kisaragi-mochi/stackchan-mcp/releases) — pick the most recent `firmware-v*` release and grab `merged-binary.bin` (and optionally `xiaozhi.bin`). Then flash with `esptool.py`:
 
 ```bash
 # Replace --port with your platform's serial device:
@@ -94,7 +154,7 @@ esptool.py --chip esp32s3 --port /dev/cu.usbmodem1101 -b 460800 \
 
 No ESP-IDF or Docker setup needed.
 
-#### Option B: Build from source with Docker (for contributors)
+#### Option B: Build from source with Docker (recommended for this fork)
 
 This repository uses git submodules under `firmware/components/`. If you
 cloned without `--recursive`, initialize them first:
@@ -290,11 +350,9 @@ cannot be added accidentally with `git add -A`.
 
 ### 2. Start the gateway
 
-The gateway can either be installed as the published PyPI package
-(recommended for end users) or run from this repository as a checkout
-(recommended for contributors who want to follow `main`).
+> **For this fork, run the gateway from this repository's `gateway/` (Option B).** The published PyPI package `stackchan-mcp` is **upstream's** gateway and does not include yorishiro's additions (response routing, SwitchBot, heartbeat, the dashboard control API). Install the PyPI package only if you specifically want the upstream gateway.
 
-#### Option A: install as a tool (recommended for end users)
+#### Option A: install upstream as a tool (upstream gateway only)
 
 For an isolated install that does not collide with your system Python or
 other Python projects, use one of:
@@ -320,7 +378,7 @@ The `STACKCHAN_TOKEN`, `VISION_HOST`, and other settings documented in
 [`gateway/README.md`](gateway/README.md#setup) can be supplied via environment
 variables, the active shell, or a `.env` file in the working directory.
 
-#### Option B: from source via uv (contributors)
+#### Option B: from source via uv (recommended for this fork)
 
 ```bash
 cd gateway
@@ -812,6 +870,31 @@ See [#80](https://github.com/kisaragi-mochi/stackchan-mcp/issues/80) for the low
 
 - The servo bus may hang on large-angle abrupt reversals (e.g. +60° → -60°). A fix is in progress via Motion::update_task interpolation.
 - The touch sensor (Si12T) occasionally drops tap events. Sensitivity register tuning has room to improve here.
+
+## Design principles
+
+A few rules keep the embodiment fast, predictable, and unobtrusive:
+
+1. **Explicit triggers only** — no always-on voice activity detection. The device listens only on an explicit trigger (screen tap, back-of-head stroke, or an optional wake word).
+2. **Low-level reflexes run on the device** — proximity gaze, touch reactions and similar reflexes are handled in firmware, never routed through the agent. This keeps them instant and avoids spending tokens on twitches.
+3. **Only interpretation goes to the agent** — conversation, decisions, smart-home actions and searches are what the agent sees; raw sensor noise is not.
+4. **The agent stays reactive** — autonomy (the heartbeat) is a separate, opt-in, rate-limited layer rather than a change to the agent itself.
+5. **Latency first (for now)** — response speed is prioritized over audio fidelity; a higher-quality hybrid path is left as future work.
+
+## Documentation map
+
+Design notes, per-phase retrospectives and a full worklog live under [`docs/`](docs/) — start at [`docs/README.md`](docs/README.md). Highlights:
+
+- [`docs/architecture.md`](docs/architecture.md) — component diagram, tool-name mapping, photo flow, auth, connection lifecycle.
+- [`docs/firmware-sync.md`](docs/firmware-sync.md) — how upstream xiaozhi-esp32 / kisaragi-mochi changes are merged downstream.
+- [`docs/remote-access.md`](docs/remote-access.md) — reaching the gateway from outside the LAN (Tailscale Funnel).
+- **Development story** — the device grew across phases A–F:
+  [A](docs/phase-a-report.md) wake the vessel ·
+  [B](docs/phase-b-report.md) listen / think / speak ·
+  [C](docs/phase-c-report.md) answer fast, control appliances ·
+  [D](docs/phase-d-report.md) act alone, use tools ·
+  [E](docs/phase-e-report.md) speak only when it matters ·
+  [F](docs/phase-f-report.md) tune it from your phone.
 
 ## License
 

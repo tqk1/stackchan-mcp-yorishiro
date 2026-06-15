@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Upstream project (kisaragi-mochi/stackchan-mcp)
+    url: https://github.com/kisaragi-mochi/stackchan-mcp
+    about: >-
+      This repository is a hard fork. For questions about the original
+      developer-facing MCP bridge, or issues that reproduce on upstream too,
+      please use the upstream project.
