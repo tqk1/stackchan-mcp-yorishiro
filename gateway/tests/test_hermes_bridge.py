@@ -190,10 +190,13 @@ def _patch_voice_pipeline(
 
     monkeypatch.setattr(stt_mod, "get_registry", lambda: _Registry())
 
-    async def fake_generate_reply(text):
+    async def fake_generate_reply(text, *, force_hermes=False):
         return reply, route
 
     monkeypatch.setattr(hermes_bridge, "generate_reply", fake_generate_reply)
+    # The turn reads the persisted Hermes-pin flag; default it off so
+    # tests never touch the real ~/.stackchan control state.
+    monkeypatch.setattr(control, "routing_force_hermes", lambda: False)
 
     async def fake_send(arguments, *, gateway=None, **kw):
         return {"frame_count": 1}
@@ -290,7 +293,7 @@ async def test_voice_turn_clears_status_when_brain_fails(monkeypatch):
     seen = _record_status_text(monkeypatch)
     _patch_voice_pipeline(monkeypatch, transcript="天気は")
 
-    async def boom(text):
+    async def boom(text, *, force_hermes=False):
         raise RuntimeError("hermes down")
 
     monkeypatch.setattr(hermes_bridge, "generate_reply", boom)
@@ -442,3 +445,76 @@ async def test_voice_turn_tts_failure_not_recorded(monkeypatch):
     # A TTS failure returns before the recording hook.
     assert control.get_conversation()["turns"] == []
     control._CONVERSATION.clear()
+
+
+# ---- Hermes-pin routing toggle (force_hermes) ------------------------
+
+
+@pytest.mark.asyncio
+async def test_generate_reply_force_hermes_bypasses_local(monkeypatch):
+    from stackchan_mcp import local_llm
+
+    monkeypatch.setattr(local_llm, "is_enabled", lambda: True)
+    monkeypatch.setattr(local_llm, "decide_route", lambda _t: local_llm.ROUTE_LOCAL)
+    called = {"local": False}
+
+    async def fake_local(text, *, system_prompt):
+        called["local"] = True
+        return "ローカル"
+
+    async def fake_hermes(text):
+        return "ハーメス"
+
+    monkeypatch.setattr(local_llm, "ask_local", fake_local)
+    monkeypatch.setattr(hermes_bridge, "ask_hermes", fake_hermes)
+
+    reply, route = await hermes_bridge.generate_reply("短い", force_hermes=True)
+
+    assert (reply, route) == ("ハーメス", local_llm.ROUTE_HERMES)
+    assert called["local"] is False  # the local fast-path was skipped
+
+
+@pytest.mark.asyncio
+async def test_generate_reply_default_keeps_local(monkeypatch):
+    from stackchan_mcp import local_llm
+
+    monkeypatch.setattr(local_llm, "is_enabled", lambda: True)
+    monkeypatch.setattr(local_llm, "decide_route", lambda _t: local_llm.ROUTE_LOCAL)
+
+    async def fake_local(text, *, system_prompt):
+        return "ローカル"
+
+    monkeypatch.setattr(local_llm, "ask_local", fake_local)
+
+    reply, route = await hermes_bridge.generate_reply("短い")
+
+    assert (reply, route) == ("ローカル", local_llm.ROUTE_LOCAL)
+
+
+@pytest.mark.asyncio
+async def test_voice_turn_force_hermes_lights_hermes_and_passes_flag(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    _record_status_text(monkeypatch)
+    rec = _record_device_cosmetics(monkeypatch)
+    # The rule-based classifier would pick LOCAL, but the pin forces Hermes.
+    _force_route_hint(monkeypatch, "local")
+    _patch_voice_pipeline(
+        monkeypatch, transcript="やあ", reply="こんにちは", route="hermes"
+    )
+    monkeypatch.setattr(control, "routing_force_hermes", lambda: True)
+    seen: dict[str, bool] = {}
+
+    async def fake_gr(text, *, force_hermes=False):
+        seen["force_hermes"] = force_hermes
+        return "こんにちは", "hermes"
+
+    monkeypatch.setattr(hermes_bridge, "generate_reply", fake_gr)
+    gateway = _StubGateway()
+
+    response = await hermes_bridge.handle_voice_turn(_make_voice_request(gateway))
+
+    assert response.status == 200
+    # The pin is threaded into generate_reply.
+    assert seen["force_hermes"] is True
+    # LED hint lights Hermes pre-call despite decide_route == local.
+    assert rec["led"] == ["listening", "hermes", "hermes", "idle"]

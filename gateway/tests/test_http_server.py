@@ -1012,6 +1012,29 @@ async def test_control_heartbeat_toggles_gestures() -> None:
 
 
 @pytest.mark.asyncio
+async def test_control_routing_sets_force_hermes(monkeypatch) -> None:
+    monkeypatch.delenv("STACKCHAN_LOCAL_LLM_MODEL", raising=False)
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/routing", json={"force_hermes": True})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "force_hermes": True}
+        # The persisted flag is surfaced back in GET /control/status.
+        body = (await client.get("/control/status")).json()
+    assert body["routing"] == {"force_hermes": True, "local_enabled": False}
+
+
+@pytest.mark.asyncio
+async def test_control_routing_rejects_non_bool() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/routing", json={"force_hermes": "yes"})
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_control_heartbeat_503_when_no_runner() -> None:
     gateway = ControlFakeGateway(heartbeat=None)
     app = _build_control_app(gateway)

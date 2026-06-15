@@ -177,7 +177,7 @@ async def ask_hermes(text: str) -> str:
     return reply.strip()
 
 
-async def generate_reply(text: str) -> tuple[str, str]:
+async def generate_reply(text: str, *, force_hermes: bool = False) -> tuple[str, str]:
     """Produce the reply for one transcript, returning ``(reply, route)``.
 
     With local routing opted in (``STACKCHAN_LOCAL_LLM_MODEL`` set) and
@@ -185,10 +185,13 @@ async def generate_reply(text: str) -> tuple[str, str]:
     the local Ollama model answers; on any local failure (timeout,
     connection refused, bad response) the turn falls back to Hermes so
     routing can never kill a conversation. ``route`` is ``"local"`` or
-    ``"hermes"``.
+    ``"hermes"``. With ``force_hermes`` set (the dashboard's Hermes-pin
+    toggle) the local fast-path is skipped entirely and every turn goes
+    to Hermes.
     """
     if (
-        local_llm.is_enabled()
+        not force_hermes
+        and local_llm.is_enabled()
         and local_llm.decide_route(text) == local_llm.ROUTE_LOCAL
     ):
         system_prompt = os.getenv(
@@ -359,17 +362,22 @@ async def _run_voice_turn(
 
     logger.info("voice_turn: transcript=%r session=%s", transcript[:120], session_id)
     await control.set_device_status_text(gateway, control.STATUS_THINKING)
+    # The dashboard's Hermes-pin toggle (persisted in the control state):
+    # read once per turn and thread into both the LED hint and the reply
+    # routing so a pinned turn lights the Hermes colour immediately.
+    force_hermes = control.routing_force_hermes()
     # Phase 2 LED: light the colour for whichever brain is about to run,
     # so it reads as "Hermes is thinking" in real time (same rule-based
     # classifier generate_reply uses). Local turns keep the listening
     # colour through their fast "preparing" phase.
     if (
-        not local_llm.is_enabled()
+        force_hermes
+        or not local_llm.is_enabled()
         or local_llm.decide_route(transcript) == local_llm.ROUTE_HERMES
     ):
         await control.apply_led_state(gateway, "hermes")
     try:
-        reply, route = await generate_reply(transcript)
+        reply, route = await generate_reply(transcript, force_hermes=force_hermes)
     except Exception as exc:
         logger.exception("voice_turn: Hermes call failed")
         return web.json_response(

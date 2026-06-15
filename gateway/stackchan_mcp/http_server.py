@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from . import control
+from . import control, local_llm
 from .notes import TOOL_NAMES as NOTES_TOOL_NAMES
 from .notify_config import NotifyConfig
 from .queue import CommandQueue, QueueFull, QueueItem, build_queue_full_error
@@ -200,6 +200,10 @@ async def _build_control_status(gateway: Any) -> dict[str, Any]:
         "led": led,
         "heartbeat": heartbeat,
         "proximity": proximity,
+        "routing": {
+            "force_hermes": state["force_hermes"],
+            "local_enabled": local_llm.is_enabled(),
+        },
     }
 
 
@@ -475,6 +479,15 @@ def build_app(
         runner.set_gestures(gestures)
         return _control_json({"ok": True, "gestures": runner.gestures_enabled})
 
+    async def control_routing(request: Request) -> JSONResponse:
+        # Gateway-only state (no device round-trip): pin every voice turn
+        # to Hermes when force_hermes is true, else auto-route.
+        body = await _read_json_body(request)
+        force = body.get("force_hermes")
+        if not isinstance(force, bool):
+            return _control_error("force_hermes must be a boolean", status=400)
+        return _control_json(control.set_routing_force_hermes(force))
+
     async def control_avatar(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
         if not gateway.esp32.device_connected:
@@ -603,6 +616,7 @@ def build_app(
         Route("/control/listen", endpoint=control_listen, methods=["POST"]),
         Route("/control/proximity", endpoint=control_proximity, methods=["POST"]),
         Route("/control/heartbeat", endpoint=control_heartbeat, methods=["POST"]),
+        Route("/control/routing", endpoint=control_routing, methods=["POST"]),
         Route("/control/avatar", endpoint=control_avatar, methods=["POST"]),
         Route("/control/say", endpoint=control_say, methods=["POST"]),
         Route(

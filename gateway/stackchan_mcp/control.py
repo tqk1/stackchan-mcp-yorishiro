@@ -58,6 +58,12 @@ MAX_PRESET_NAME_LEN = 32
 #: Default volume applied when no state file exists yet.
 DEFAULT_VOLUME = 50
 
+#: Default response routing. When True, every voice turn is pinned to
+#: Hermes and the local LLM fast-path is bypassed. Dashboard-toggleable
+#: and persisted in the control state; defaults off (auto-routing, the
+#: pre-toggle behaviour).
+DEFAULT_FORCE_HERMES = False
+
 #: Default mic gain applied when no state file exists yet (0..36).
 DEFAULT_MIC_GAIN = 30
 
@@ -276,8 +282,9 @@ def load_state() -> dict[str, Any]:
 
     Returns a dict with ``volume`` (int 0..100), ``muted`` (bool),
     ``pre_mute_volume`` (int 0..100), ``mic_gain`` (int 0..36),
-    ``brightness`` (int 0..100) and ``led`` (``{on, r, g, b}``). A
-    missing or unreadable file yields the defaults rather than raising —
+    ``brightness`` (int 0..100), ``led`` (``{on, r, g, b}``) and
+    ``force_hermes`` (bool). A missing or unreadable file yields the
+    defaults rather than raising —
     the dashboard must come up even on a fresh host.
     """
     path = _state_path()
@@ -296,6 +303,7 @@ def load_state() -> dict[str, Any]:
     mic_gain = _clamp_mic_gain(raw.get("mic_gain", DEFAULT_MIC_GAIN))
     brightness = _clamp_brightness(raw.get("brightness", DEFAULT_BRIGHTNESS))
     led = _normalize_led(raw.get("led", DEFAULT_LED))
+    force_hermes = bool(raw.get("force_hermes", DEFAULT_FORCE_HERMES))
     return {
         "volume": volume,
         "muted": muted,
@@ -303,6 +311,7 @@ def load_state() -> dict[str, Any]:
         "mic_gain": mic_gain,
         "brightness": brightness,
         "led": led,
+        "force_hermes": force_hermes,
     }
 
 
@@ -318,6 +327,7 @@ def save_state(state: dict[str, Any]) -> None:
         "mic_gain": _clamp_mic_gain(state.get("mic_gain", DEFAULT_MIC_GAIN)),
         "brightness": _clamp_brightness(state.get("brightness", DEFAULT_BRIGHTNESS)),
         "led": _normalize_led(state.get("led", DEFAULT_LED)),
+        "force_hermes": bool(state.get("force_hermes", DEFAULT_FORCE_HERMES)),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -331,6 +341,23 @@ def save_state(state: dict[str, Any]) -> None:
                 os.unlink(tmp)
     except OSError as exc:
         logger.warning("control: cannot write state file %s (%s)", path, exc)
+
+
+def routing_force_hermes() -> bool:
+    """True when voice turns are pinned to Hermes (local fast-path off).
+
+    Reads the persisted control state so the setting survives a gateway
+    restart, mirroring how volume / mic_gain / led are surfaced.
+    """
+    return bool(load_state()["force_hermes"])
+
+
+def set_routing_force_hermes(enabled: bool) -> dict[str, Any]:
+    """Persist the Hermes-pin toggle and echo the new value back."""
+    state = load_state()
+    state["force_hermes"] = bool(enabled)
+    save_state(state)
+    return {"ok": True, "force_hermes": bool(enabled)}
 
 
 async def _send_volume(gateway: "Gateway", volume: int) -> bool:

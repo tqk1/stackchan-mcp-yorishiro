@@ -52,6 +52,7 @@ def test_load_state_defaults_when_missing():
         "mic_gain": control.DEFAULT_MIC_GAIN,
         "brightness": control.DEFAULT_BRIGHTNESS,
         "led": control.DEFAULT_LED,
+        "force_hermes": False,
     }
 
 
@@ -70,6 +71,7 @@ def test_save_then_load_roundtrip(monkeypatch, tmp_path):
         "mic_gain": 18,
         "brightness": control.DEFAULT_BRIGHTNESS,
         "led": control.DEFAULT_LED,
+        "force_hermes": False,
     }
 
 
@@ -88,6 +90,33 @@ def test_load_state_corrupt_file_uses_defaults(monkeypatch, tmp_path):
     monkeypatch.setenv("STACKCHAN_CONTROL_STATE", str(path))
     state = control.load_state()
     assert state["volume"] == control.DEFAULT_VOLUME
+
+
+# ---- force_hermes (Hermes-pin routing toggle) ------------------------
+
+
+def test_routing_force_hermes_defaults_false():
+    assert control.routing_force_hermes() is False
+
+
+def test_set_routing_force_hermes_roundtrip():
+    assert control.set_routing_force_hermes(True) == {
+        "ok": True,
+        "force_hermes": True,
+    }
+    assert control.routing_force_hermes() is True
+    assert control.load_state()["force_hermes"] is True
+    control.set_routing_force_hermes(False)
+    assert control.routing_force_hermes() is False
+
+
+def test_force_hermes_survives_other_state_writes():
+    # Persisting an unrelated setting must not drop the pin.
+    control.set_routing_force_hermes(True)
+    control.save_state({**control.load_state(), "volume": 22})
+    reloaded = control.load_state()
+    assert reloaded["force_hermes"] is True
+    assert reloaded["volume"] == 22
 
 
 # ---- set_volume -------------------------------------------------------
