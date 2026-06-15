@@ -4,7 +4,7 @@
 > 各 Phase の詳細な振り返りは `docs/phase-a〜f-report.md` / `docs/worklog/` を参照。
 > このファイルには **まだ生きている未完了項目** と **直近の作業文脈** だけを残す。
 
-最終整理: 2026-06-14（feature/review-cleanup）。直前ステータス: **Phase F フォロー完了 + ② ウェイクワードはクローズ（タップ/背面なで運用）**。Phase A〜E + C1 クローズ済み。詳細は `docs/phase-f-report.md` および archive の 2026-06-14 セッション群を参照。
+最終整理: 2026-06-15。直前ステータス: **ダッシュボード機能拡張プロジェクト 全5フェーズ実装完了**（フェーズ1〜3 `bf161b3`、フェーズ4 両方スキップ決着、フェーズ5 人間工学的仕上げ＝フル案・HTML-only を実装＋Playwright自動検証パス 2026-06-15）。残: ①ユーザー実機1往復チェック（=フェーズ2(h)積み残し同時クローズ）②learning-report（全5フェーズ）。それ以前: Phase F フォロー完了 + ② ウェイクワードはクローズ（タップ/背面なで運用）、Phase A〜E + C1 クローズ済み。詳細は `docs/phase-f-report.md` および archive の 2026-06-14 セッション群を参照。
 
 ---
 
@@ -27,7 +27,7 @@
   - [x] (g機械検証) `pytest` / `ruff clean` / dashboard JS構文・ID・タグ OK。worklog 作成済。
   - [x] (実機E2E①初版) 明るさ/LED(単色) 実機目視 OK（ユーザー確認済 2026-06-14）。
   - [x] (h) **LED を3状態に拡張**（ユーザー提案）: idle(通常・オン/オフ+色) / listening(聞き取り・準備中) / hermes(Hermes動作中) を各色設定可 + 「試」点灯ボタン。voice turn で `apply_led_state(slot)` でフェーズ点灯。ハードコード青を撤去し全色 `set_all` 化 → **60秒 idle-settle 問題が解消する見込み**。`control_state.json led` をネスト化(+旧形式マイグレーション)。`pytest 792 passed`/`ruff clean`/dashboard機械検証OK。
-  - [ ] (h実機検証) **gateway 再起動 → 3スロット色・試ボタン・会話時のフェーズ遷移・60秒問題解消 を実機確認**（ユーザー）。
+  - [~] (h実機検証) LED 3スロット色・試ボタン・明るさ・横並びは**フェーズ3 E2E で実機確認済**（ユーザー「いい感じ」）。残るは**会話1往復での LED フェーズ遷移（listening→hermes→idle）/60秒 idle-settle 解消の明示確認のみ** → **フェーズ5の残ユーザー実機1往復チェックと同時にクローズ**（同チェックでヘッダー状態ピルの「🎙録音中」遷移も併せて目視）。
 - [x] **フェーズ3完了: 近接listen mode + トグル + LED明るさ/横並び** — flash 1回・コミット+push `bf161b3`。計画: `~/.claude/plans/drifting-finding-wind.md`、worklog: `docs/worklog/2026-06-14-phase3-proximity-led.md`
   - **音量200は除外（ユーザー確定）**: ソース確定で `vol>=100` は 0dB クリップ＝100が物理最大、200は無意味（`esp_codec_dev.c` デフォルトカーブ `_get_vol_db` L99-101）。スライダー上限100据置。PA アナログゲインは歪みリスクで見送り。
   - 近接反応を mode 3択化（reflex/listen/**off**）、デフォルト listen、`enabled` 廃止し mode 一本化、NVS永続+旧enabled migration。
@@ -43,10 +43,20 @@
   - [x] (D) dashboard: 近接 select 3択 + **LED 3列横並び**（led-cols）+ **LED明るさスライダー**（sc-led-bright）
   - [x] 実機 flash + E2E（migration `mode=listen`/threshold824保持・トグル・reflex・off・LED明るさ・横並び・回帰）ユーザー「いい感じ」✅
   - [x] worklog + commit/push（bf161b3）
-- [ ] **フェーズ4: サーバタブに Codex利用率 + Gemini API利用額** — dashboard。まず取得手段を調査（無ければ相談）。
-- [ ] **フェーズ5: dashboard 人間工学的仕上げ** — 全項目出揃い後に整理。完了後 **learning-report 1本**作成。
+- [x] **フェーズ4: 両方スキップで決着（2026-06-15・実装なし）** — Codex 利用率=OpenAI に枠%を返す公式 API が無く `~/.codex/` にもキャッシュ無し→取得不可でスキップ。Gemini 利用額=自動取得は Cloud Billing→BigQuery Export が事実上唯一の経路（GCP 未設定・現状 Gemini 未使用）で設定重く見送り（将来 Gemini 使用開始なら BigQuery Export 経由で再検討）。dashboard 受け皿（`setUsage`/`remain` 再利用）は無傷で将来流用可。調査記録: `docs/worklog/2026-06-15-phase4-decision.md`、決着プラン: `~/.claude/plans/eager-enchanting-truffle.md`
+- [x] **フェーズ5完了: dashboard 人間工学的仕上げ（フル案・HTML-only）** — `~/razer-dashboard/dashboard.html` のみ（git管理外・flash/コミット不要）。スコープ=**フル案**（ユーザー選択）。実装 A〜H: (A)状態ピル昇格＝録音状態を接続バッジ `sc-conn` に常時反映(🎙録音中…+パルス) (B)カードを使用頻度で3グループ再編(よく使う/調整/設定・詳細)+`.group-label` (C)LED色設定(`.led-cols`)を既存 `.ctl-toggle`/`.pad-body` で初期折りたたみ (D)首デフォルト保存に `confirm()`+警告色 `.btn-warn` (E)タッチ域44px(`.icon-btn`/`.color-swatch`/`.btn-act`/`.field`) (F)レスポンシブ(max-width 480→min(100%,580px)・狭画面でLED2列) (G)サーバータブ CC利用率を5h主/7d従に階層化 (H)孤児 `.led-slot` CSS削除。**思考中表示は gateway 未公開のため HTML-only 境界を守り対象外**（後日）。各 `.ctl` の中身・ID・イベントは不変・再利用クラスは崩さず。検証: Playwright(同梱chromium)で**コンソール/ページエラー0**・カード順序・折りたたみ初期状態・状態ピル・44px・390/768px・利用率階層を確認、`node --check`OK。worklog: `docs/worklog/2026-06-15-phase5-dashboard-ergonomics.md`、計画: `~/.claude/plans/5-shimmying-cherny.md`。**残: ①ユーザー実機1往復チェック（下記フェーズ2(h)と同時クローズ）②learning-report（全5フェーズ）**
 
 確定方針: ウェイクワード「ハイ スタックちゃん」は今回スコープ外（microWakeWord は後日）。音量はデジタル増幅しない（安全側）。近接listen は手かざし(~10-15cm)=明示トリガー扱い。
+
+### ★ 進行中: ダッシュボード追加要望（モード機能 + 初期タブ）2026-06-15
+
+ダッシュボード機能拡張プロジェクト完了後のユーザー追加要望。計画: `~/.claude/plans/5-shimmying-cherny.md`。worklog: `docs/worklog/2026-06-15-mode-presets.md`。
+
+- [x] **要望2: 初期表示をサーバータブに** — dashboard.html `activeTab='server'`+`showTab('server')`、冗長 `load()` 除去。Playwright 確認済み。
+- [x] **モード機能 M1: gateway バックエンド（コミット `2d13ac7`）** — 現在の全設定（音量/ミュート/マイク感度/明るさ/LED全色・明るさ/近接/heartbeat、**首の向き neutral_pose は置き場所依存で除外**）を名前付きプリセットとして `~/.stackchan/presets` に保存・一括適用。control.py に save/list/load/delete/apply_preset + `normalize_preset_name`(パストラバーサル防止) + `_preset_lock`(voice_turn ガード)、http_server.py に `/control/presets/{list,save,apply,delete}` + `_build_preset_snapshot`。既存セッター/`load_state`/`set_neutral_pose` は不変（純追加）。`pytest 816 passed`(+18)/`ruff clean`。
+- [x] **モード機能 M2: ダッシュボード UI（HTML-only・即反映）** — 「よく使う」先頭にモードカード（select+適用/🗑削除、名前入力+保存、既存の型流用・独自実装ゼロ）。`loadPresets`/`scApplyPreset`/`scSavePreset`/`scDeletePreset`。`node --check` OK + Playwright で描画・44px・**pageerror 0**・初期 disabled 確認。
+- [x] **モード機能 ユーザー実機 E2E 成功（「いい感じ」2026-06-15）** — 両サービス再起動後、保存→適用の一括復元が実機で動作確認。投入直後の2バグ（①status_api `do_GET` の allowlist に `/control/presets/list` 欠落＝GET未プロキシ ②保存失敗が遠い sc-err にしか出ず無反応に見えた）も修正済み（status_api.py・dashboard.html、いずれも git管理外＝即反映、サービス再起動で反映済み）。
+- 記録のみ（learning-report は不要・ユーザー確認済、worklog のみ）。**ダッシュボード追加要望2件クローズ**。
 
 ### 0. review-cleanup の実機 flash + USB-reset ブロック調査（※ CLAUDE.md 最終更新では flash+E2E 完了済み・要整合確認）
 
