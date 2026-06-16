@@ -10,6 +10,62 @@
 
 ## 現役タスク（まだやるべき生きた未完了項目）
 
+### ★ 次フェーズ（計画確定・着手前）: 在室状態マシン + heartbeat 在室ゲート（Phase D 序盤）2026-06-16
+
+**背景**: TMOS 在室ゲート「強い GO」（下記 TMOS 検証 Phase 3）を受け、自発提案の土台となる**在室状態マシン**を実装する。
+ケンジさんの最終ビジョン（朝の挨拶/室温連動エアコン/在室・睡眠・不在のモード自動切替/生活支援AI）の**共通基盤**。
+今回スコープ = **ステップ1（在室ゲートまで）**（ユーザー合意 2026-06-16）。SwitchBot 自動制御・個人識別(BLE)・室温連動は次ステップ以降。
+自発開発は **承認制（human-in-the-loop）**：Hermes は「気づき・提案」まで→実装は CC が承認後に行う（ユーザー合意）。
+ビジョン全体の分解は memory `project_life_support_vision` 参照。
+
+**設計（過剰にしない）**: 状態 = [在室か](TMOS presence) × [活動/就寝時間帯](時刻)
+- `ABSENT`（不在 = presence ロスが N デバウンス分継続）/ `ACTIVE`（在室×活動時間帯→heartbeat 許可）/ `QUIET`（在室×就寝時間帯→heartbeat 禁止=オフモード）
+- 睡眠の厳密検知は TMOS 単体では不可（静止と就寝を区別不能）→ 時刻ベース。将来 ToF/活動量で精緻化。
+- 既存 heartbeat `is_quiet()`（quiet hours）を就寝時間帯にそのまま流用。
+- 閾値（就寝時間帯・不在デバウンス分）は **dashboard で実行時調整＋永続化**（set_neutral_pose の流儀。ここで値固定しない）。
+
+**触るファイル**（investigator 調査済み 2026-06-16・在室土台は既存4ファイルに完備）:
+- 🆕 `gateway/stackchan_mcp/presence.py`（状態マシン+10秒ポーリング+`~/.stackchan/presence_state.json` 永続化。control.py の mkstemp+os.replace 流用。dispatch 注入は sensors.py と同設計）
+- 🆕 `gateway/tests/test_presence.py`（FakeGateway + fake dispatch、test_sensors の `make_dispatch` 流用）
+- ✏️ `heartbeat.py` `_skip_reason()`（在室ゲート1条件：`is_occupied()` False でスキップ）
+- ✏️ `gateway.py`（PresenceMonitor start/stop 紐付け）
+- ✏️ `http_server.py`（`GET /control/presence` + `/control/status` に presence 同梱 + 閾値 `POST /control/presence/config`）
+- ✏️ `~/razer-dashboard/dashboard.html` + `status_api.py`（在室状態表示+閾値スライダ。GET allowlist 追加を忘れない＝過去の教訓）
+
+**着手時に確定する技術判断**: I2C mux 競合。presence ポーリングと dashboard センサータブが mux ch3 を同時アクセス→読み裂けリスク。ESP32 dispatch 経路の直列性を確認し、無ければ `sensors` 側に `asyncio.Lock` を1本足して I2C アクセスを直列化（poll は10秒間隔で軽い）。
+
+- [x] (1) `presence.py`: `PresenceState`(4状態 Enum: UNKNOWN/ABSENT/ACTIVE/QUIET) + `PresenceMonitor`（10秒ポーリング/状態遷移/`presence_state.json` 永続化/`allows_heartbeat()`/デバウンス/連続エラー→UNKNOWN フォールバック）。**fail-open**設計（確実に ABSENT の時だけ抑制、不明時は許可＝センサー故障で黙りっぱなしを回避）
+- [x] (2) `heartbeat.py` `_skip_reason` に在室ゲート追加（`presence.allows_heartbeat()` False → "room empty"。monitor 無し/None なら従来通り）
+- [x] (3) `gateway.py` で PresenceMonitor 紐付け（`__init__`/start/stop、`from_env` opt-in）
+- [x] (4) `http_server.py`: `GET /control/presence` + `/control/status` に presence 同梱 + 閾値 `POST /control/presence/config`
+- [x] (5) I2C mux 競合の排他制御 → `sensors.py` に `_i2c_lock`(asyncio.Lock) 追加。read_tmos/read_gesture/init_tmos/init_gesture を atomic 化（read_all/init_all は内部経由で自動ロック・再入なし）。presence poll と dashboard センサータブが同ロック共有で読み裂け防止
+- [x] (6) `tests/test_presence.py`（状態遷移/デバウンス/fail-open/エラー復帰/config/snapshot/ゲート、+25）+ `test_http_server.py`（presence エンドポイント +9）。既存回帰なし
+- [x] (7) dashboard: **センサータブに「🏠在室判定」カード**追加（状態/自発提案可否/最終検知 + 不在猶予スライダ + 就寝時間帯入力、専用ノート `sc-pres-note` にエラー）。閾値は初回だけ反映（操作中の上書き防止）/ poll は既存センサーポーリングに相乗り（presence は gateway-local でデバイス非接触＝mux 競合と無関係）。`status_api.py` `do_GET` allowlist に `/control/presence` 追加（POST は汎用転送で不要）。**JS構文 OK・ID 整合 8/8**。実機反映は status_api 再起動が必要（dashboard.html は即時）
+- [x] (8) 機械検証: **pytest 897 passed / ruff clean**（dashboard 未着手のため JS 構文は (7) で）
+- [ ] (9) 実機 E2E（在室→自発提案発火 / 不在→沈黙 / 就寝時間帯→沈黙）← ケンジさん。**前提**: `STACKCHAN_PRESENCE_POLL_SEC` を env に設定（opt-in）+ サービス再起動
+- [ ] (10) **learning-report（docs/）**（ユーザー合意・作る）+ worklog（docs/worklog/）+ memory 更新 ← worklog 済、report はフェーズ完了時
+
+### ★ 次々フェーズ（設計確定・着手は在室ゲート実機検証後）: Hermes 自発判断層 2026-06-16
+
+**ケンジさんの設計指摘（2026-06-16）**: heartbeat（自発の発話判断）は本来 Hermes agent（思考体）の責務。gateway の機械的タイマーが weather/memo を定型処理するのは歪み。→ **観測（gateway・高頻度・機械的）と判断（Hermes・文脈的）を分離する**。発話が部屋の状態に依存し、判断は思考体が担うのが理想。
+
+**確定方針（ユーザー選択 2026-06-16）**:
+- 観測は高頻度（`STACKCHAN_PRESENCE_POLL_SEC=5` 等）、Hermes 問い合わせは **状態遷移イベント駆動**（不在→在室=帰宅/起床 等の"意味ある変化"の時だけ。1分ポーリング問い合わせ=1日1440回=トークン/割り込み爆発を回避＝原則②）。
+- heartbeat を分解: **idle gesture = ファーム/gateway 反射**（在室時・高頻度OK・Hermes不要・原則②）/ **自発発話 = Hermes 判断**（状態遷移トリガー・原則③）。
+- 既存 gateway 内蔵通知（weather/memo）は **当面併存**（確実な定型通知）。将来 Hermes 統合を検討。
+- 在室ゲート（ステップ1）は「観測層 + 機械的安全装置」として土台に残る（捨てない）。
+
+**着手前の設計判断/調査**（investigator 委任予定）:
+- どの状態遷移を「意味ある」とするか（不在→在室=最重要 / 活動↔就寝 / 長時間在室の継続は"遷移"でないので別途＝在室経過時間のイベント化が要るか検討）
+- Hermes への問い合わせ経路（`hermes_bridge` 流用 vs 自発用 別経路）。**原則④: Hermes 本体改造はしない**
+- 安全装置の流用（会話中スキップ/クールダウン/日次上限は既存 heartbeat speak の `_speak_skip_reason` を再利用）
+
+**順序**: 在室ゲート（ステップ1）の実機 E2E 完了 → 本フェーズ着手（観測が信頼できてから判断層を載せる）。
+
+**先行実装（2026-06-17・reactive 版／ケンジ案）**: `get_presence` MCP ツールを追加（`stdio_server` tool 定義 + `_dispatch_mcp_tool` + `http_server` BYPASS_TOOLS、pytest 899）。Hermes が Discord で「今どんな状態?」と聞かれたら在室状態（state/最終検知/閾値）を読んで答えられる。**reactive なので原則①④に沿う**（自発でなく聞かれたら答える・トークンは会話時のみ）。狙い=数日運用の精度検証（自然なドッグフーディング）+ 自発判断層への橋渡し（Hermes が状態を読める第一歩）。**有効化に gateway 再起動が必要**（新ツールの反映）。
+
+**現在のステータス（2026-06-17）= 数日運用フェーズ**: env（`STACKCHAN_PRESENCE_POLL_SEC`）設定済（ケンジ）。観測層 + get_presence で数日過ごし、センサー精度を dashboard と Discord 会話の両面で確認 → 勘所を掴んでから自発判断層に着手。
+
 ### ★ 進行中: TMOS PIR (STHS34PF80) 活用検証（2026-06-16 着手）
 
 **部品到着**: M5Stack Unit TMOS PIR (U185 / STHS34PF80) が届いた（memory `project_future_sensors` の到着待ち品）。

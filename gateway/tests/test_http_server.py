@@ -466,6 +466,7 @@ async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
     assert BYPASS_TOOLS == frozenset(
         {
             "get_status",
+            "get_presence",
             "switchbot_list_devices",
             "switchbot_get_status",
             "switchbot_send_command",
@@ -672,10 +673,58 @@ class ControlFakeESP32:
         self.listen_calls.append((state, mode))
 
 
+class FakePresenceMonitor:
+    """Stand-in for PresenceMonitor in HTTP handler tests.
+
+    The monitor's own logic is covered in test_presence.py; here we only
+    drive the route handler (None vs present, snapshot pass-through, the
+    update_config call and its result -> status-code mapping).
+    """
+
+    def __init__(self, snapshot=None, *, config_result=None) -> None:
+        self._snapshot = (
+            snapshot
+            if snapshot is not None
+            else {
+                "enabled": True,
+                "state": "active",
+                "allows_heartbeat": True,
+                "last_seen_s_ago": 3.0,
+                "poll_sec": 10.0,
+                "config": {"absent_after_s": 120, "sleep_window": "22:00-06:30"},
+                "tmos": {"present": True, "presence": 770},
+            }
+        )
+        self._config_result = config_result
+        self.update_calls: list[tuple] = []
+
+    def snapshot(self) -> dict:
+        return self._snapshot
+
+    def update_config(self, *, absent_after_s=None, sleep_window=None) -> dict:
+        self.update_calls.append((absent_after_s, sleep_window))
+        if self._config_result is not None:
+            return self._config_result
+        return {
+            "ok": True,
+            "config": {
+                "absent_after_s": absent_after_s if absent_after_s is not None else 120,
+                "sleep_window": sleep_window if sleep_window is not None else "22:00-06:30",
+            },
+        }
+
+
 class ControlFakeGateway:
-    def __init__(self, *, connected: bool = True, heartbeat: object | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        connected: bool = True,
+        heartbeat: object | None = None,
+        presence: object | None = None,
+    ) -> None:
         self.esp32 = ControlFakeESP32(connected=connected)
         self._heartbeat = heartbeat
+        self._presence = presence
         self.voice_turn_active = False
 
 
@@ -1714,3 +1763,114 @@ async def test_control_sensors_init_503_when_disconnected() -> None:
     async with _client(app) as client:
         resp = await client.post("/control/sensors/init")
     assert resp.status_code == 503
+
+
+# ---- /control/presence (presence state machine) ----------------------
+
+
+@pytest.mark.asyncio
+async def test_control_presence_disabled_when_no_monitor() -> None:
+    gateway = ControlFakeGateway()  # presence monitoring not opted in
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/presence")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "enabled": False}
+
+
+@pytest.mark.asyncio
+async def test_control_presence_reports_snapshot() -> None:
+    gateway = ControlFakeGateway(presence=FakePresenceMonitor())
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/presence")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["enabled"] is True
+    assert body["state"] == "active"
+    assert body["config"]["absent_after_s"] == 120
+
+
+@pytest.mark.asyncio
+async def test_control_status_includes_presence_block() -> None:
+    gateway = ControlFakeGateway(presence=FakePresenceMonitor())
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/status")
+    assert resp.status_code == 200
+    assert resp.json()["presence"]["state"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_control_status_presence_disabled_without_monitor() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/status")
+    assert resp.json()["presence"] == {"enabled": False}
+
+
+@pytest.mark.asyncio
+async def test_control_presence_config_updates() -> None:
+    monitor = FakePresenceMonitor()
+    gateway = ControlFakeGateway(presence=monitor)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/presence/config",
+            json={"absent_after_s": 60, "sleep_window": "23:00-07:00"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert monitor.update_calls == [(60, "23:00-07:00")]
+
+
+@pytest.mark.asyncio
+async def test_control_presence_config_503_when_no_monitor() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/presence/config", json={"absent_after_s": 60}
+        )
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_control_presence_config_400_when_empty() -> None:
+    gateway = ControlFakeGateway(presence=FakePresenceMonitor())
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/presence/config", json={})
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_control_presence_config_400_bad_absent_type() -> None:
+    gateway = ControlFakeGateway(presence=FakePresenceMonitor())
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/presence/config", json={"absent_after_s": "soon"}
+        )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_control_presence_config_400_on_bad_window() -> None:
+    # The monitor rejects a malformed window; the handler maps it to 400.
+    monitor = FakePresenceMonitor(
+        config_result={
+            "ok": False,
+            "error": "sleep_window must be 'HH:MM-HH:MM' or 'off'",
+        }
+    )
+    gateway = ControlFakeGateway(presence=monitor)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/presence/config", json={"sleep_window": "nonsense"}
+        )
+    assert resp.status_code == 400
+    assert resp.json()["ok"] is False

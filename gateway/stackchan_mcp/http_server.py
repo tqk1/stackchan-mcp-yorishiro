@@ -34,7 +34,7 @@ from .web_search import TOOL_NAMES as WEB_SEARCH_TOOL_NAMES
 # Tools handled gateway-locally (no ESP32 round-trip): they bypass the
 # single-flight device queue and its device_connected guard.
 BYPASS_TOOLS = (
-    frozenset({"get_status"})
+    frozenset({"get_status", "get_presence"})
     | SWITCHBOT_TOOL_NAMES
     | WEB_SEARCH_TOOL_NAMES
     | NOTES_TOOL_NAMES
@@ -226,6 +226,8 @@ async def _build_control_status(gateway: Any) -> dict[str, Any]:
 
     heartbeat = _heartbeat_status(gateway)
     proximity = await _proximity_status(gateway) if connected else None
+    monitor = getattr(gateway, "_presence", None)
+    presence = monitor.snapshot() if monitor is not None else {"enabled": False}
 
     return {
         "ok": True,
@@ -237,6 +239,7 @@ async def _build_control_status(gateway: Any) -> dict[str, Any]:
         "led": led,
         "heartbeat": heartbeat,
         "proximity": proximity,
+        "presence": presence,
         "routing": {
             "force_hermes": state["force_hermes"],
             "local_enabled": local_llm.is_enabled(),
@@ -350,6 +353,39 @@ def build_app(
         # Gateway-local read of the rolling conversation log; no device
         # round-trip, so it never contends the command queue.
         return JSONResponse(control.get_conversation())
+
+    async def control_presence(_request: Request) -> JSONResponse:
+        # Gateway-local read of the presence monitor (room occupancy +
+        # heartbeat gate). No device round-trip; returns {"enabled": False}
+        # when presence monitoring is not opted in.
+        monitor = getattr(gateway, "_presence", None)
+        if monitor is None:
+            return JSONResponse({"ok": True, "enabled": False})
+        return JSONResponse({"ok": True, **monitor.snapshot()})
+
+    async def control_presence_config(request: Request) -> JSONResponse:
+        # Runtime-adjust the absent debounce / sleeping-hours window. The
+        # monitor persists them so a dashboard change survives a restart.
+        body = await _read_json_body(request)
+        monitor = getattr(gateway, "_presence", None)
+        if monitor is None:
+            return _control_error("presence monitor not running", status=503)
+        absent_after_s = body.get("absent_after_s")
+        sleep_window = body.get("sleep_window")
+        if absent_after_s is None and sleep_window is None:
+            return _control_error(
+                "provide absent_after_s and/or sleep_window", status=400
+            )
+        if absent_after_s is not None and (
+            not isinstance(absent_after_s, int) or isinstance(absent_after_s, bool)
+        ):
+            return _control_error("absent_after_s must be an integer", status=400)
+        if sleep_window is not None and not isinstance(sleep_window, str):
+            return _control_error("sleep_window must be a string", status=400)
+        result = monitor.update_config(
+            absent_after_s=absent_after_s, sleep_window=sleep_window
+        )
+        return _control_json(result, status=200 if result.get("ok") else 400)
 
     async def control_volume(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
@@ -716,6 +752,12 @@ def build_app(
         Route("/control/status", endpoint=control_status, methods=["GET"]),
         Route("/control/audio_level", endpoint=control_audio_level, methods=["GET"]),
         Route("/control/conversation", endpoint=control_conversation, methods=["GET"]),
+        Route("/control/presence", endpoint=control_presence, methods=["GET"]),
+        Route(
+            "/control/presence/config",
+            endpoint=control_presence_config,
+            methods=["POST"],
+        ),
         Route("/control/volume", endpoint=control_volume, methods=["POST"]),
         Route("/control/mic_gain", endpoint=control_mic_gain, methods=["POST"]),
         Route("/control/brightness", endpoint=control_brightness, methods=["POST"]),

@@ -342,6 +342,15 @@ async def _dispatch_mcp_tool(
         status = gateway.esp32.get_status()
         return [TextContent(type="text", text=json.dumps(status, indent=2))]
 
+    # Presence/occupancy snapshot (yorishiro fork): gateway-local, no
+    # device round-trip. Lets Hermes answer "is anyone in the room?" by
+    # reading the TMOS-derived state. {"enabled": False} when the monitor
+    # is not opted in (STACKCHAN_PRESENCE_POLL_SEC unset).
+    if name == "get_presence":
+        monitor = getattr(gateway, "_presence", None)
+        snap = monitor.snapshot() if monitor is not None else {"enabled": False}
+        return [TextContent(type="text", text=json.dumps(snap, ensure_ascii=False))]
+
     if name == "say":
         try:
             result = await synthesize_and_send(arguments, gateway=gateway)
@@ -702,6 +711,22 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 description=(
                     "Get the gateway's connection status: whether ESP32 is connected, "
                     "device info, and list of available device tools."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+            Tool(
+                name="get_presence",
+                description=(
+                    "Get the room's current presence state from the TMOS sensor: "
+                    "state (active=someone present and awake hours / quiet=present "
+                    "during sleeping hours / absent=room empty / unknown=not yet "
+                    "read), seconds since last detection, and the configured "
+                    "thresholds. Gateway-local, no device round-trip. Use this to "
+                    "answer whether anyone is in the room right now. Returns "
+                    '{"enabled": false} when presence monitoring is off.'
                 ),
                 inputSchema={
                     "type": "object",

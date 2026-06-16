@@ -17,6 +17,7 @@ from .capture_server import create_capture_app, stage_avatar_set
 from .esp32_client import ESP32Manager
 from .heartbeat import HeartbeatRunner
 from .mdns_advertiser import MdnsAdvertiser
+from .presence import PresenceMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,10 @@ class Gateway:
         self._capture_app: web.Application | None = None
         self._mdns_advertiser: MdnsAdvertiser | None = None
         self._heartbeat: HeartbeatRunner | None = None
+        # Phase D (yorishiro fork): polls the TMOS PIR for room occupancy
+        # and gates the heartbeat (never greet an empty room). Opt-in via
+        # STACKCHAN_PRESENCE_POLL_SEC; from_env returns None when unset.
+        self._presence: PresenceMonitor | None = None
         # Phase E (yorishiro fork): monotonic timestamp of the last
         # human-initiated interaction (voice turn or touch). The
         # heartbeat's speak cooldown reads this so a proactive
@@ -228,6 +233,12 @@ class Gateway:
         if self._heartbeat is not None:
             self._heartbeat.start()
 
+        # Phase D presence monitor (yorishiro fork): opt-in via
+        # STACKCHAN_PRESENCE_POLL_SEC; gates the heartbeat on room occupancy.
+        self._presence = PresenceMonitor.from_env(self)
+        if self._presence is not None:
+            self._presence.start()
+
         self._running = True
         logger.info(
             "Gateway started: WS on %s:%d, capture on %s:%d, vision_url=%s",
@@ -240,6 +251,9 @@ class Gateway:
         if self._heartbeat is not None:
             await self._heartbeat.stop()
             self._heartbeat = None
+        if self._presence is not None:
+            await self._presence.stop()
+            self._presence = None
         if self._mdns_advertiser:
             try:
                 await self._mdns_advertiser.stop()

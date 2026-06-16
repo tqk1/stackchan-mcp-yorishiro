@@ -367,6 +367,14 @@ class HeartbeatRunner:
             return "audio pipeline busy"
         if is_quiet(self._now(), self._quiet):
             return "quiet hours"
+        # Occupancy gate (yorishiro fork): when a presence monitor is
+        # running and is *confident* the room is empty, stay silent — no
+        # one is here to greet (life-support vision foundation). fail-open:
+        # the monitor only reports not-allowed on a debounced ABSENT, so a
+        # missing monitor / dead sensor never suppresses the heartbeat.
+        presence = getattr(self._gateway, "_presence", None)
+        if presence is not None and not presence.allows_heartbeat():
+            return "room empty"
         return None
 
     async def _loop(self) -> None:

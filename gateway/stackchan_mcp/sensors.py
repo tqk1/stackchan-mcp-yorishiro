@@ -26,6 +26,7 @@ need on-device tuning (gesture direction depends on mount orientation).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -33,6 +34,17 @@ from typing import Any
 # A dispatch coroutine: (logical tool name, arguments) -> device content
 # list. The HTTP layer passes ``lambda n, a: _dispatch_mcp_tool(n, a, gateway)``.
 DispatchFn = Callable[[str, dict[str, Any]], Awaitable[list[Any]]]
+
+#: Serialises Port A I2C transactions. The dashboard sensor tab
+#: (GET /control/sensors) and the presence monitor both read TMOS through
+#: this module; the control plane bypasses the single-flight device queue,
+#: so two reads can interleave on the bus. Without a lock a mux
+#: channel-select from one read lands between another read's select and
+#: its register fetch — tearing the bytes (reading ch2's data as ch3's,
+#: etc.). Held across each *single-sensor* read/init so a select and its
+#: follow-up reads are atomic. ``read_all`` / ``init_all`` do not take it
+#: directly: they call the per-sensor functions, which do (no re-entrancy).
+_i2c_lock = asyncio.Lock()
 
 # ---- I2C topology -----------------------------------------------------
 MUX_ADDR = 0x70  # PCA9548A (PaHUB2). Channel select = write [1 << ch].
@@ -176,23 +188,25 @@ async def _mux_select(dispatch: DispatchFn, ch: int) -> None:
 
 async def init_tmos(dispatch: DispatchFn) -> dict[str, Any]:
     """Enable the embedded presence/motion algorithm (ODR 4 Hz, BDU)."""
-    await _mux_select(dispatch, TMOS_CH)
-    who = (await _read(dispatch, TMOS_ADDR, TMOS_WHO_AM_I, 1))[0]
-    await _write(dispatch, TMOS_ADDR, [TMOS_CTRL1, TMOS_CTRL1_VALUE])
-    return {"ok": who == TMOS_WHO_AM_I_EXPECTED, "who_am_i": who}
+    async with _i2c_lock:
+        await _mux_select(dispatch, TMOS_CH)
+        who = (await _read(dispatch, TMOS_ADDR, TMOS_WHO_AM_I, 1))[0]
+        await _write(dispatch, TMOS_ADDR, [TMOS_CTRL1, TMOS_CTRL1_VALUE])
+        return {"ok": who == TMOS_WHO_AM_I_EXPECTED, "who_am_i": who}
 
 
 async def read_tmos(dispatch: DispatchFn) -> dict[str, Any]:
     """Live presence/motion/temperature snapshot. Occupancy = presence."""
-    await _mux_select(dispatch, TMOS_CH)
-    fstat = (await _read(dispatch, TMOS_ADDR, TMOS_FUNC_STATUS, 1))[0]
-    pres_flag = bool((fstat >> 2) & 1)
-    mot_flag = bool((fstat >> 1) & 1)
-    shk_flag = bool(fstat & 1)
-    presence = _s16(*await _read(dispatch, TMOS_ADDR, TMOS_TPRESENCE_L, 2))
-    motion = _s16(*await _read(dispatch, TMOS_ADDR, TMOS_TMOTION_L, 2))
-    obj = _s16(*await _read(dispatch, TMOS_ADDR, TMOS_TOBJECT_L, 2))
-    amb = _s16(*await _read(dispatch, TMOS_ADDR, TMOS_TAMBIENT_L, 2))
+    async with _i2c_lock:
+        await _mux_select(dispatch, TMOS_CH)
+        fstat = (await _read(dispatch, TMOS_ADDR, TMOS_FUNC_STATUS, 1))[0]
+        pres_flag = bool((fstat >> 2) & 1)
+        mot_flag = bool((fstat >> 1) & 1)
+        shk_flag = bool(fstat & 1)
+        presence = _s16(*await _read(dispatch, TMOS_ADDR, TMOS_TPRESENCE_L, 2))
+        motion = _s16(*await _read(dispatch, TMOS_ADDR, TMOS_TMOTION_L, 2))
+        obj = _s16(*await _read(dispatch, TMOS_ADDR, TMOS_TOBJECT_L, 2))
+        amb = _s16(*await _read(dispatch, TMOS_ADDR, TMOS_TAMBIENT_L, 2))
     return {
         "present": pres_flag or presence > PRESENCE_THRESHOLD,
         "presence": presence,
@@ -220,26 +234,28 @@ def _decode_gesture(raw0: int, raw1: int) -> str | None:
 async def init_gesture(dispatch: DispatchFn) -> dict[str, Any]:
     """Wake the PAJ7620 (it NACKs the first access while asleep), confirm
     the part id, then write the gesture-mode init array."""
-    await _mux_select(dispatch, GESTURE_CH)
-    part_id: int | None = None
-    for _ in range(2):  # first read may NACK (sleep); second wakes + reads
-        try:
-            await _write(dispatch, GESTURE_ADDR, [GESTURE_BANK_SEL, GESTURE_BANK0])
-            lo, hi = await _read(dispatch, GESTURE_ADDR, GESTURE_PART_ID_L, 2)
-            part_id = (hi << 8) | lo
-            break
-        except SensorError:
-            continue
-    for reg, val in GESTURE_INIT_REGISTERS:
-        await _write(dispatch, GESTURE_ADDR, [reg, val])
-    return {"ok": part_id == GESTURE_PART_ID_EXPECTED, "part_id": part_id}
+    async with _i2c_lock:
+        await _mux_select(dispatch, GESTURE_CH)
+        part_id: int | None = None
+        for _ in range(2):  # first read may NACK (sleep); second wakes + reads
+            try:
+                await _write(dispatch, GESTURE_ADDR, [GESTURE_BANK_SEL, GESTURE_BANK0])
+                lo, hi = await _read(dispatch, GESTURE_ADDR, GESTURE_PART_ID_L, 2)
+                part_id = (hi << 8) | lo
+                break
+            except SensorError:
+                continue
+        for reg, val in GESTURE_INIT_REGISTERS:
+            await _write(dispatch, GESTURE_ADDR, [reg, val])
+        return {"ok": part_id == GESTURE_PART_ID_EXPECTED, "part_id": part_id}
 
 
 async def read_gesture(dispatch: DispatchFn) -> dict[str, Any]:
     """Read the latched gesture flags (reading clears them)."""
-    await _mux_select(dispatch, GESTURE_CH)
-    await _write(dispatch, GESTURE_ADDR, [GESTURE_BANK_SEL, GESTURE_BANK0])
-    raw0, raw1 = await _read(dispatch, GESTURE_ADDR, GESTURE_RESULT_0, 2)
+    async with _i2c_lock:
+        await _mux_select(dispatch, GESTURE_CH)
+        await _write(dispatch, GESTURE_ADDR, [GESTURE_BANK_SEL, GESTURE_BANK0])
+        raw0, raw1 = await _read(dispatch, GESTURE_ADDR, GESTURE_RESULT_0, 2)
     return {"gesture": _decode_gesture(raw0, raw1), "raw0": raw0, "raw1": raw1}
 
 
