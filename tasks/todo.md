@@ -10,6 +10,58 @@
 
 ## 現役タスク（まだやるべき生きた未完了項目）
 
+### ★ 進行中: TMOS PIR (STHS34PF80) 活用検証（2026-06-16 着手）
+
+**部品到着**: M5Stack Unit TMOS PIR (U185 / STHS34PF80) が届いた（memory `project_future_sensors` の到着待ち品）。
+**狙い**: firmware 改造ゼロ（道A）で実機評価し、**heartbeat 在室ゲート**（会話に割り込まない発話タイミング）に足るか判定。
+**ハード**: I2C 0x5A / FOV80° / >2m / 焦電PIRと違い**静止在室も検知**（ここが評価の本丸）。
+**環境**: このマシン＝razer-server。gateway= systemd `stackchan-gateway.service`（WS:8765/capture:8766/MCP HTTP:8767）。
+ダッシュボード proxy `:8080` が `POST /control/*` を gateway:8767 へトークン付き汎用転送 → 検証は `:8080/control/i2c` で `.env`・トークン不要。
+**確認済み方針（2026-06-16）**: 配線=Port.A 直挿し（PaHUB2 なし）/ ドライブ= gateway に再利用可能な `POST /control/i2c` 追加 / learning-report 作成。
+i2c ツール: `i2c_scan` / `i2c_read{addr,n_bytes}` / `i2c_write{addr,bytes}` / `i2c_write_read{addr,write_bytes,n_bytes}`（Port.A 専用）。
+レジスタ: WHO_AM_I=0x0F→0xD3 / CTRL1=0x20(ODR) / FUNC_STATUS=0x25(presence/motionフラグ) / TPRESENCE=0x3A,3B / TMOTION=0x3C,3D / TOBJECT=0x26,27。
+
+- **Phase 0 — 検証ツール準備（私／ハード不要）**
+  - [x] gateway `http_server.py` に `POST /control/i2c` デバッグ経路追加（op で 4 ツール呼び分け・道A enabler・再利用可）
+  - [x] pytest（mock gateway）でルート単体テスト追加（+24）→ **848 passed** / **ruff clean**（回帰なし）
+  - [x] `scratch/tmos_probe.py` 作成（scan / whoami / poll サブコマンド、urllib のみ・依存なし）
+  - [x] **ケンジさん**: `sudo systemctl restart stackchan-gateway` 実施済み（2026-06-16）→ `:8080/control/i2c` 稼働確認
+- **Phase 1 — 配線＆疎通（ケンジさん配線／私検証）** ✅ 完了
+  - [x] ケンジさん: TMOS を CoreS3 **Port.A** 直挿し・gateway 接続
+  - [x] `scan` → **0x5A** 検出 ✓ / `whoami` → **WHO_AM_I=0xD3** ✓（疎通OK）
+- **Phase 2 — 生反応観測** ✅ 完了（2026-06-16、実機実演）
+  - [x] CTRL1=0x15（ODR=4Hz・BDU）で ODR 有効化 → ライブポーリング
+  - [x] **重要修正**: presence/motion の L/H を別トランザクションで読むと ODR 更新を跨いで「読み裂け」→ ±256 偽スパイク。`read_s16` を**1トランザクション2バイト読み（auto-increment 実機確認済）**に修正
+  - [x] **ハブ構成判明**: ケンジが PaHUB2 系 mux（PCA9548A **@0x70**, DIP）経由に変更。scan で 0x70 のみ→チャネル探索で **ch3=TMOS(0x5A) / ch2=ジェスチャー(PAJ7620U2 0x73, part_id 0x7620)**。プローブに `--mux/--ch`（PCA9548A チャネル選択 `1<<ch`、各周回で再選択）追加。ジェスチャー初回未検出はスリープでNACK（二度読みで検出）
+  - [x] 実演（8分/961サンプル、ハブ ch3）で全区間取得。証拠: `scratch/tmos_session_2026-06-16.log`
+- **Phase 3 — 実用評価** ✅ 完了 → **在室ゲート採用 = 強い GO**
+  - [x] **静止在室の保持＝合格**: 在室中 **211.7秒連続で PRES フラグ 100% 点灯**（presence 平均774）。静止しても減衰せず保持。初回の「減衰」は通過物の過渡で steady-state ではなかった
+  - [x] **分離**: 無人 presence 平均-1（±130ノイズ）vs 在室 平均767 → **50倍超のクリーン分離**。デフォルト閾値200が中間に最適
+  - [x] **誤検出**: 無人約5分（473サンプル）で **PRES フラグ誤発火 0**。※motion フラグは無人でも時々発火（46/473）→ **在室判定は presence を使う・motion は使わない**
+  - [x] **離脱レイテンシ**: フレームアウトで presence が即（~1サンプル/<1-2s）<200 へ復帰 → ゲート解除が速くリンガリング無し
+  - [x] **推奨**: PRES フラグ（FUNC_STATUS bit2）or presence>200 を在室信号に。ポーリング 1-2Hz/数秒間隔で十分。堅牢化に「2サンプル連続」or 軽いヒステリシス。設置時に実環境でノイズ再確認（今回は発熱PC上で±130と広め）
+  - [ ] 残（任意・非ブロッキング）: 距離 1m/2m・横ずれ FOV の定量化（今回 ~50cm で presence~770）。ジェスチャー(ch2/PAJ7620)9種の動作検証。PaHUB2 道B(firmware ドライバ)化の要否。`/control/i2c` のコミット要否
+- **Phase 4 — まとめ**
+  - [ ] learning-report（docs/）+ worklog（docs/worklog/2026-06-16-tmos-verify.md）+ memory 更新
+
+### ★ 進行中: センサータブ追加（TMOS + ジェスチャー リアルタイム可視化）2026-06-16
+
+ダッシュボードに「センサー」タブを新設し、TMOS PIR(ch3/0x5A) と ジェスチャー(ch2/0x73) の検知値を
+リアルタイム表示する観察ツール。家中を動いてスクショ→挙動設計の土台にする。
+計画: `~/.claude/plans/m5stack-port-ai2c-v2-1-dip-compressed-aurora.md`。**両方一気に実装＋learning-report 作成（ユーザー合意）**。
+
+- [x] (1) gateway 新規 `sensors.py`: TMOS/PAJ7620 レジスタ定義・`_s16`・mux_select・read_tmos/read_gesture/init・read_all。PAJ7620 init array は RevEng_PAJ7620 から移植（55 ペア）
+- [x] (2) `http_server.py`: `GET /control/sensors` + `POST /control/sensors/init` 追加、route 登録、import
+- [x] (3) `~/razer-dashboard/status_api.py`: do_GET allowlist に `/control/sensors` 追加（**status-api 再起動で反映**）
+- [x] (4) テスト: `test_sensors.py`（+13）+ `test_http_server.py` に `test_control_sensors_*`（+5）。**pytest 864 passed / ruff clean**
+- [x] (5) `~/razer-dashboard/dashboard.html`: センサータブ UI（トグル+TMOSカード+ジェスチャーカード）+ 独立ポーリングタイマー（≈2.5Hz=400ms、トグルON∧タブ表示中∧画面表示中）。JS構文OK・全ID存在確認済
+- [x] (6a) サービス再起動済 + バックエンド E2E ✅: `GET /control/sensors`=TMOS実値(presence/温度)正常、`POST /control/sensors/init`=TMOS who_am_i 0xD3 / ジェスチャー part_id 0x7620
+- [x] (6b) **ジェスチャー検出 解決（物理＝レンズ光学経路）**: 設定は M5純正(`m5stack/M5Unit-GESTURE`)と完全一致＝ソフトは正しかった。原因は物理（レンズの向き/遮蔽/フィルム）。Kenji が物理調整後、up/down/left/right を検出。`scratch/gesture_probe.py poll` で確認。**本番 `/control/sensors`（mux切替経路）でも ~9.7Hz で検出OK・TMOS 193/193**。教訓: gesture が出ない時は init より先にレンズ物理（極接近で物体信号≒0 は遮蔽/向きの典型）
+- [x] (6c) ダッシュボード センサータブ 実機 E2E ✅（ユーザー「いい感じ」2026-06-16）。TMOS/ジェスチャー表示・トグル動作確認
+- [ ] (7) 実地観察（Kenji・主目的）: 家中ウォークスルー→スクショ→在室ゲート閾値/ジェスチャー反射の挙動設計（継続）
+- [ ] (8) learning-report（観察結果込み）+ memory 更新。IR LEDカメラ確認/物理で何が効いたかの追記
+- [x] worklog: `docs/worklog/2026-06-16-sensor-tab.md` 作成済
+
 ### ★ 進行中: ダッシュボード機能拡張プロジェクト（全5フェーズ・/clear 境界で分割）
 
 前回コンテキスト逼迫の反省から、機能追加を5フェーズに分割し各完了で `/clear` して進める。

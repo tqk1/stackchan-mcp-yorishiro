@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from . import control, local_llm
+from . import control, local_llm, sensors
 from .notes import TOOL_NAMES as NOTES_TOOL_NAMES
 from .notify_config import NotifyConfig
 from .queue import CommandQueue, QueueFull, QueueItem, build_queue_full_error
@@ -172,6 +172,43 @@ def _control_device_result(
     if error is not None:
         return _control_error(error, status=502)
     return _control_json({"ok": True, **extra})
+
+
+def _control_i2c_result(content: list[Any]) -> JSONResponse:
+    """Map an ``i2c_*`` device dispatch to a control JSON response.
+
+    Surfaces the device payload verbatim (e.g. ``{"bytes": [...]}`` for a
+    read, or the scan's address list) so dashboard / probe scripts get the
+    raw values back instead of a flattened ``ok``.
+    """
+    error = _content_has_error(content)
+    if error is not None:
+        return _control_error(error, status=502)
+    payload = _device_tool_payload(content)
+    if payload is None:
+        return _control_error("empty device response", status=502)
+    if isinstance(payload, dict):
+        return _control_json({"ok": True, **payload})
+    return _control_json({"ok": True, "result": payload})
+
+
+def _i2c_byte_list(value: Any) -> list[int] | None:
+    """Validate a JSON array as I2C bytes (each 0..255); None if invalid."""
+    if not isinstance(value, list) or not value:
+        return None
+    out: list[int] = []
+    for b in value:
+        if not isinstance(b, int) or isinstance(b, bool) or not 0 <= b <= 255:
+            return None
+        out.append(b)
+    return out
+
+
+def _i2c_n_bytes(value: Any) -> int | None:
+    """Validate an I2C read length (1..256); None if invalid."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 <= value <= 256 else None
 
 
 async def _build_control_status(gateway: Any) -> dict[str, Any]:
@@ -519,6 +556,89 @@ def build_app(
             return _control_error(f"say failed: {exc}", status=502)
         return _control_json({"ok": True, "tts": result})
 
+    async def control_i2c(request: Request) -> JSONResponse:
+        # Debug relay onto the Grove Port A I2C bus (yorishiro sensor
+        # bring-up, "道A"): probe new Port A sensors without a firmware
+        # change. Mirrors the MCP i2c_* tools over the control plane.
+        # Body: {"op": "scan"|"read"|"write"|"write_read", ...args}.
+        body = await _read_json_body(request)
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+        op = body.get("op")
+        if op == "scan":
+            content = await _dispatch_mcp_tool("i2c_scan", {}, gateway)
+            return _control_i2c_result(content)
+        if op not in ("read", "write", "write_read"):
+            return _control_error(
+                "op must be one of: scan, read, write, write_read", status=400
+            )
+        addr = body.get("addr")
+        if (
+            not isinstance(addr, int)
+            or isinstance(addr, bool)
+            or not 0x08 <= addr <= 0x77
+        ):
+            return _control_error("addr must be an integer 0x08..0x77", status=400)
+        if op == "read":
+            n = _i2c_n_bytes(body.get("n_bytes"))
+            if n is None:
+                return _control_error("n_bytes must be an integer 1..256", status=400)
+            content = await _dispatch_mcp_tool(
+                "i2c_read", {"addr": addr, "n_bytes": n}, gateway
+            )
+        elif op == "write":
+            data = _i2c_byte_list(body.get("bytes"))
+            if data is None:
+                return _control_error(
+                    "bytes must be a non-empty list of integers 0..255", status=400
+                )
+            content = await _dispatch_mcp_tool(
+                "i2c_write", {"addr": addr, "bytes": data}, gateway
+            )
+        else:  # write_read
+            data = _i2c_byte_list(body.get("write_bytes"))
+            n = _i2c_n_bytes(body.get("n_bytes"))
+            if data is None:
+                return _control_error(
+                    "write_bytes must be a non-empty list of integers 0..255",
+                    status=400,
+                )
+            if n is None:
+                return _control_error("n_bytes must be an integer 1..256", status=400)
+            content = await _dispatch_mcp_tool(
+                "i2c_write_read",
+                {"addr": addr, "write_bytes": data, "n_bytes": n},
+                gateway,
+            )
+        return _control_i2c_result(content)
+
+    async def control_sensors(_request: Request) -> JSONResponse:
+        # Live Port A sensor snapshot for the dashboard sensor tab
+        # (yorishiro): TMOS PIR presence/motion/temp + PAJ7620 gesture.
+        # Per-sensor errors are nested in the payload (one sensor NACKing
+        # must not 502 the whole read), so top-level ok stays True.
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+
+        async def dispatch(name: str, arguments: dict[str, Any]) -> list[Any]:
+            return await _dispatch_mcp_tool(name, arguments, gateway)
+
+        data = await sensors.read_all(dispatch)
+        return _control_json({"ok": True, **data})
+
+    async def control_sensors_init(_request: Request) -> JSONResponse:
+        # Enable the TMOS embedded algorithm (ODR/BDU) and write the
+        # PAJ7620 gesture-mode init array. The dashboard calls this when
+        # the sensor poll toggle is switched on. Per-sensor ok is nested.
+        if not gateway.esp32.device_connected:
+            return _control_error("no device connected", status=503)
+
+        async def dispatch(name: str, arguments: dict[str, Any]) -> list[Any]:
+            return await _dispatch_mcp_tool(name, arguments, gateway)
+
+        data = await sensors.init_all(dispatch)
+        return _control_json({"ok": True, **data})
+
     # ---- Mode presets (yorishiro fork) --------------------------------
     async def control_presets_list(_request: Request) -> JSONResponse:
         return _control_json({"ok": True, "presets": await control.list_presets()})
@@ -619,6 +739,13 @@ def build_app(
         Route("/control/routing", endpoint=control_routing, methods=["POST"]),
         Route("/control/avatar", endpoint=control_avatar, methods=["POST"]),
         Route("/control/say", endpoint=control_say, methods=["POST"]),
+        Route("/control/i2c", endpoint=control_i2c, methods=["POST"]),
+        Route("/control/sensors", endpoint=control_sensors, methods=["GET"]),
+        Route(
+            "/control/sensors/init",
+            endpoint=control_sensors_init,
+            methods=["POST"],
+        ),
         Route(
             "/control/presets/list",
             endpoint=control_presets_list,

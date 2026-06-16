@@ -20,6 +20,7 @@ from stackchan_mcp.http_server import (
     build_app,
     make_dispatch_fn,
 )
+from stackchan_mcp import sensors
 from stackchan_mcp.queue import CommandQueue, QueueFull, QueueItem, build_queue_full_error
 
 
@@ -1443,3 +1444,273 @@ async def test_control_presets_delete() -> None:
     assert deleted.status_code == 200
     assert missing.status_code == 404
     assert listed.json()["presets"] == []
+
+
+# ---- POST /control/i2c (Port A sensor bring-up, "道A") -----------------
+
+
+@pytest.mark.asyncio
+async def test_control_i2c_scan_dispatches() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/i2c", json={"op": "scan"})
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert ("self.i2c.scan", {}) in gateway.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_control_i2c_write_read_dispatches_who_am_i() -> None:
+    # The STHS34PF80 WHO_AM_I idiom: set register pointer 0x0F, read 1 byte.
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/i2c",
+            json={"op": "write_read", "addr": 0x5A, "write_bytes": [0x0F], "n_bytes": 1},
+        )
+    assert resp.status_code == 200
+    assert (
+        "self.i2c.write_read",
+        {"addr": 0x5A, "write_bytes": [0x0F], "n_bytes": 1},
+    ) in gateway.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_control_i2c_read_dispatches() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/i2c", json={"op": "read", "addr": 0x5A, "n_bytes": 2}
+        )
+    assert resp.status_code == 200
+    assert ("self.i2c.read", {"addr": 0x5A, "n_bytes": 2}) in gateway.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_control_i2c_write_dispatches() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/i2c", json={"op": "write", "addr": 0x5A, "bytes": [0x20, 0x13]}
+        )
+    assert resp.status_code == 200
+    assert ("self.i2c.write", {"addr": 0x5A, "bytes": [0x20, 0x13]}) in gateway.esp32.calls
+
+
+@pytest.mark.asyncio
+async def test_control_i2c_surfaces_device_bytes() -> None:
+    gateway = ControlFakeGateway()
+
+    async def _read_d3(name, arguments):
+        payload = {"ok": True, "bytes": [0xD3]}
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}, None
+
+    gateway.esp32.call_tool = _read_d3  # type: ignore[assignment]
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/i2c",
+            json={"op": "write_read", "addr": 0x5A, "write_bytes": [0x0F], "n_bytes": 1},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["bytes"] == [0xD3]  # WHO_AM_I reads back verbatim
+
+
+@pytest.mark.asyncio
+async def test_control_i2c_device_error_maps_502() -> None:
+    gateway = ControlFakeGateway()
+
+    async def _nack(name, arguments):
+        payload = {"ok": False, "error": "ESP_ERR_TIMEOUT"}
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}, None
+
+    gateway.esp32.call_tool = _nack  # type: ignore[assignment]
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/i2c", json={"op": "read", "addr": 0x5A, "n_bytes": 1}
+        )
+    assert resp.status_code == 502
+    assert resp.json()["error"] == "ESP_ERR_TIMEOUT"
+
+
+@pytest.mark.asyncio
+async def test_control_i2c_rejects_unknown_op() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/i2c", json={"op": "nope"})
+    assert resp.status_code == 400
+    assert gateway.esp32.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("addr", [0x07, 0x78, "0x5A", True, None])
+async def test_control_i2c_rejects_out_of_range_addr(addr) -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/i2c", json={"op": "read", "addr": addr, "n_bytes": 1}
+        )
+    assert resp.status_code == 400
+    assert gateway.esp32.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("n", [0, 257, True, "2", None])
+async def test_control_i2c_rejects_bad_n_bytes(n) -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/i2c", json={"op": "read", "addr": 0x5A, "n_bytes": n}
+        )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", [[], [256], [-1], [True], "x", [1, "2"]])
+async def test_control_i2c_rejects_bad_bytes(data) -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/i2c", json={"op": "write", "addr": 0x5A, "bytes": data}
+        )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_control_i2c_503_when_disconnected() -> None:
+    gateway = ControlFakeGateway(connected=False)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/i2c", json={"op": "scan"})
+    assert resp.status_code == 503
+
+
+def _sensor_call_tool(reg_map, *, recorded=None):
+    """Programmable esp32.call_tool: serve register bytes for write_read,
+    ack writes, optionally recording (esp32_name, args)."""
+
+    async def _fake(name, arguments):
+        if recorded is not None:
+            recorded.append((name, arguments))
+        if name == "self.i2c.write_read":
+            addr = arguments["addr"]
+            reg = arguments["write_bytes"][0]
+            data = reg_map.get((addr, reg), [0] * arguments["n_bytes"])
+            payload = {"ok": True, "bytes": data}
+        else:
+            payload = {"ok": True}
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}, None
+
+    return _fake
+
+
+@pytest.mark.asyncio
+async def test_control_sensors_reads_both() -> None:
+    gateway = ControlFakeGateway()
+    reg_map = {
+        (0x5A, sensors.TMOS_FUNC_STATUS): [0x04],  # PRES flag
+        (0x5A, sensors.TMOS_TPRESENCE_L): [0x2C, 0x01],  # 300
+        (0x5A, sensors.TMOS_TMOTION_L): [0x00, 0x00],
+        (0x5A, sensors.TMOS_TOBJECT_L): [0x00, 0x00],
+        (0x5A, sensors.TMOS_TAMBIENT_L): [0xB8, 0x0B],  # 30.00 C
+        (0x73, sensors.GESTURE_RESULT_0): [0x01, 0x00],  # up
+    }
+    gateway.esp32.call_tool = _sensor_call_tool(reg_map)  # type: ignore[assignment]
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/sensors")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["tmos"]["present"] is True
+    assert body["tmos"]["presence"] == 300
+    assert body["tmos"]["ambient_c"] == 30.0
+    assert body["gesture"]["gesture"] == "up"
+
+
+@pytest.mark.asyncio
+async def test_control_sensors_partial_error_stays_200() -> None:
+    # TMOS reads fine; the gesture unit NACKs -> nested error, top-level ok.
+    gateway = ControlFakeGateway()
+    reg_map = {
+        (0x5A, sensors.TMOS_FUNC_STATUS): [0x00],
+        (0x5A, sensors.TMOS_TPRESENCE_L): [0x00, 0x00],
+        (0x5A, sensors.TMOS_TMOTION_L): [0x00, 0x00],
+        (0x5A, sensors.TMOS_TOBJECT_L): [0x00, 0x00],
+        (0x5A, sensors.TMOS_TAMBIENT_L): [0x00, 0x00],
+    }
+
+    async def _fake(name, arguments):
+        if name == "self.i2c.write_read" and arguments["addr"] == 0x73:
+            return {"content": [{"type": "text", "text": json.dumps({"error": "NACK"})}]}, None
+        if name == "self.i2c.write" and arguments["addr"] == 0x73:
+            return {"content": [{"type": "text", "text": json.dumps({"error": "NACK"})}]}, None
+        if name == "self.i2c.write_read":
+            reg = arguments["write_bytes"][0]
+            data = reg_map.get((arguments["addr"], reg), [0] * arguments["n_bytes"])
+            return {"content": [{"type": "text", "text": json.dumps({"ok": True, "bytes": data})}]}, None
+        return {"content": [{"type": "text", "text": json.dumps({"ok": True})}]}, None
+
+    gateway.esp32.call_tool = _fake  # type: ignore[assignment]
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/sensors")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["tmos"]["present"] is False
+    assert "error" in body["gesture"]
+
+
+@pytest.mark.asyncio
+async def test_control_sensors_503_when_disconnected() -> None:
+    gateway = ControlFakeGateway(connected=False)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/sensors")
+    assert resp.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_control_sensors_init_writes_gesture_array() -> None:
+    gateway = ControlFakeGateway()
+    recorded: list[tuple[str, dict]] = []
+    reg_map = {
+        (0x5A, sensors.TMOS_WHO_AM_I): [0xD3],
+        (0x73, sensors.GESTURE_PART_ID_L): [0x20, 0x76],  # 0x7620
+    }
+    gateway.esp32.call_tool = _sensor_call_tool(reg_map, recorded=recorded)  # type: ignore[assignment]
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/sensors/init")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["tmos"]["ok"] is True
+    assert body["gesture"]["ok"] is True
+    gesture_writes = [
+        tuple(a["bytes"])
+        for n, a in recorded
+        if n == "self.i2c.write" and a["addr"] == 0x73
+    ]
+    # A representative slice of the init array made it through verbatim.
+    assert (0xEF, 0x00) in gesture_writes
+    assert (0x41, 0xFF) in gesture_writes
+
+
+@pytest.mark.asyncio
+async def test_control_sensors_init_503_when_disconnected() -> None:
+    gateway = ControlFakeGateway(connected=False)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/sensors/init")
+    assert resp.status_code == 503
