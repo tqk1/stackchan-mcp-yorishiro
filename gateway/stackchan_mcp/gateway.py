@@ -17,6 +17,7 @@ from .capture_server import create_capture_app, stage_avatar_set
 from .esp32_client import ESP32Manager
 from .heartbeat import HeartbeatRunner
 from .mdns_advertiser import MdnsAdvertiser
+from .multiturn import MultiturnSession
 from .presence import PresenceMonitor
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,16 @@ class Gateway:
         # this so they only touch the device display during a real turn,
         # never for Claude-Desktop-driven tool calls.
         self.voice_turn_active = False
+        # Multi-turn (yorishiro fork): per-conversation continuation state
+        # (consecutive-turn counter + activity stamp) that survives across
+        # the independent /voice_turn POSTs of one spoken conversation, and
+        # a flag that stays True through the *gap* between an auto-continued
+        # turn and the user's answer. voice_turn_active covers each turn's
+        # processing; multiturn_active covers the listening gap in between,
+        # so the heartbeat never gestures into a continued conversation
+        # (design principle #1). See :mod:`stackchan_mcp.multiturn`.
+        self.multiturn = MultiturnSession()
+        self.multiturn_active = False
 
     def note_human_interaction(self) -> None:
         """Record that the user just interacted (voice turn / touch)."""

@@ -10,6 +10,41 @@
 
 ## 現役タスク（まだやるべき生きた未完了項目）
 
+### ★★ 着手中: マルチターン会話（Phase 1 MVP）2026-06-17  — ブランチ `feature/multiturn`
+
+**プラン**: `~/.claude/plans/codex-fluffy-breeze.md`（承認済み）。調査=Explore×3＋Plan＋独立Claude赤チーム。
+**設計確定**: 継続トリガー=Hermes応答末尾「？/?」/ 対象=route==hermesのみ / firmware改修なし(VAD自停止 PollTouchpad 再利用) / 二段方式(MVP=gateway sleep、保険=firmware continuation Phase4条件付き)。
+**赤チーム指摘(必須対策)**: P0自己拾音(AEC off・TTS完了通知無し→duration_ms+マージン sleep＋実機確認) / P1 heartbeat再発(multiturn_active 別フラグ) / P1カウンタ競合(成功パス確定・ConnectionError握る) / P2文脈(API key依存・session id 日跨ぎ→Phase2)。
+
+- [x] `multiturn.py` 新規: `MultiturnSession` dataclass + `should_continue()` 純関数 + reset/`is_gap_stale` 判定 + env getters
+- [x] `gateway.py` `__init__` に `self.multiturn` / `self.multiturn_active=False`
+- [x] `hermes_bridge.py` `_run_voice_turn` 成功パス末尾に `_maybe_continue`（is_enabled 先行ゲート / **固定 guard sleep**＝duration_ms 非依存に補正 / send_listen_state を try/except ConnectionError）
+- [x] `hermes_bridge.py` `handle_voice_turn` finally: 継続中は表示クリアをスキップ / 入口で stale-gap リセット / 空transcriptで counter リセット
+- [x] `heartbeat.py` `_skip_reason` に `multiturn_active` ゲート（`_multiturn_suppresses`＝stale で自己失効）
+- [x] `control.py` `is_muted()` 薄アクセサ追加（routing_force_hermes ミラー）
+- [x] 定数 env 化: `STACKCHAN_MULTITURN`(既定off) / `MAX_MULTITURN_TURNS`(4) / `MULTITURN_SESSION_TIMEOUT_S`(60) / `MULTITURN_TTS_GUARD_MS`(既定1000・安全側)
+- [x] pytest: test_multiturn(新規) + test_hermes_bridge 継続マトリクス + test_heartbeat multiturn ゲート（**943 passed**・ruff clean）
+- [x] worklog: docs/worklog/2026-06-17-multiturn-p1.md
+
+#### Phase 2 文脈保持（会話単位 session id）2026-06-17 ✅ 実装完了
+
+**確定（ユーザー）**: 既定 ON / 会話ウィンドウ 180s（`HERMES_SESSION_WINDOW_S`）/ `HERMES_SESSION_ID` を base 名前空間として `<base>-<uuid8>` にローテ / `HERMES_SESSION_WINDOW_S=0` で旧固定 id 挙動に復帰。Hermes 無改造・heartbeat 非共有・API key gating 維持。
+**実害**: このデプロイは KEY も SESSION_ID も設定済み = 固定 id に全会話が日跨ぎ蓄積中だった。
+
+- [x] `multiturn.py`: `MultiturnSession.session_id` + `conversation_id()` メソッド（窓内再利用/窓超過ローテ/window=0 無効）/ `session_window_s()` getter / `new_session_id(base)` 純関数 / `reset()` は session_id 温存
+- [x] `hermes_bridge.py`: `ask_hermes(text, *, session_id=None)`（None で env フォールバック）/ `generate_reply` thread / `handle_voice_turn` 入口で会話 id 算出＋`last_activity` 毎ターン stamp / `_run_voice_turn(hermes_session_id=...)`
+- [x] pytest 追加（test_multiturn +9 / test_hermes_bridge +5）＋既存フェイク更新（**955 passed**・ruff clean）
+- [x] worklog: docs/worklog/2026-06-17-multiturn-p2.md
+
+#### 残（Phase 1 + 2 共通）
+
+- [ ] 実機 E2E: ①自己拾音ゲート（自己ループ無し確認・guard_ms 実測）②文脈保持（会話内は覚える/別会話で混ざらない）← **ユーザー実機ステップ**（`STACKCHAN_MULTITURN=1` で起動）
+- [ ] commit（feature/multiturn・E2E green 後にまとめて or 2 コミット）
+
+（Phase 3 ダッシュボードトグル+UX / Phase 4 firmware continuation[条件付き] / 全完了後 learning-report は プラン参照）
+
+---
+
 ### ★ 次フェーズ（計画確定・着手前）: 在室状態マシン + heartbeat 在室ゲート（Phase D 序盤）2026-06-16
 
 **背景**: TMOS 在室ゲート「強い GO」（下記 TMOS 検証 Phase 3）を受け、自発提案の土台となる**在室状態マシン**を実装する。

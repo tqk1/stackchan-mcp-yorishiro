@@ -74,7 +74,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import notes, weather
+from . import multiturn, notes, weather
 from .audio_stream import is_recording
 
 if TYPE_CHECKING:
@@ -354,6 +354,23 @@ class HeartbeatRunner:
         """Monotonic clock; split out for tests."""
         return time.monotonic()
 
+    def _multiturn_suppresses(self) -> bool:
+        """True while a multi-turn continuation gap is open and fresh.
+
+        Suppresses the heartbeat between an auto-continued turn and the
+        user's answer. Self-expiring on the session timeout so a lost
+        answer (e.g. a dropped capture POST) can never wedge the
+        heartbeat off forever.
+        """
+        if not getattr(self._gateway, "multiturn_active", False):
+            return False
+        session = getattr(self._gateway, "multiturn", None)
+        if session is None:
+            return False
+        return not session.is_gap_stale(
+            self._monotonic(), multiturn.session_timeout_s()
+        )
+
     def _skip_reason(self) -> str | None:
         if not self._gateway.esp32.device_connected:
             return "no device connected"
@@ -363,6 +380,14 @@ class HeartbeatRunner:
         # (design principle #1: never interrupt the conversation).
         if getattr(self._gateway, "voice_turn_active", False):
             return "voice turn active"
+        # Multi-turn (yorishiro fork): voice_turn_active drops to False in
+        # the *gap* between an auto-continued turn and the user's answer
+        # (the next turn hasn't POSTed yet), so a separate flag covers that
+        # gap — otherwise a gesture could land mid-conversation, the exact
+        # principle-#1 regression fixed earlier. Self-expiring: if the
+        # answer never arrives, the gap goes stale and stops suppressing.
+        if self._multiturn_suppresses():
+            return "multiturn continuation"
         if self._gateway.esp32.tts_lock.locked():
             return "audio pipeline busy"
         if is_quiet(self._now(), self._quiet):

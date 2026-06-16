@@ -18,9 +18,14 @@ Environment variables:
   Defaults to ``http://127.0.0.1:8642``.
 - ``HERMES_API_KEY`` — bearer token for the Hermes API server. Optional;
   when set, requests also carry ``X-Hermes-Session-Id`` so Hermes keeps
-  one persistent conversation (session continuity requires the key).
-- ``HERMES_SESSION_ID`` — session id used with the key above.
-  Defaults to ``stackchan-voice``.
+  conversation context (session continuity requires the key).
+- ``HERMES_SESSION_ID`` — Phase 2: the *base namespace* for the session
+  id. By default each spoken conversation gets its own rotating id
+  (``<base>-<short uuid>``) so context is kept within a conversation but
+  no longer piles every conversation into one ever-growing session; see
+  ``HERMES_SESSION_WINDOW_S`` in :mod:`stackchan_mcp.multiturn`. Defaults
+  to ``stackchan-voice``. Set ``HERMES_SESSION_WINDOW_S=0`` to disable
+  rotation and use this value as a fixed id, as before.
 - ``HERMES_VOICE_SYSTEM_PROMPT`` — overrides the default system prompt
   that keeps spoken replies short.
 - ``STACKCHAN_AUDIO_HOOK_TOKEN`` — shared bearer token; when set, the
@@ -46,7 +51,7 @@ from typing import TYPE_CHECKING, Any
 import aiohttp
 from aiohttp import web
 
-from . import local_llm
+from . import local_llm, multiturn
 
 if TYPE_CHECKING:
     from .gateway import Gateway
@@ -123,8 +128,14 @@ def _ogg_opus_to_pcm16k(data: bytes) -> bytes:
     return bytes(out)
 
 
-async def ask_hermes(text: str) -> str:
-    """Send one user turn to the Hermes API server, return the reply text."""
+async def ask_hermes(text: str, *, session_id: str | None = None) -> str:
+    """Send one user turn to the Hermes API server, return the reply text.
+
+    ``session_id`` is the per-conversation Hermes context id computed by
+    the voice turn (Phase 2). When ``None`` (other callers, tests) it
+    falls back to the fixed ``HERMES_SESSION_ID``, preserving the old
+    behaviour.
+    """
     base_url = os.getenv("HERMES_API_URL", DEFAULT_HERMES_API_URL).rstrip("/")
     api_key = os.getenv("HERMES_API_KEY", "")
     system_prompt = os.getenv(
@@ -136,7 +147,7 @@ async def ask_hermes(text: str) -> str:
         headers["Authorization"] = f"Bearer {api_key}"
         # Session continuity is gated on API-key auth by the Hermes API
         # server; without the key we stay stateless.
-        headers["X-Hermes-Session-Id"] = os.getenv(
+        headers["X-Hermes-Session-Id"] = session_id or os.getenv(
             "HERMES_SESSION_ID", DEFAULT_HERMES_SESSION_ID
         )
 
@@ -177,7 +188,9 @@ async def ask_hermes(text: str) -> str:
     return reply.strip()
 
 
-async def generate_reply(text: str, *, force_hermes: bool = False) -> tuple[str, str]:
+async def generate_reply(
+    text: str, *, force_hermes: bool = False, session_id: str | None = None
+) -> tuple[str, str]:
     """Produce the reply for one transcript, returning ``(reply, route)``.
 
     With local routing opted in (``STACKCHAN_LOCAL_LLM_MODEL`` set) and
@@ -187,7 +200,8 @@ async def generate_reply(text: str, *, force_hermes: bool = False) -> tuple[str,
     routing can never kill a conversation. ``route`` is ``"local"`` or
     ``"hermes"``. With ``force_hermes`` set (the dashboard's Hermes-pin
     toggle) the local fast-path is skipped entirely and every turn goes
-    to Hermes.
+    to Hermes. ``session_id`` is threaded to :func:`ask_hermes` so the
+    Hermes-routed turn carries the per-conversation context id (Phase 2).
     """
     if (
         not force_hermes
@@ -204,7 +218,7 @@ async def generate_reply(text: str, *, force_hermes: bool = False) -> tuple[str,
             logger.warning(
                 "voice_turn: local LLM failed (%s); falling back to Hermes", exc
             )
-    return await ask_hermes(text), local_llm.ROUTE_HERMES
+    return await ask_hermes(text, session_id=session_id), local_llm.ROUTE_HERMES
 
 
 def _check_token(request: web.Request) -> bool:
@@ -255,12 +269,41 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
     # flag in the finally below so the display never gets stuck.
     gateway.voice_turn_active = True
 
+    # Multi-turn (yorishiro fork): a new turn is starting, so close any
+    # open continuation gap — this turn's processing is covered by
+    # voice_turn_active. If the gap went stale (the user's answer took
+    # too long, or this is a fresh tap minutes later), reset the counter
+    # so it counts as a new conversation rather than turn N+1.
+    now = time.monotonic()
+    gateway.multiturn_active = False
+    if gateway.multiturn.is_gap_stale(now, multiturn.session_timeout_s()):
+        gateway.multiturn.reset()
+
+    # Phase 2 — per-conversation Hermes context id. Rotate to a fresh id
+    # when the previous turn is older than the context window (or none is
+    # open) and reuse it across the turns of one conversation, so Hermes
+    # keeps context without piling every conversation into one
+    # ever-growing session. HERMES_SESSION_WINDOW_S=0 disables rotation
+    # (fixed HERMES_SESSION_ID, as before). conversation_id reads
+    # last_activity *before* we advance it for this turn.
+    base_session = os.getenv("HERMES_SESSION_ID", DEFAULT_HERMES_SESSION_ID)
+    hermes_session_id = (
+        gateway.multiturn.conversation_id(
+            now=now,
+            window_s=multiturn.session_window_s(),
+            mint=lambda: multiturn.new_session_id(base_session),
+        )
+        or base_session
+    )
+    gateway.multiturn.last_activity = now
+
     session_id = request.headers.get("X-StackChan-Session", "")
     try:
         return await _run_voice_turn(
             request,
             gateway,
             session_id,
+            hermes_session_id=hermes_session_id,
             get_stt_registry=get_stt_registry,
             default_stt_engine=DEFAULT_STT_ENGINE,
             synthesize_and_send=synthesize_and_send,
@@ -276,10 +319,17 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
         # restore_idle_led re-lights the user's chosen idle colour, or
         # clears the LEDs when no idle colour is set (Phase 2).
         gateway.voice_turn_active = False
-        await control.set_device_status_text(gateway, control.STATUS_CLEAR)
-        await control.set_device_subtitle(gateway, "")
-        await control.set_device_route_badge(gateway, "")
-        await control.restore_idle_led(gateway)
+        # Multi-turn (yorishiro fork): when this turn just re-opened
+        # listening for a follow-up, leave the display alone —
+        # on_listen_started now owns the listening status/LED, and
+        # clearing here would blank it and flicker the idle colour over
+        # the firmware's listening state. The next turn (or a stale-gap
+        # entry / non-continuing turn) restores the display normally.
+        if not gateway.multiturn_active:
+            await control.set_device_status_text(gateway, control.STATUS_CLEAR)
+            await control.set_device_subtitle(gateway, "")
+            await control.set_device_route_badge(gateway, "")
+            await control.restore_idle_led(gateway)
 
 
 async def _run_voice_turn(
@@ -287,12 +337,18 @@ async def _run_voice_turn(
     gateway: "Gateway",
     session_id: str,
     *,
+    hermes_session_id: str = "",
     get_stt_registry: Any,
     default_stt_engine: str,
     synthesize_and_send: Any,
     control: Any,
 ) -> web.Response:
-    """Body of one voice turn; the caller owns status-text cleanup."""
+    """Body of one voice turn; the caller owns status-text cleanup.
+
+    ``session_id`` is the device WS session (``X-StackChan-Session``);
+    ``hermes_session_id`` is the Phase 2 per-conversation Hermes context
+    id threaded into the brain call.
+    """
     if (request.content_length or 0) > MAX_OGG_BYTES:
         return web.json_response(
             {"ok": False, "error": "payload too large"}, status=413
@@ -356,6 +412,10 @@ async def _run_voice_turn(
 
     if not transcript:
         logger.info("voice_turn: empty transcript (noise?), session=%s", session_id)
+        # Multi-turn: silence ends the conversation — if this was the
+        # auto-reopened listen after a Hermes question and the user said
+        # nothing, drop the continuation counter so the loop stops here.
+        gateway.multiturn.reset()
         return web.json_response(
             {"ok": False, "reason": "empty transcript", "session_id": session_id}
         )
@@ -377,7 +437,9 @@ async def _run_voice_turn(
     ):
         await control.apply_led_state(gateway, "hermes")
     try:
-        reply, route = await generate_reply(transcript, force_hermes=force_hermes)
+        reply, route = await generate_reply(
+            transcript, force_hermes=force_hermes, session_id=hermes_session_id
+        )
     except Exception as exc:
         logger.exception("voice_turn: Hermes call failed")
         return web.json_response(
@@ -433,6 +495,10 @@ async def _run_voice_turn(
     # and TTS reach here — empty transcripts and Hermes/TTS failures
     # return earlier and are intentionally not logged.
     control.record_conversation_turn(transcript, reply, route, timings_ms)
+    # Multi-turn (yorishiro fork): if Hermes ended this turn with a
+    # question, re-open listening so the user can answer hands-free.
+    # Bounded + opt-in; resets the counter when the conversation ends.
+    multiturn_continued = await _maybe_continue(gateway, reply, route, control)
     return web.json_response(
         {
             "ok": True,
@@ -442,5 +508,74 @@ async def _run_voice_turn(
             "route": route,
             "tts": tts_result,
             "timings_ms": timings_ms,
+            "multiturn": multiturn_continued,
         }
     )
+
+
+async def _maybe_continue(
+    gateway: "Gateway",
+    reply: str,
+    route: str,
+    control: Any,
+) -> bool:
+    """Re-open listening after a turn iff Hermes invited a follow-up.
+
+    Returns True when a continuation listen was fired. On any
+    non-continuing turn the per-conversation counter is reset so the
+    next tap starts a brand-new conversation. See
+    :mod:`stackchan_mcp.multiturn` and CLAUDE.md design principle #1.
+    """
+    from .audio_stream import is_recording
+
+    # Master gate first — a cheap env read (default off). When the
+    # feature is disabled the conversation always ends after one
+    # round-trip and we skip the persisted-state read entirely, so a
+    # normal turn costs nothing extra.
+    if not multiturn.is_enabled():
+        gateway.multiturn.reset()
+        return False
+
+    cont = multiturn.should_continue(
+        enabled=True,
+        route=route,
+        reply=reply,
+        turn_count=gateway.multiturn.turn_count,
+        max_turns=multiturn.max_turns(),
+        device_connected=gateway.esp32.device_connected,
+        muted=control.is_muted(),
+        recording=is_recording(),
+    )
+    if not cont:
+        # No question (or local route / ceiling reached / muted /
+        # disconnected): the conversation is over — clear the counter.
+        gateway.multiturn.reset()
+        return False
+
+    # Mark the gap active *before* the guard sleep so a heartbeat tick
+    # during the wait is suppressed, then re-open listening once the
+    # firmware decode-queue tail has drained. Frames are paced at real
+    # time (tts/orchestrator.py), so only the ~0.8 s queue tail remains
+    # after synthesize_and_send returns; AEC is off, so re-opening too
+    # early risks the device hearing its own tail (tune the guard on
+    # hardware via MULTITURN_TTS_GUARD_MS).
+    gateway.multiturn.note_continuation(time.monotonic())
+    gateway.multiturn_active = True
+    guard_ms = multiturn.tts_guard_ms()
+    if guard_ms:
+        await asyncio.sleep(guard_ms / 1000.0)
+    try:
+        await gateway.esp32.send_listen_state("start", mode="manual")
+    except ConnectionError:
+        logger.warning(
+            "multiturn: device gone before re-listen; ending conversation"
+        )
+        gateway.multiturn.reset()
+        gateway.multiturn_active = False
+        return False
+    logger.info(
+        "multiturn: re-opened listening (turn %d/%d)",
+        gateway.multiturn.turn_count,
+        multiturn.max_turns(),
+    )
+    return True

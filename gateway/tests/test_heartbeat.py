@@ -163,6 +163,30 @@ def test_skip_during_voice_turn():
     assert runner._skip_reason() is None
 
 
+def test_skip_during_multiturn_gap(monkeypatch):
+    # Between an auto-continued turn and the user's answer, voice_turn_active
+    # is False (the next turn hasn't POSTed) but multiturn_active covers the
+    # gap so a gesture can't land mid-conversation.
+    from stackchan_mcp.multiturn import MultiturnSession
+
+    gw = FakeGateway()
+    gw.multiturn = MultiturnSession()
+    gw.multiturn_active = True
+    gw.multiturn.note_continuation(100.0)
+    runner = make_runner(gw)
+    # Fresh gap (10s in) → suppressed.
+    monkeypatch.setattr(runner, "_monotonic", lambda: 110.0)
+    assert runner._skip_reason() == "multiturn continuation"
+    # The gap goes stale past the session timeout → no longer suppressed
+    # (a lost answer must never wedge the heartbeat off forever).
+    monkeypatch.setattr(runner, "_monotonic", lambda: 100.0 + 9999.0)
+    assert runner._skip_reason() is None
+    # Flag cleared → not suppressed regardless of timing.
+    gw.multiturn_active = False
+    monkeypatch.setattr(runner, "_monotonic", lambda: 110.0)
+    assert runner._skip_reason() is None
+
+
 # ---- gestures --------------------------------------------------------
 
 

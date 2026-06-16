@@ -360,6 +360,16 @@ def set_routing_force_hermes(enabled: bool) -> dict[str, Any]:
     return {"ok": True, "force_hermes": bool(enabled)}
 
 
+def is_muted() -> bool:
+    """True when the speaker is muted (persisted control state).
+
+    A thin accessor mirroring :func:`routing_force_hermes` so callers
+    (e.g. the multi-turn continuation check) can read just the mute flag
+    without unpacking the whole state dict — and tests can stub it.
+    """
+    return bool(load_state()["muted"])
+
+
 async def _send_volume(gateway: "Gateway", volume: int) -> bool:
     """Push a volume level to the device. True on success."""
     result, error = await gateway.esp32.call_tool(
