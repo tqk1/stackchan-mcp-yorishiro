@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import sensors
+from .event_log import rotate_old_entries
 from .heartbeat import is_quiet, parse_quiet_hours
 
 if TYPE_CHECKING:
@@ -79,6 +80,11 @@ DEFAULT_ABSENT_AFTER_S = 120
 
 #: Default sleeping-hours window (matches the heartbeat's quiet default).
 DEFAULT_SLEEP_WINDOW = "22:00-06:30"
+
+#: Default presence log path. One JSONL line per poll (TMOS snapshot +
+#: derived state) so we can later reconstruct occupancy gaps and tune the
+#: absent debounce from real data rather than a guess.
+DEFAULT_LOG_PATH = "~/.stackchan/presence_log.jsonl"
 
 #: Consecutive read failures before occupancy falls back to UNKNOWN
 #: (fail-open: a dead sensor must not silence the heartbeat forever).
@@ -102,6 +108,23 @@ def _state_path() -> Path:
     return Path(
         os.getenv("STACKCHAN_PRESENCE_STATE", "") or DEFAULT_STATE_PATH
     ).expanduser()
+
+
+def _resolve_log_path() -> Path | None:
+    """Resolve the presence log path, or None when logging is disabled.
+
+    - ``STACKCHAN_PRESENCE_LOG`` unset -> default path (logging on while the
+      monitor runs).
+    - Empty or ``"off"`` -> None (disabled).
+    - Any other value -> that path (``~`` expanded).
+    """
+    raw = os.getenv("STACKCHAN_PRESENCE_LOG")
+    if raw is None:
+        return Path(DEFAULT_LOG_PATH).expanduser()
+    stripped = raw.strip()
+    if not stripped or stripped.lower() == "off":
+        return None
+    return Path(stripped).expanduser()
 
 
 def _clamp_absent_after(value: Any) -> int:
@@ -184,12 +207,14 @@ class PresenceMonitor:
         poll_sec: float = DEFAULT_POLL_SEC,
         absent_after_s: int = DEFAULT_ABSENT_AFTER_S,
         sleep_window: str = DEFAULT_SLEEP_WINDOW,
+        log_path: Path | None = None,
     ):
         self._gateway = gateway
         self._dispatch = dispatch
         self._poll_sec = max(1.0, poll_sec)
         self._absent_after_s = _clamp_absent_after(absent_after_s)
         self._sleep_window = _valid_window(sleep_window) or DEFAULT_SLEEP_WINDOW
+        self._log_path = log_path
         self._quiet = parse_quiet_hours(self._sleep_window)
         self._state = PresenceState.UNKNOWN
         self._last_present_mono: float | None = None
@@ -231,11 +256,16 @@ class PresenceMonitor:
             poll_sec=poll_sec,
             absent_after_s=config["absent_after_s"],
             sleep_window=config["sleep_window"],
+            log_path=_resolve_log_path(),
         )
 
     def start(self) -> None:
         if self._task is not None:
             return
+        if self._log_path is not None:
+            # Prune entries older than the retention window once at startup,
+            # reusing the event-log rotation (it keys on ``ts_unix``).
+            rotate_old_entries(path=self._log_path)
         self._task = asyncio.get_running_loop().create_task(self._loop())
         logger.info(
             "presence: enabled, poll=%.0fs, absent_after=%ds, sleep=%s",
@@ -271,14 +301,11 @@ class PresenceMonitor:
 
     def snapshot(self) -> dict[str, Any]:
         """Summary for GET /control/presence and the status payload."""
-        last_seen = None
-        if self._last_present_mono is not None:
-            last_seen = round(self._monotonic() - self._last_present_mono, 1)
         return {
             "enabled": True,
             "state": self._state.value,
             "allows_heartbeat": self.allows_heartbeat(),
-            "last_seen_s_ago": last_seen,
+            "last_seen_s_ago": self._last_seen_s_ago(),
             "poll_sec": self._poll_sec,
             "config": {
                 "absent_after_s": self._absent_after_s,
@@ -336,6 +363,40 @@ class PresenceMonitor:
         """Monotonic clock; split out for tests."""
         return time.monotonic()
 
+    def _wall_clock(self) -> float:
+        """Wall-clock epoch seconds; split out for tests."""
+        return time.time()
+
+    def _last_seen_s_ago(self) -> float | None:
+        """Seconds since presence was last detected, or None if never."""
+        if self._last_present_mono is None:
+            return None
+        return round(self._monotonic() - self._last_present_mono, 1)
+
+    def _append_log(self, snap: dict[str, Any], state: PresenceState) -> None:
+        """Append one TMOS snapshot + derived state as a JSONL line.
+
+        Fire-and-forget like :mod:`event_log`: any disk error is logged at
+        WARNING and swallowed so logging can never take the monitor down.
+        Disabled (``log_path`` None) is a no-op.
+        """
+        path = self._log_path
+        if path is None:
+            return
+        line = {
+            "ts_unix": self._wall_clock(),
+            "state": state.value,
+            "last_seen_s_ago": self._last_seen_s_ago(),
+            **snap,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(line, ensure_ascii=False) + "\n")
+                f.flush()
+        except (OSError, PermissionError) as exc:
+            logger.warning("presence: cannot append log %s (%s)", path, exc)
+
     def _occupied(self) -> bool | None:
         """True=present (within debounce), False=absent, None=never seen."""
         if self._last_present_mono is None:
@@ -386,6 +447,7 @@ class PresenceMonitor:
         if snap.get("present"):
             self._last_present_mono = self._monotonic()
         self._state = self._derive_state()
+        self._append_log(snap, self._state)
 
     async def _loop(self) -> None:
         while True:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -376,3 +377,90 @@ async def test_get_presence_tool_disabled_without_monitor() -> None:
     gw = FakeGateway()  # _presence is None
     content = await _dispatch_mcp_tool("get_presence", {}, gw)
     assert json.loads(content[0].text) == {"enabled": False}
+
+
+# ---- presence log (raw TMOS time series for offline analysis) ---------
+
+
+def test_resolve_log_path(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("STACKCHAN_PRESENCE_LOG", raising=False)
+    assert presence._resolve_log_path() == Path(presence.DEFAULT_LOG_PATH).expanduser()
+    monkeypatch.setenv("STACKCHAN_PRESENCE_LOG", "off")
+    assert presence._resolve_log_path() is None
+    monkeypatch.setenv("STACKCHAN_PRESENCE_LOG", "  ")
+    assert presence._resolve_log_path() is None
+    target = tmp_path / "p.jsonl"
+    monkeypatch.setenv("STACKCHAN_PRESENCE_LOG", str(target))
+    assert presence._resolve_log_path() == target
+
+
+def test_from_env_sets_log_path(monkeypatch, tmp_path) -> None:
+    target = tmp_path / "p.jsonl"
+    monkeypatch.setenv("STACKCHAN_PRESENCE_POLL_SEC", "10")
+    monkeypatch.setenv("STACKCHAN_PRESENCE_LOG", str(target))
+    monitor = PresenceMonitor.from_env(FakeGateway())
+    assert monitor is not None
+    assert monitor._log_path == target
+
+
+@pytest.mark.asyncio
+async def test_poll_appends_full_tmos_line(tmp_path) -> None:
+    log = tmp_path / "presence_log.jsonl"
+    monitor = make_monitor(log_path=log)
+    monitor._now = lambda: dt.time(12, 0)
+    await monitor._poll_once()
+    lines = log.read_text("utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    # Every TMOS field is recorded, plus the derived fields.
+    for key in (
+        "present", "presence", "motion", "pres_flag", "mot_flag",
+        "shk_flag", "object_raw", "ambient_c",
+    ):
+        assert key in rec
+    assert rec["state"] == "active"
+    assert rec["present"] is True
+    assert isinstance(rec["ts_unix"], float)
+    # A second poll appends, not overwrites.
+    await monitor._poll_once()
+    assert len(log.read_text("utf-8").splitlines()) == 2
+
+
+@pytest.mark.asyncio
+async def test_poll_logs_absent_rows(tmp_path) -> None:
+    # An empty room must still be logged (the gaps are the whole point).
+    log = tmp_path / "presence_log.jsonl"
+    monitor = make_monitor(dispatch=make_dispatch(dict(ABSENT_REG)), log_path=log)
+    monitor._now = lambda: dt.time(12, 0)
+    await monitor._poll_once()
+    rec = json.loads(log.read_text("utf-8").splitlines()[0])
+    assert rec["present"] is False
+    assert rec["state"] == "unknown"  # never seen anyone yet (fail-open)
+
+
+@pytest.mark.asyncio
+async def test_poll_skips_log_on_sensor_error(tmp_path) -> None:
+    log = tmp_path / "presence_log.jsonl"
+    monitor = make_monitor(dispatch=make_dispatch({}, fail_addr=0x5A), log_path=log)
+    await monitor._poll_once()
+    assert not log.exists()
+
+
+@pytest.mark.asyncio
+async def test_poll_no_log_when_disabled() -> None:
+    # log_path defaults to None -> _poll_once writes nothing and never raises.
+    monitor = make_monitor()
+    monitor._now = lambda: dt.time(12, 0)
+    assert monitor._log_path is None
+    await monitor._poll_once()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_start_prunes_old_log_entries(tmp_path) -> None:
+    log = tmp_path / "presence_log.jsonl"
+    # An entry from epoch 1.0 is far older than the 7-day retention window.
+    log.write_text(json.dumps({"ts_unix": 1.0, "state": "active"}) + "\n", "utf-8")
+    monitor = make_monitor(poll_sec=1.0, log_path=log)
+    monitor.start()  # rotation runs synchronously before the poll loop
+    await monitor.stop()
+    assert log.read_text("utf-8") == ""
