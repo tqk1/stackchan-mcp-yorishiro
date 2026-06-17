@@ -327,9 +327,19 @@ async def handle_voice_turn(request: web.Request) -> web.Response:
         # entry / non-continuing turn) restores the display normally.
         if not gateway.multiturn_active:
             await control.set_device_status_text(gateway, control.STATUS_CLEAR)
-            await control.set_device_subtitle(gateway, "")
             await control.set_device_route_badge(gateway, "")
             await control.restore_idle_led(gateway)
+            # Multi-turn UX: if this turn hit the conversation's turn
+            # ceiling on a still-open question, leave a "tap to continue"
+            # hint on screen instead of blanking the subtitle. The flag is
+            # set in _maybe_continue and is one-shot (consumed here).
+            if getattr(gateway, "multiturn_prompt_pending", False):
+                await control.set_device_subtitle(
+                    gateway, multiturn.TAP_TO_CONTINUE_HINT
+                )
+                gateway.multiturn_prompt_pending = False
+            else:
+                await control.set_device_subtitle(gateway, "")
 
 
 async def _run_voice_turn(
@@ -528,11 +538,11 @@ async def _maybe_continue(
     """
     from .audio_stream import is_recording
 
-    # Master gate first — a cheap env read (default off). When the
-    # feature is disabled the conversation always ends after one
-    # round-trip and we skip the persisted-state read entirely, so a
-    # normal turn costs nothing extra.
-    if not multiturn.is_enabled():
+    # Master gate first — the persisted dashboard toggle (its default is
+    # seeded from the legacy STACKCHAN_MULTITURN env, but the toggle wins).
+    # When the feature is disabled the conversation always ends after one
+    # round-trip, so a normal turn costs nothing extra.
+    if not control.multiturn_enabled():
         gateway.multiturn.reset()
         return False
 
@@ -547,8 +557,22 @@ async def _maybe_continue(
         recording=is_recording(),
     )
     if not cont:
-        # No question (or local route / ceiling reached / muted /
-        # disconnected): the conversation is over — clear the counter.
+        # The conversation is over — clear the counter. UX: when Hermes
+        # still invited a follow-up but we stopped *only* because the
+        # per-conversation turn ceiling was reached, flag a gentle "tap to
+        # continue" subtitle so the device doesn't fall silent mid-question
+        # (handle_voice_turn's finally consumes the flag). Other stop
+        # reasons — no question, local route, muted, disconnected — end
+        # silently as before.
+        if (
+            route == "hermes"
+            and multiturn.reply_invites_continuation(reply)
+            and gateway.multiturn.turn_count >= multiturn.max_turns()
+            and gateway.esp32.device_connected
+            and not control.is_muted()
+            and not is_recording()
+        ):
+            gateway.multiturn_prompt_pending = True
         gateway.multiturn.reset()
         return False
 

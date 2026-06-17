@@ -277,14 +277,31 @@ def _clamp_head_pitch(pitch: Any) -> int:
     return min(max(value, MIN_HEAD_PITCH), MAX_HEAD_PITCH)
 
 
+def _default_multiturn() -> bool:
+    """Initial multi-turn default when the state file has no ``multiturn`` key.
+
+    Mirrors the env truthiness parse in :func:`multiturn.is_enabled` (kept
+    local to avoid a control→multiturn import cycle). This lets the legacy
+    ``STACKCHAN_MULTITURN`` env gate seed the first value on an existing
+    host, after which the persisted dashboard toggle is the source of truth
+    — a dashboard OFF wins even when the env var is still set.
+    """
+    return os.getenv("STACKCHAN_MULTITURN", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def load_state() -> dict[str, Any]:
     """Read the persisted control state, with defaults filled in.
 
     Returns a dict with ``volume`` (int 0..100), ``muted`` (bool),
     ``pre_mute_volume`` (int 0..100), ``mic_gain`` (int 0..36),
-    ``brightness`` (int 0..100), ``led`` (``{on, r, g, b}``) and
-    ``force_hermes`` (bool). A missing or unreadable file yields the
-    defaults rather than raising —
+    ``brightness`` (int 0..100), ``led`` (``{on, r, g, b}``),
+    ``force_hermes`` (bool) and ``multiturn`` (bool). A missing or
+    unreadable file yields the defaults rather than raising —
     the dashboard must come up even on a fresh host.
     """
     path = _state_path()
@@ -304,6 +321,7 @@ def load_state() -> dict[str, Any]:
     brightness = _clamp_brightness(raw.get("brightness", DEFAULT_BRIGHTNESS))
     led = _normalize_led(raw.get("led", DEFAULT_LED))
     force_hermes = bool(raw.get("force_hermes", DEFAULT_FORCE_HERMES))
+    multiturn = bool(raw.get("multiturn", _default_multiturn()))
     return {
         "volume": volume,
         "muted": muted,
@@ -312,6 +330,7 @@ def load_state() -> dict[str, Any]:
         "brightness": brightness,
         "led": led,
         "force_hermes": force_hermes,
+        "multiturn": multiturn,
     }
 
 
@@ -328,6 +347,7 @@ def save_state(state: dict[str, Any]) -> None:
         "brightness": _clamp_brightness(state.get("brightness", DEFAULT_BRIGHTNESS)),
         "led": _normalize_led(state.get("led", DEFAULT_LED)),
         "force_hermes": bool(state.get("force_hermes", DEFAULT_FORCE_HERMES)),
+        "multiturn": bool(state.get("multiturn", _default_multiturn())),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -358,6 +378,26 @@ def set_routing_force_hermes(enabled: bool) -> dict[str, Any]:
     state["force_hermes"] = bool(enabled)
     save_state(state)
     return {"ok": True, "force_hermes": bool(enabled)}
+
+
+def multiturn_enabled() -> bool:
+    """True when hands-free multi-turn continuation is on (persisted).
+
+    Reads the persisted control state so the setting survives a gateway
+    restart, mirroring :func:`routing_force_hermes`. This is the runtime
+    source of truth for the multi-turn feature; the legacy
+    ``STACKCHAN_MULTITURN`` env var only seeds the default (see
+    :func:`_default_multiturn`), so a dashboard OFF wins over the env.
+    """
+    return bool(load_state()["multiturn"])
+
+
+def set_multiturn(enabled: bool) -> dict[str, Any]:
+    """Persist the multi-turn toggle and echo the new value back."""
+    state = load_state()
+    state["multiturn"] = bool(enabled)
+    save_state(state)
+    return {"ok": True, "multiturn": bool(enabled)}
 
 
 def is_muted() -> bool:

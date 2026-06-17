@@ -243,6 +243,7 @@ async def _build_control_status(gateway: Any) -> dict[str, Any]:
         "routing": {
             "force_hermes": state["force_hermes"],
             "local_enabled": local_llm.is_enabled(),
+            "multiturn": state["multiturn"],
         },
     }
 
@@ -561,6 +562,18 @@ def build_app(
             return _control_error("force_hermes must be a boolean", status=400)
         return _control_json(control.set_routing_force_hermes(force))
 
+    async def control_multiturn(request: Request) -> JSONResponse:
+        # Gateway-only state (no device round-trip): when enabled, a Hermes
+        # reply ending in a question re-opens listening for a hands-free
+        # follow-up (bounded; see stackchan_mcp.multiturn). The persisted
+        # toggle is the runtime source of truth — it overrides the legacy
+        # STACKCHAN_MULTITURN env gate.
+        body = await _read_json_body(request)
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            return _control_error("enabled must be a boolean", status=400)
+        return _control_json(control.set_multiturn(enabled))
+
     async def control_avatar(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
         if not gateway.esp32.device_connected:
@@ -779,6 +792,7 @@ def build_app(
         Route("/control/proximity", endpoint=control_proximity, methods=["POST"]),
         Route("/control/heartbeat", endpoint=control_heartbeat, methods=["POST"]),
         Route("/control/routing", endpoint=control_routing, methods=["POST"]),
+        Route("/control/multiturn", endpoint=control_multiturn, methods=["POST"]),
         Route("/control/avatar", endpoint=control_avatar, methods=["POST"]),
         Route("/control/say", endpoint=control_say, methods=["POST"]),
         Route("/control/i2c", endpoint=control_i2c, methods=["POST"]),

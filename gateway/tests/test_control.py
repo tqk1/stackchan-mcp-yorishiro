@@ -43,7 +43,8 @@ def _isolate_state(monkeypatch, tmp_path):
 # ---- state persistence ------------------------------------------------
 
 
-def test_load_state_defaults_when_missing():
+def test_load_state_defaults_when_missing(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_MULTITURN", raising=False)
     state = control.load_state()
     assert state == {
         "volume": control.DEFAULT_VOLUME,
@@ -53,12 +54,14 @@ def test_load_state_defaults_when_missing():
         "brightness": control.DEFAULT_BRIGHTNESS,
         "led": control.DEFAULT_LED,
         "force_hermes": False,
+        "multiturn": False,
     }
 
 
 def test_save_then_load_roundtrip(monkeypatch, tmp_path):
     path = tmp_path / "rt.json"
     monkeypatch.setenv("STACKCHAN_CONTROL_STATE", str(path))
+    monkeypatch.delenv("STACKCHAN_MULTITURN", raising=False)
     control.save_state(
         {"volume": 33, "muted": True, "pre_mute_volume": 70, "mic_gain": 18}
     )
@@ -72,6 +75,7 @@ def test_save_then_load_roundtrip(monkeypatch, tmp_path):
         "brightness": control.DEFAULT_BRIGHTNESS,
         "led": control.DEFAULT_LED,
         "force_hermes": False,
+        "multiturn": False,
     }
 
 
@@ -116,6 +120,48 @@ def test_force_hermes_survives_other_state_writes():
     control.save_state({**control.load_state(), "volume": 22})
     reloaded = control.load_state()
     assert reloaded["force_hermes"] is True
+    assert reloaded["volume"] == 22
+
+
+# ---- multiturn (hands-free continuation toggle) ----------------------
+
+
+def test_multiturn_defaults_false(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_MULTITURN", raising=False)
+    assert control.multiturn_enabled() is False
+
+
+def test_multiturn_default_seeded_from_env(monkeypatch):
+    # On a fresh state file (no "multiturn" key) the legacy env gate seeds
+    # the initial value, so existing STACKCHAN_MULTITURN=1 deployments keep
+    # the feature on until the dashboard toggle is touched.
+    monkeypatch.setenv("STACKCHAN_MULTITURN", "1")
+    assert control.multiturn_enabled() is True
+
+
+def test_set_multiturn_roundtrip(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_MULTITURN", raising=False)
+    assert control.set_multiturn(True) == {"ok": True, "multiturn": True}
+    assert control.multiturn_enabled() is True
+    assert control.load_state()["multiturn"] is True
+    control.set_multiturn(False)
+    assert control.multiturn_enabled() is False
+
+
+def test_set_multiturn_overrides_env(monkeypatch):
+    # The persisted dashboard toggle is the runtime source of truth: an
+    # explicit OFF wins even when STACKCHAN_MULTITURN=1 is still set.
+    monkeypatch.setenv("STACKCHAN_MULTITURN", "1")
+    control.set_multiturn(False)
+    assert control.multiturn_enabled() is False
+
+
+def test_multiturn_survives_other_state_writes(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_MULTITURN", raising=False)
+    control.set_multiturn(True)
+    control.save_state({**control.load_state(), "volume": 22})
+    reloaded = control.load_state()
+    assert reloaded["multiturn"] is True
     assert reloaded["volume"] == 22
 
 

@@ -1064,6 +1064,7 @@ async def test_control_heartbeat_toggles_gestures() -> None:
 @pytest.mark.asyncio
 async def test_control_routing_sets_force_hermes(monkeypatch) -> None:
     monkeypatch.delenv("STACKCHAN_LOCAL_LLM_MODEL", raising=False)
+    monkeypatch.delenv("STACKCHAN_MULTITURN", raising=False)
     gateway = ControlFakeGateway()
     app = _build_control_app(gateway)
     async with _client(app) as client:
@@ -1072,7 +1073,35 @@ async def test_control_routing_sets_force_hermes(monkeypatch) -> None:
         assert resp.json() == {"ok": True, "force_hermes": True}
         # The persisted flag is surfaced back in GET /control/status.
         body = (await client.get("/control/status")).json()
-    assert body["routing"] == {"force_hermes": True, "local_enabled": False}
+    assert body["routing"] == {
+        "force_hermes": True,
+        "local_enabled": False,
+        "multiturn": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_control_multiturn_sets_enabled(monkeypatch) -> None:
+    monkeypatch.delenv("STACKCHAN_LOCAL_LLM_MODEL", raising=False)
+    monkeypatch.delenv("STACKCHAN_MULTITURN", raising=False)
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/multiturn", json={"enabled": True})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "multiturn": True}
+        # Surfaced back in the GET /control/status routing block.
+        body = (await client.get("/control/status")).json()
+    assert body["routing"]["multiturn"] is True
+
+
+@pytest.mark.asyncio
+async def test_control_multiturn_rejects_non_bool() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post("/control/multiturn", json={"enabled": "yes"})
+        assert resp.status_code == 400
 
 
 @pytest.mark.asyncio

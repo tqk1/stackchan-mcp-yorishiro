@@ -8,7 +8,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
-from stackchan_mcp import control, hermes_bridge
+from stackchan_mcp import control, hermes_bridge, multiturn
 from stackchan_mcp.capture_server import GATEWAY_KEY
 from stackchan_mcp.hermes_bridge import (
     DEFAULT_VOICE_SYSTEM_PROMPT,
@@ -221,6 +221,7 @@ class _StubGateway:
         self.voice_turn_active = False
         self.multiturn = MultiturnSession()
         self.multiturn_active = False
+        self.multiturn_prompt_pending = False
         self._interactions = 0
 
     def note_human_interaction(self) -> None:
@@ -286,6 +287,11 @@ def _patch_voice_pipeline(
     # The turn reads the persisted Hermes-pin flag; default it off so
     # tests never touch the real ~/.stackchan control state.
     monkeypatch.setattr(control, "routing_force_hermes", lambda: False)
+    # The multi-turn gate likewise reads persisted state; bind it to the
+    # env reader so tests gate purely via STACKCHAN_MULTITURN and never
+    # depend on (or get perturbed by) a live dashboard toggle in the real
+    # control state file (mirrors the routing_force_hermes stub above).
+    monkeypatch.setattr(control, "multiturn_enabled", multiturn.is_enabled)
 
     async def fake_send(arguments, *, gateway=None, **kw):
         return {"frame_count": 1}
@@ -699,6 +705,53 @@ async def test_multiturn_stops_at_ceiling(monkeypatch):
     assert gateway.esp32.listen_calls == []
     # Reaching the ceiling ends the conversation: the counter resets.
     assert gateway.multiturn.turn_count == 0
+
+
+@pytest.mark.asyncio
+async def test_multiturn_ceiling_on_question_shows_tap_hint(monkeypatch):
+    # Phase 3 UX: when we stop only because the turn ceiling was hit while
+    # Hermes still had an open question, leave a "tap to continue" subtitle
+    # instead of blanking the display.
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    _record_status_text(monkeypatch)
+    rec = _record_device_cosmetics(monkeypatch)
+    _patch_voice_pipeline(
+        monkeypatch, transcript="やあ", reply="まだ続ける？", route="hermes"
+    )
+    _enable_multiturn(monkeypatch)
+    monkeypatch.setenv("MAX_MULTITURN_TURNS", "2")
+    monkeypatch.setattr(hermes_bridge.time, "monotonic", lambda: 500.0)
+    gateway = _StubGateway()
+    gateway.multiturn.turn_count = 2  # already at the ceiling
+    gateway.multiturn.last_activity = 500.0
+
+    await hermes_bridge.handle_voice_turn(_make_voice_request(gateway))
+
+    assert gateway.esp32.listen_calls == []  # no hands-free re-listen
+    assert gateway.multiturn_active is False
+    # The last subtitle written is the hint (after the reply subtitle), and
+    # the one-shot flag is consumed.
+    assert rec["subtitle"][-1] == multiturn.TAP_TO_CONTINUE_HINT
+    assert gateway.multiturn_prompt_pending is False
+
+
+@pytest.mark.asyncio
+async def test_multiturn_no_hint_on_normal_end(monkeypatch):
+    # A non-question end clears the subtitle as before — the hint is only
+    # for the ceiling-on-question case, not every conversation close.
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    _record_status_text(monkeypatch)
+    rec = _record_device_cosmetics(monkeypatch)
+    _patch_voice_pipeline(
+        monkeypatch, transcript="やあ", reply="そうだね。", route="hermes"
+    )
+    _enable_multiturn(monkeypatch)
+    gateway = _StubGateway()
+
+    await hermes_bridge.handle_voice_turn(_make_voice_request(gateway))
+
+    assert gateway.multiturn_prompt_pending is False
+    assert rec["subtitle"][-1] == ""
 
 
 @pytest.mark.asyncio

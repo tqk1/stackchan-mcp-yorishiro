@@ -57,6 +57,11 @@ from . import local_llm
 #: Reply suffixes that invite a follow-up answer (ASCII + full-width).
 _CONTINUE_SUFFIXES = ("?", "？")
 
+#: Subtitle shown when a hands-free chain stops only because it hit the
+#: per-conversation turn ceiling on a still-open question. A gentle nudge
+#: instead of falling silent mid-question (Phase 3 UX).
+TAP_TO_CONTINUE_HINT = "タップして続けてね"
+
 DEFAULT_MAX_TURNS = 4
 DEFAULT_SESSION_TIMEOUT_S = 60
 DEFAULT_TTS_GUARD_MS = 1000
@@ -75,8 +80,11 @@ def _env_positive_int(name: str, default: int) -> int:
 def is_enabled() -> bool:
     """True when multi-turn continuation is opted in via the env gate.
 
-    Phase 1 (MVP) gates on the env var alone; Phase 3 will OR this with a
-    persisted dashboard toggle.
+    Phase 1 (MVP) gated the runtime check on this env var. As of Phase 3
+    the runtime source of truth is the persisted dashboard toggle
+    (:func:`control.multiturn_enabled`); this env var only seeds that
+    toggle's initial default (see ``control._default_multiturn``). Kept for
+    that default and for tests.
     """
     return os.getenv("STACKCHAN_MULTITURN", "").strip().lower() in (
         "1",

@@ -38,10 +38,25 @@
 
 #### 残（Phase 1 + 2 共通）
 
-- [ ] 実機 E2E: ①自己拾音ゲート（自己ループ無し確認・guard_ms 実測）②文脈保持（会話内は覚える/別会話で混ざらない）← **ユーザー実機ステップ**（`STACKCHAN_MULTITURN=1` で起動）
-- [ ] commit（feature/multiturn・E2E green 後にまとめて or 2 コミット）
+- [x] commit 済み（`77883c3` feat(gateway): multi-turn voice — continuation + per-conversation Hermes context）
+- [x] 実機 E2E: ①自己拾音ゲート ②文脈保持（`STACKCHAN_MULTITURN=1` 起動・worklog p2 に記録）
 
-（Phase 3 ダッシュボードトグル+UX / Phase 4 firmware continuation[条件付き] / 全完了後 learning-report は プラン参照）
+#### Phase 3 — 仕上げ（ダッシュボードトグル + UX）2026-06-17 着手
+
+**スコープ確定（ユーザー 2026-06-17）**: ①ダッシュボード ON/OFF トグル+永続化 ②上限到達時の「タップして続けてね」字幕 UX を実装。継続ターン短縮 LISTEN_TIMEOUT は見送り（firmware 領域・Phase 4）。全完了後 learning-report 作成（Phase 1-3 まとめ）。
+**設計判断（確定）**: 永続トグルが実行時の主制御。env `STACKCHAN_MULTITURN` は state ファイル不在時の初期既定値に降格（dashboard OFF が env=1 に勝つ＝直感的、既存 systemd drop-in も維持）。
+**参照パターン**: `control.py:346-360` routing_force_hermes / `http_server.py:555-562` control_routing。字幕は既存 `control.set_device_subtitle`。
+
+- [x] (1) `control.py`: `_default_multiturn()`(env 由来) + `load_state`/`save_state` に `multiturn`(bool) + `multiturn_enabled()`/`set_multiturn()`（routing_force_hermes ミラー）。docstring 更新
+- [x] (2) `http_server.py`: `control_multiturn` エンドポイント（body `{"enabled": bool}`）+ `_build_control_status` routing ブロックに `multiturn` 追加 + Route 登録
+- [x] (3) `hermes_bridge.py`: `_maybe_continue` のゲートを `multiturn.is_enabled()` → `control.multiturn_enabled()` に変更
+- [x] (4) UX: `_maybe_continue` で「上限到達×質問」を検知し `multiturn_prompt_pending` を立てる → `handle_voice_turn` finally で字幕「タップして続けてね」表示（それ以外はクリア）。`gateway.py` に `self.multiturn_prompt_pending=False`。`multiturn.TAP_TO_CONTINUE_HINT` 定数
+- [x] (5) pytest **964 passed**（+9: control 5 / http 2 / hermes_bridge 2、完全一致テスト2件追従）・ruff clean。`_patch_voice_pipeline` で `multiturn_enabled`→`is_enabled` 束縛（live 非依存化）
+- [x] (6) dashboard.html（非git）: 「🧠応答モード」に「🔄連続会話」トグル追加（HTML/status追従/handler）。JS構文OK・ID整合3/3。status_api.py は変更不要（POST 汎用転送・status は既存 GET allowlist）
+- [x] (7) 実機 E2E（ユーザー 2026-06-17・「挙動はいい感じです」）: gateway 再起動（PID 1581616）→ `/control/status` に `routing.multiturn:true` 反映確認 → dashboard トグル ON/OFF・再起動後維持・上限字幕・自然な会話すべて green
+- [~] (8) E2E green 後: commit（feature/multiturn）✅ → learning-report（Phase 1-3 まとめ・docs/）作成中。worklog `docs/worklog/2026-06-17-multiturn-p3.md` 作成済
+
+（Phase 4 firmware continuation は条件付き・MVP で問題が出た場合のみ — プラン参照）
 
 ---
 

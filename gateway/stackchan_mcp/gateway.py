@@ -75,6 +75,11 @@ class Gateway:
         # (design principle #1). See :mod:`stackchan_mcp.multiturn`.
         self.multiturn = MultiturnSession()
         self.multiturn_active = False
+        # One-shot flag: set when a turn stops on the conversation's turn
+        # ceiling while Hermes still had an open question, so the voice-turn
+        # finally leaves a "tap to continue" subtitle (Phase 3 UX) instead
+        # of blanking the display. See hermes_bridge._maybe_continue.
+        self.multiturn_prompt_pending = False
 
     def note_human_interaction(self) -> None:
         """Record that the user just interacted (voice turn / touch)."""
