@@ -54,7 +54,7 @@
 - [x] (5) pytest **964 passed**（+9: control 5 / http 2 / hermes_bridge 2、完全一致テスト2件追従）・ruff clean。`_patch_voice_pipeline` で `multiturn_enabled`→`is_enabled` 束縛（live 非依存化）
 - [x] (6) dashboard.html（非git）: 「🧠応答モード」に「🔄連続会話」トグル追加（HTML/status追従/handler）。JS構文OK・ID整合3/3。status_api.py は変更不要（POST 汎用転送・status は既存 GET allowlist）
 - [x] (7) 実機 E2E（ユーザー 2026-06-17・「挙動はいい感じです」）: gateway 再起動（PID 1581616）→ `/control/status` に `routing.multiturn:true` 反映確認 → dashboard トグル ON/OFF・再起動後維持・上限字幕・自然な会話すべて green
-- [~] (8) E2E green 後: commit（feature/multiturn）✅ → learning-report（Phase 1-3 まとめ・docs/）作成中。worklog `docs/worklog/2026-06-17-multiturn-p3.md` 作成済
+- [x] (8) E2E green 後: commit（feature/multiturn・`20517be`）✅ / learning-report `docs/multiturn-report.md`（Phase 1-3 まとめ）作成済 ✅ / worklog `docs/worklog/2026-06-17-multiturn-p3.md` 作成済。**マルチターン Phase 1-3 全クローズ。** 残=report のコミット（ユーザー提案待ち）/ develop マージ・push（指示時）
 
 （Phase 4 firmware continuation は条件付き・MVP で問題が出た場合のみ — プラン参照）
 
