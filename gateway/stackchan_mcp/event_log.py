@@ -116,8 +116,14 @@ def rotate_old_entries(
     *,
     path: Path | None = None,
     now_unix: float | None = None,
+    retention_days: int | None = None,
 ) -> None:
-    """Prune log entries older than ``RETENTION_DAYS`` from the log file.
+    """Prune log entries older than the retention window from the log file.
+
+    ``retention_days`` overrides the module default ``RETENTION_DAYS``
+    (the presence log keeps a longer multi-week window for occupancy
+    tuning, while the event log keeps the short default). ``None`` uses
+    the default.
 
     Intended to be called exactly once at gateway startup. Reads every
     line, keeps the ones whose ``ts_unix`` is within the retention
@@ -135,7 +141,11 @@ def rotate_old_entries(
         return
     if now_unix is None:
         now_unix = time.time()
-    cutoff = now_unix - _RETENTION_SECONDS
+    if retention_days is None:
+        retention_seconds = _RETENTION_SECONDS
+    else:
+        retention_seconds = retention_days * 24 * 60 * 60
+    cutoff = now_unix - retention_seconds
 
     kept: list[str] = []
     try:

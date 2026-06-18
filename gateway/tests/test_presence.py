@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -464,3 +465,19 @@ async def test_start_prunes_old_log_entries(tmp_path) -> None:
     monitor.start()  # rotation runs synchronously before the poll loop
     await monitor.stop()
     assert log.read_text("utf-8") == ""
+
+
+@pytest.mark.asyncio
+async def test_start_uses_longer_presence_retention(tmp_path) -> None:
+    # Presence keeps PRESENCE_RETENTION_DAYS (28), longer than the event-log
+    # default of 7, so a ~20-day-old entry survives startup rotation.
+    assert presence.PRESENCE_RETENTION_DAYS == 28
+    log = tmp_path / "presence_log.jsonl"
+    twenty_days_ago = time.time() - 20 * 24 * 60 * 60
+    log.write_text(
+        json.dumps({"ts_unix": twenty_days_ago, "state": "active"}) + "\n", "utf-8"
+    )
+    monitor = make_monitor(poll_sec=1.0, log_path=log)
+    monitor.start()  # rotation runs synchronously before the poll loop
+    await monitor.stop()
+    assert len(log.read_text("utf-8").splitlines()) == 1

@@ -86,6 +86,12 @@ DEFAULT_SLEEP_WINDOW = "22:00-06:30"
 #: absent debounce from real data rather than a guess.
 DEFAULT_LOG_PATH = "~/.stackchan/presence_log.jsonl"
 
+#: Presence log retention (days). Longer than the event-log default
+#: (``event_log.RETENTION_DAYS`` = 7) because occupancy tuning wants
+#: multi-week weekday/weekend patterns from the raw TMOS time series.
+#: ~3.8 MB/day, so 28 days is ~110 MB — well within budget.
+PRESENCE_RETENTION_DAYS = 28
+
 #: Consecutive read failures before occupancy falls back to UNKNOWN
 #: (fail-open: a dead sensor must not silence the heartbeat forever).
 MAX_CONSEC_ERRORS = 3
@@ -263,9 +269,11 @@ class PresenceMonitor:
         if self._task is not None:
             return
         if self._log_path is not None:
-            # Prune entries older than the retention window once at startup,
-            # reusing the event-log rotation (it keys on ``ts_unix``).
-            rotate_old_entries(path=self._log_path)
+            # Prune entries older than the presence retention window once at
+            # startup, reusing the event-log rotation (it keys on ``ts_unix``).
+            rotate_old_entries(
+                path=self._log_path, retention_days=PRESENCE_RETENTION_DAYS
+            )
         self._task = asyncio.get_running_loop().create_task(self._loop())
         logger.info(
             "presence: enabled, poll=%.0fs, absent_after=%ds, sleep=%s",

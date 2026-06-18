@@ -205,6 +205,28 @@ def test_rotate_keeps_recent_drops_stale(monkeypatch, tmp_path):
     assert surviving[0]["session_id"] == "new"
 
 
+def test_rotate_custom_retention_overrides_default(monkeypatch, tmp_path):
+    """``retention_days`` overrides the module default (presence uses 28d)."""
+    path = tmp_path / "events.jsonl"
+    monkeypatch.setenv(PATH_ENV_VAR, str(path))
+
+    now = 1717000000.0
+    day = 24 * 60 * 60
+    # 20 days old: kept under a 28-day window, dropped under the 7-day default.
+    entry = json.dumps({"ts_unix": now - 20 * day, "session_id": "twenty"}) + "\n"
+
+    path.write_text(entry, encoding="utf-8")
+    rotate_old_entries(now_unix=now, retention_days=28)
+    surviving = path.read_text(encoding="utf-8").splitlines()
+    assert len(surviving) == 1
+    assert json.loads(surviving[0])["session_id"] == "twenty"
+
+    # The same entry is pruned under the default RETENTION_DAYS (7).
+    path.write_text(entry, encoding="utf-8")
+    rotate_old_entries(now_unix=now)
+    assert path.read_text(encoding="utf-8") == ""
+
+
 def test_rotate_keeps_entries_exactly_at_cutoff(monkeypatch, tmp_path):
     path = tmp_path / "events.jsonl"
     monkeypatch.setenv(PATH_ENV_VAR, str(path))
