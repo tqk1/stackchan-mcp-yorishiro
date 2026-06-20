@@ -308,6 +308,79 @@ async def test_snapshot_shape() -> None:
     assert snap["tmos"]["present"] is True
 
 
+# ---- sleep latch (static sleeper bridged through detection gaps) ------
+
+
+@pytest.mark.asyncio
+async def test_sleep_latch_holds_quiet_across_gap() -> None:
+    # Confirm presence in the sleeping window, then lose it for far longer
+    # than the debounce: the latch must hold QUIET, not flip to ABSENT.
+    clock = [0.0]
+    monitor = make_monitor(absent_after_s=120, sleep_window="22:00-06:30")
+    monitor._monotonic = lambda: clock[0]
+    monitor._now = lambda: dt.time(23, 0)
+
+    await monitor._poll_once()
+    assert monitor.state is PresenceState.QUIET
+    assert monitor._asleep is True
+
+    monitor._dispatch = make_dispatch(dict(ABSENT_REG))
+    clock[0] = 1000.0  # well past the 120 s debounce
+    await monitor._poll_once()
+    assert monitor.state is PresenceState.QUIET
+    assert monitor.allows_heartbeat() is True
+
+
+@pytest.mark.asyncio
+async def test_sleep_latch_clears_on_waking() -> None:
+    # Latched asleep, then morning arrives with an empty room -> ABSENT.
+    clock = [0.0]
+    monitor = make_monitor(absent_after_s=120, sleep_window="22:00-06:30")
+    monitor._monotonic = lambda: clock[0]
+    monitor._now = lambda: dt.time(23, 0)
+    await monitor._poll_once()
+    assert monitor._asleep is True
+
+    monitor._dispatch = make_dispatch(dict(ABSENT_REG))
+    monitor._now = lambda: dt.time(12, 0)  # waking hours
+    clock[0] = 1000.0
+    await monitor._poll_once()
+    assert monitor._asleep is False
+    assert monitor.state is PresenceState.ABSENT
+    assert monitor.allows_heartbeat() is False
+
+
+@pytest.mark.asyncio
+async def test_no_latch_when_away_into_night() -> None:
+    # Present in the evening, then gone before the sleeping window and all
+    # night: presence is never confirmed in the window, so the latch never
+    # sets -> ABSENT. This is how sleep and away-overnight stay distinct.
+    clock = [0.0]
+    monitor = make_monitor(absent_after_s=120, sleep_window="22:00-06:30")
+    monitor._monotonic = lambda: clock[0]
+    monitor._now = lambda: dt.time(21, 0)  # waking, present
+    await monitor._poll_once()
+    assert monitor.state is PresenceState.ACTIVE
+    assert monitor._asleep is False
+
+    monitor._dispatch = make_dispatch(dict(ABSENT_REG))
+    monitor._now = lambda: dt.time(23, 0)  # into the sleeping window, empty
+    clock[0] = 1000.0
+    await monitor._poll_once()
+    assert monitor._asleep is False
+    assert monitor.state is PresenceState.ABSENT
+
+
+@pytest.mark.asyncio
+async def test_snapshot_exposes_asleep() -> None:
+    monitor = make_monitor(sleep_window="22:00-06:30")
+    monitor._now = lambda: dt.time(23, 0)
+    await monitor._poll_once()
+    snap = monitor.snapshot()
+    assert snap["asleep"] is True
+    assert snap["state"] == "quiet"
+
+
 # ---- start / stop ----------------------------------------------------
 
 
@@ -420,6 +493,7 @@ async def test_poll_appends_full_tmos_line(tmp_path) -> None:
     ):
         assert key in rec
     assert rec["state"] == "active"
+    assert rec["asleep"] is False  # derived latch field is logged too
     assert rec["present"] is True
     assert isinstance(rec["ts_unix"], float)
     # A second poll appends, not overwrites.

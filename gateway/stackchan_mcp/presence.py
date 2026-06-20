@@ -13,10 +13,20 @@ derives a coarse state:
     UNKNOWN — not yet read / sensor erroring        (fail-open: heartbeat ON)
     ABSENT  — presence lost past the debounce window (heartbeat OFF)
     ACTIVE  — someone present, during waking hours    (heartbeat ON)
-    QUIET   — someone present, during sleeping hours  (mode=off; the
-              heartbeat is already suppressed by its own quiet-hours guard,
-              so QUIET is a *mode* signal for future appliance control —
-              the gate itself only ever suppresses on ABSENT)
+    QUIET   — sleeping hours with someone present, *or* a static sleeper
+              held by the sleep latch through a detection gap (mode=off;
+              the heartbeat is already suppressed by its own quiet-hours
+              guard, so QUIET is a *mode* signal for future appliance
+              control — the gate itself only ever suppresses on ABSENT)
+
+The absent debounce (``absent_after_s``) is the *exit* timer of an
+asymmetric hysteresis: entry is instant (any ``present`` read marks the
+room occupied), exit is slow (presence must stay lost for the whole
+debounce). Real TMOS logs show in-room gaps up to ~444 s while someone
+sits still or drifts to the sensor's range edge, so the operational
+debounce is minutes-scale (room data tunes it via the dashboard, not a
+code constant). On top of that, the **sleep latch** bridges the one gap a
+debounce cannot: a wholly still sleeper, undetectable for hours.
 
 Design:
 
@@ -224,6 +234,10 @@ class PresenceMonitor:
         self._quiet = parse_quiet_hours(self._sleep_window)
         self._state = PresenceState.UNKNOWN
         self._last_present_mono: float | None = None
+        # Sleep latch: set once presence is confirmed inside the sleeping
+        # window, cleared at waking hours. Holds QUIET through a static
+        # sleeper's detection gap (see _update_sleep_latch).
+        self._asleep = False
         self._last_snapshot: dict[str, Any] | None = None
         self._consec_errors = 0
         self._inited = False
@@ -312,6 +326,7 @@ class PresenceMonitor:
         return {
             "enabled": True,
             "state": self._state.value,
+            "asleep": self._asleep,  # QUIET internals: latched sleeper vs awake
             "allows_heartbeat": self.allows_heartbeat(),
             "last_seen_s_ago": self._last_seen_s_ago(),
             "poll_sec": self._poll_sec,
@@ -394,6 +409,7 @@ class PresenceMonitor:
         line = {
             "ts_unix": self._wall_clock(),
             "state": state.value,
+            "asleep": self._asleep,
             "last_seen_s_ago": self._last_seen_s_ago(),
             **snap,
         }
@@ -411,15 +427,38 @@ class PresenceMonitor:
             return None
         return (self._monotonic() - self._last_present_mono) < self._absent_after_s
 
+    def _update_sleep_latch(self) -> None:
+        """Bridge a static sleeper through detection gaps (side effect).
+
+        TMOS sees only *moving* warmth, so a wholly still sleeper goes
+        undetected for the rest of the night — a gap no debounce can span.
+        The latch records "presence was confirmed during the sleeping
+        window" and is held until waking hours, so the room is not
+        mis-declared ABSENT mid-sleep. An overnight outing never confirms
+        presence in the window, so the latch stays clear and sleep vs.
+        away-overnight remain distinguishable. Driven from the poll only;
+        ``_derive_state`` stays a pure read of the current latch.
+        """
+        if not is_quiet(self._now(), self._quiet):
+            self._asleep = False  # waking hours clear the latch
+        elif self._occupied():  # confirmed present (None/False are falsy)
+            self._asleep = True
+
     def _derive_state(self) -> PresenceState:
         occ = self._occupied()
         if occ is None:
             return PresenceState.UNKNOWN
-        if not occ:
-            return PresenceState.ABSENT
-        if is_quiet(self._now(), self._quiet):
+        quiet_now = is_quiet(self._now(), self._quiet)
+        if occ:
+            return PresenceState.QUIET if quiet_now else PresenceState.ACTIVE
+        # Debounce elapsed. In the sleeping window a set latch keeps QUIET
+        # (a still sleeper whose motion fell below the sensor); otherwise
+        # the room is genuinely empty.
+        # [FUTURE Phase 3] a learned weekday/hour occupancy prior could
+        # also lift ABSENT->QUIET/ACTIVE here once enough data accumulates.
+        if quiet_now and self._asleep:
             return PresenceState.QUIET
-        return PresenceState.ACTIVE
+        return PresenceState.ABSENT
 
     async def _poll_once(self) -> None:
         """One poll: read TMOS, update the last-seen timestamp + state.
@@ -454,6 +493,7 @@ class PresenceMonitor:
         self._last_snapshot = snap
         if snap.get("present"):
             self._last_present_mono = self._monotonic()
+        self._update_sleep_latch()
         self._state = self._derive_state()
         self._append_log(snap, self._state)
 
