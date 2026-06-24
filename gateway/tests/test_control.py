@@ -45,6 +45,7 @@ def _isolate_state(monkeypatch, tmp_path):
 
 def test_load_state_defaults_when_missing(monkeypatch):
     monkeypatch.delenv("STACKCHAN_MULTITURN", raising=False)
+    monkeypatch.delenv("STACKCHAN_PROACTIVE", raising=False)
     state = control.load_state()
     assert state == {
         "volume": control.DEFAULT_VOLUME,
@@ -55,6 +56,7 @@ def test_load_state_defaults_when_missing(monkeypatch):
         "led": control.DEFAULT_LED,
         "force_hermes": False,
         "multiturn": False,
+        "proactive_enabled": False,
     }
 
 
@@ -62,6 +64,7 @@ def test_save_then_load_roundtrip(monkeypatch, tmp_path):
     path = tmp_path / "rt.json"
     monkeypatch.setenv("STACKCHAN_CONTROL_STATE", str(path))
     monkeypatch.delenv("STACKCHAN_MULTITURN", raising=False)
+    monkeypatch.delenv("STACKCHAN_PROACTIVE", raising=False)
     control.save_state(
         {"volume": 33, "muted": True, "pre_mute_volume": 70, "mic_gain": 18}
     )
@@ -76,6 +79,7 @@ def test_save_then_load_roundtrip(monkeypatch, tmp_path):
         "led": control.DEFAULT_LED,
         "force_hermes": False,
         "multiturn": False,
+        "proactive_enabled": False,
     }
 
 
@@ -154,6 +158,40 @@ def test_set_multiturn_overrides_env(monkeypatch):
     monkeypatch.setenv("STACKCHAN_MULTITURN", "1")
     control.set_multiturn(False)
     assert control.multiturn_enabled() is False
+
+
+# ---- proactive (state-transition speech toggle) ----------------------
+
+
+def test_proactive_defaults_false(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_PROACTIVE", raising=False)
+    assert control.proactive_enabled() is False
+
+
+def test_proactive_default_seeded_from_env(monkeypatch):
+    # A fresh state file (no key) seeds from the STACKCHAN_PROACTIVE master
+    # switch, so enabling the env turns it on without a separate dashboard tap.
+    monkeypatch.setenv("STACKCHAN_PROACTIVE", "1")
+    assert control.proactive_enabled() is True
+
+
+def test_set_proactive_roundtrip(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_PROACTIVE", raising=False)
+    assert control.set_proactive_enabled(True) == {
+        "ok": True,
+        "proactive_enabled": True,
+    }
+    assert control.proactive_enabled() is True
+    assert control.load_state()["proactive_enabled"] is True
+    control.set_proactive_enabled(False)
+    assert control.proactive_enabled() is False
+
+
+def test_set_proactive_overrides_env(monkeypatch):
+    # A persisted OFF wins even with STACKCHAN_PROACTIVE=1 still set.
+    monkeypatch.setenv("STACKCHAN_PROACTIVE", "1")
+    control.set_proactive_enabled(False)
+    assert control.proactive_enabled() is False
 
 
 def test_multiturn_survives_other_state_writes(monkeypatch):

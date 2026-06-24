@@ -721,10 +721,12 @@ class ControlFakeGateway:
         connected: bool = True,
         heartbeat: object | None = None,
         presence: object | None = None,
+        proactive: object | None = None,
     ) -> None:
         self.esp32 = ControlFakeESP32(connected=connected)
         self._heartbeat = heartbeat
         self._presence = presence
+        self._proactive = proactive
         self.voice_turn_active = False
 
 
@@ -1101,6 +1103,44 @@ async def test_control_multiturn_rejects_non_bool() -> None:
     app = _build_control_app(gateway)
     async with _client(app) as client:
         resp = await client.post("/control/multiturn", json={"enabled": "yes"})
+        assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_control_proactive_sets_enabled(monkeypatch) -> None:
+    monkeypatch.delenv("STACKCHAN_PROACTIVE", raising=False)
+    gateway = ControlFakeGateway(proactive=object())  # speaker built
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/proactive", json={"proactive_enabled": True}
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "proactive_enabled": True}
+        # Surfaced back in GET /control/status.
+        body = (await client.get("/control/status")).json()
+    assert body["proactive"] == {"enabled": True, "available": True}
+
+
+@pytest.mark.asyncio
+async def test_control_status_proactive_unavailable_when_no_speaker(monkeypatch) -> None:
+    monkeypatch.delenv("STACKCHAN_PROACTIVE", raising=False)
+    gateway = ControlFakeGateway()  # no proactive speaker
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        body = (await client.get("/control/status")).json()
+    assert body["proactive"]["available"] is False
+    assert body["proactive"]["enabled"] is False  # default off
+
+
+@pytest.mark.asyncio
+async def test_control_proactive_rejects_non_bool() -> None:
+    gateway = ControlFakeGateway()
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.post(
+            "/control/proactive", json={"proactive_enabled": "yes"}
+        )
         assert resp.status_code == 400
 
 

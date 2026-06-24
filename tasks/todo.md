@@ -10,6 +10,24 @@
 
 ## 現役タスク（まだやるべき生きた未完了項目）
 
+### ★★ 着手中: おやすみ／つうじょう モード自動切替＋挨拶 2026-06-24 — ブランチ `feature/proactive`
+
+**方針確定（ケンジ 2026-06-24）**: presence 遷移に「プリセット適用（モード切替）」を相乗りさせ挨拶と同時に行う。ユーザー作成 `おやすみ`/`つうじょう` プリセットを再利用。単一トグル（🗣️自発会話）で ON/OFF。帰宅でも つうじょう 適用・境界会話中のスキップ許容（確定）。
+
+| 遷移 | きっかけ | 動作 | 順序 |
+|---|---|---|---|
+| active_quiet（新規）| 22:00 ACTIVE→QUIET | 「おやすみ」→ おやすみ適用 | 発話→適用（ミュート前に喋る）|
+| quiet_active（既存）| 6:30 QUIET→ACTIVE | つうじょう適用 →「おはよう」 | 適用→発話（unmute後）|
+| absent_active（既存）| 帰宅 ABSENT→ACTIVE | つうじょう適用 →「おかえり」 | 適用→発話 |
+
+- [x] proactive.py: `_Transition` に preset_role/preset_first/exempt_quiet_hours 追加・active_quiet 遷移追加・DEFAULT_TRANSITIONS 更新・ProactiveConfig に day_preset/night_preset(env 上書き・既定 つうじょう/おやすみ)・_skip_reason(transition) で exempt 時 quiet スキップ・on_state_change で refire 前倒し＋順序制御＋_apply_mode(best-effort)
+- [x] test_proactive.py: active_quiet(quiet中発火/順序/モード適用)・→ACTIVE で day 適用（+8 ケース）
+- [x] pytest **1020 passed** + ruff clean
+- [ ] 実機 E2E（restart 後・睡眠窓を一時操作で おやすみ→おはよう／任意で帰宅 おかえり）← **sudo restart 待ち**
+- [ ] commit + learning-report
+
+**フォローアップ（将来・今回スコープ外）**: 在室データ蓄積→曜日×時間帯の在室確率マップを半自動学習し精度向上／「その時間にいたか?」を Discord で Hermes 経由確認しラベル収集（教師信号）。memory `project_future_sensors`/`project_life_support_vision` の学習アイデアと統合。
+
 ### ★★ 着手中: マルチターン会話（Phase 1 MVP）2026-06-17  — ブランチ `feature/multiturn`
 
 **プラン**: `~/.claude/plans/codex-fluffy-breeze.md`（承認済み）。調査=Explore×3＋Plan＋独立Claude赤チーム。

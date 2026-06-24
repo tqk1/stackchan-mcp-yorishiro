@@ -128,19 +128,31 @@ def _ogg_opus_to_pcm16k(data: bytes) -> bytes:
     return bytes(out)
 
 
-async def ask_hermes(text: str, *, session_id: str | None = None) -> str:
+async def ask_hermes(
+    text: str,
+    *,
+    session_id: str | None = None,
+    system_prompt: str | None = None,
+) -> str:
     """Send one user turn to the Hermes API server, return the reply text.
 
     ``session_id`` is the per-conversation Hermes context id computed by
     the voice turn (Phase 2). When ``None`` (other callers, tests) it
     falls back to the fixed ``HERMES_SESSION_ID``, preserving the old
     behaviour.
+
+    ``system_prompt`` overrides the spoken-reply prompt for callers with a
+    different framing — the proactive speaker passes its own prompt so a
+    state-transition utterance reads as a one-line greeting, not a chat
+    answer. When ``None`` the usual ``HERMES_VOICE_SYSTEM_PROMPT`` env /
+    default applies. The tool-routing line is always appended either way.
     """
     base_url = os.getenv("HERMES_API_URL", DEFAULT_HERMES_API_URL).rstrip("/")
     api_key = os.getenv("HERMES_API_KEY", "")
-    system_prompt = os.getenv(
-        "HERMES_VOICE_SYSTEM_PROMPT", DEFAULT_VOICE_SYSTEM_PROMPT
-    )
+    if system_prompt is None:
+        system_prompt = os.getenv(
+            "HERMES_VOICE_SYSTEM_PROMPT", DEFAULT_VOICE_SYSTEM_PROMPT
+        )
 
     headers = {"Content-Type": "application/json"}
     if api_key:

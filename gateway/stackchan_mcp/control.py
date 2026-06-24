@@ -294,6 +294,23 @@ def _default_multiturn() -> bool:
     )
 
 
+def _default_proactive() -> bool:
+    """Initial proactive-speech default when the state file has no key.
+
+    Seeds from the ``STACKCHAN_PROACTIVE`` master switch (same parse, kept
+    local to avoid a control→proactive import cycle) so enabling the env
+    var turns the feature on without a separate dashboard tap. Once the
+    state file holds a value, the persisted dashboard toggle is the source
+    of truth — a dashboard OFF wins even with the env var still set.
+    """
+    return os.getenv("STACKCHAN_PROACTIVE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def load_state() -> dict[str, Any]:
     """Read the persisted control state, with defaults filled in.
 
@@ -322,6 +339,7 @@ def load_state() -> dict[str, Any]:
     led = _normalize_led(raw.get("led", DEFAULT_LED))
     force_hermes = bool(raw.get("force_hermes", DEFAULT_FORCE_HERMES))
     multiturn = bool(raw.get("multiturn", _default_multiturn()))
+    proactive = bool(raw.get("proactive_enabled", _default_proactive()))
     return {
         "volume": volume,
         "muted": muted,
@@ -331,6 +349,7 @@ def load_state() -> dict[str, Any]:
         "led": led,
         "force_hermes": force_hermes,
         "multiturn": multiturn,
+        "proactive_enabled": proactive,
     }
 
 
@@ -348,6 +367,9 @@ def save_state(state: dict[str, Any]) -> None:
         "led": _normalize_led(state.get("led", DEFAULT_LED)),
         "force_hermes": bool(state.get("force_hermes", DEFAULT_FORCE_HERMES)),
         "multiturn": bool(state.get("multiturn", _default_multiturn())),
+        "proactive_enabled": bool(
+            state.get("proactive_enabled", _default_proactive())
+        ),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -398,6 +420,25 @@ def set_multiturn(enabled: bool) -> dict[str, Any]:
     state["multiturn"] = bool(enabled)
     save_state(state)
     return {"ok": True, "multiturn": bool(enabled)}
+
+
+def proactive_enabled() -> bool:
+    """True when state-transition-driven proactive speech is on (persisted).
+
+    Runtime source of truth for the proactive speaker, mirroring
+    :func:`multiturn_enabled`. The ``STACKCHAN_PROACTIVE`` env var only
+    seeds the default (see :func:`_default_proactive`) *and* gates whether
+    the speaker is built at all; once running, a dashboard OFF here wins.
+    """
+    return bool(load_state()["proactive_enabled"])
+
+
+def set_proactive_enabled(enabled: bool) -> dict[str, Any]:
+    """Persist the proactive-speech toggle and echo the new value back."""
+    state = load_state()
+    state["proactive_enabled"] = bool(enabled)
+    save_state(state)
+    return {"ok": True, "proactive_enabled": bool(enabled)}
 
 
 def is_muted() -> bool:

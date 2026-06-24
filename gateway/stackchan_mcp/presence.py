@@ -64,6 +64,7 @@ import logging
 import os
 import tempfile
 import time
+from collections.abc import Awaitable, Callable
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -76,6 +77,16 @@ if TYPE_CHECKING:
     from .gateway import Gateway
 
 logger = logging.getLogger(__name__)
+
+#: A state-change observer: ``cb(old, new)`` fired whenever the derived
+#: state flips. May be sync or async (a coroutine is awaited); exceptions
+#: are swallowed so an observer can never take the monitor down. Used by
+#: the proactive speaker to react to meaningful transitions (e.g. a
+#: returning resident or a morning wake), keeping observation mechanical
+#: in the gateway and the wording in Hermes.
+StateChangeCb = Callable[
+    ["PresenceState", "PresenceState"], Awaitable[None] | None
+]
 
 #: Persisted threshold file. Overridable for tests via the env var.
 DEFAULT_STATE_PATH = "~/.stackchan/presence_state.json"
@@ -242,6 +253,7 @@ class PresenceMonitor:
         self._consec_errors = 0
         self._inited = False
         self._task: asyncio.Task[None] | None = None
+        self._on_change: list[StateChangeCb] = []
 
     @classmethod
     def from_env(cls, gateway: "Gateway") -> "PresenceMonitor | None":
@@ -321,6 +333,16 @@ class PresenceMonitor:
     def state(self) -> PresenceState:
         return self._state
 
+    def register_on_state_change(self, cb: StateChangeCb) -> None:
+        """Subscribe to derived-state transitions (see :data:`StateChangeCb`).
+
+        Callbacks fire only on an actual flip and only for poll-driven
+        changes — a ``update_config`` recompute (dashboard threshold edit)
+        is intentionally silent (``notify=False``) so re-tuning the sleep
+        window never reads as a real "woke up" / "came home" event.
+        """
+        self._on_change.append(cb)
+
     def snapshot(self) -> dict[str, Any]:
         """Summary for GET /control/presence and the status payload."""
         return {
@@ -367,7 +389,9 @@ class PresenceMonitor:
         )
         # Reflect the change immediately (e.g. a shorter debounce may flip
         # the room to ABSENT now, or a new window may switch ACTIVE<->QUIET).
-        self._state = self._derive_state()
+        # notify=False: a dashboard re-tune is not a real occupancy event,
+        # so it must not trigger a proactive "おかえり"/"おはよう".
+        self._set_state(self._derive_state(), notify=False)
         return {
             "ok": True,
             "config": {
@@ -377,6 +401,30 @@ class PresenceMonitor:
         }
 
     # ---- internals -------------------------------------------------
+
+    def _set_state(self, new: PresenceState, *, notify: bool = True) -> None:
+        """Assign the derived state and fire observers on an actual flip.
+
+        Observers run as a detached task (``create_task``) so the poll loop
+        never waits on Hermes/TTS; with none registered this is a plain
+        assignment (no task, no running-loop requirement) so the direct
+        ``await monitor._poll_once()`` path in tests is unchanged.
+        """
+        old = self._state
+        self._state = new
+        if notify and new != old and self._on_change:
+            asyncio.get_running_loop().create_task(self._fire_change(old, new))
+
+    async def _fire_change(self, old: PresenceState, new: PresenceState) -> None:
+        for cb in list(self._on_change):
+            try:
+                result = cb(old, new)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                # An observer must never take the monitor down (same
+                # discipline as _loop): log and move on.
+                logger.exception("presence: on_state_change callback failed")
 
     def _now(self) -> _dt.time:
         """Local wall-clock time; split out for tests."""
@@ -469,7 +517,7 @@ class PresenceMonitor:
         if not self._gateway.esp32.device_connected:
             # No device: cannot read. Stay UNKNOWN (fail-open) and force a
             # re-init on the next connect rather than flipping to ABSENT.
-            self._state = PresenceState.UNKNOWN
+            self._set_state(PresenceState.UNKNOWN)
             self._consec_errors = 0
             self._inited = False
             return
@@ -484,7 +532,7 @@ class PresenceMonitor:
             # tick. Fall back to UNKNOWN (fail-open) after a few failures.
             self._inited = False
             if self._consec_errors >= MAX_CONSEC_ERRORS:
-                self._state = PresenceState.UNKNOWN
+                self._set_state(PresenceState.UNKNOWN)
             logger.debug(
                 "presence: read failed (%s), consec=%d", exc, self._consec_errors
             )
@@ -494,7 +542,7 @@ class PresenceMonitor:
         if snap.get("present"):
             self._last_present_mono = self._monotonic()
         self._update_sleep_latch()
-        self._state = self._derive_state()
+        self._set_state(self._derive_state())
         self._append_log(snap, self._state)
 
     async def _loop(self) -> None:

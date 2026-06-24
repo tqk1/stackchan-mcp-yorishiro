@@ -245,6 +245,14 @@ async def _build_control_status(gateway: Any) -> dict[str, Any]:
             "local_enabled": local_llm.is_enabled(),
             "multiturn": state["multiturn"],
         },
+        "proactive": {
+            # ``enabled`` is the persisted dashboard toggle (runtime truth);
+            # ``available`` is whether the speaker was built at all (the
+            # STACKCHAN_PROACTIVE env master switch). Toggling has no effect
+            # until available is true.
+            "enabled": state["proactive_enabled"],
+            "available": getattr(gateway, "_proactive", None) is not None,
+        },
     }
 
 
@@ -574,6 +582,18 @@ def build_app(
             return _control_error("enabled must be a boolean", status=400)
         return _control_json(control.set_multiturn(enabled))
 
+    async def control_proactive(request: Request) -> JSONResponse:
+        # Gateway-only state (no device round-trip): the runtime kill switch
+        # for state-transition-driven proactive speech. The persisted toggle
+        # is read live by ProactiveSpeaker.on_state_change, so this takes
+        # effect on the next transition without a restart. Note it only
+        # matters when the speaker exists (STACKCHAN_PROACTIVE env set).
+        body = await _read_json_body(request)
+        enabled = body.get("proactive_enabled")
+        if not isinstance(enabled, bool):
+            return _control_error("proactive_enabled must be a boolean", status=400)
+        return _control_json(control.set_proactive_enabled(enabled))
+
     async def control_avatar(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
         if not gateway.esp32.device_connected:
@@ -793,6 +813,7 @@ def build_app(
         Route("/control/heartbeat", endpoint=control_heartbeat, methods=["POST"]),
         Route("/control/routing", endpoint=control_routing, methods=["POST"]),
         Route("/control/multiturn", endpoint=control_multiturn, methods=["POST"]),
+        Route("/control/proactive", endpoint=control_proactive, methods=["POST"]),
         Route("/control/avatar", endpoint=control_avatar, methods=["POST"]),
         Route("/control/say", endpoint=control_say, methods=["POST"]),
         Route("/control/i2c", endpoint=control_i2c, methods=["POST"]),

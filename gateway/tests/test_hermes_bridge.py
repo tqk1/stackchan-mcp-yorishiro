@@ -108,6 +108,37 @@ async def test_ask_hermes_custom_prompt_still_gets_tool_guidance(
 
 
 @pytest.mark.asyncio
+async def test_ask_hermes_explicit_system_prompt_overrides_env(
+    monkeypatch, aiohttp_unused_port
+):
+    """The proactive speaker passes its own prompt via system_prompt=; it
+    must win over HERMES_VOICE_SYSTEM_PROMPT while the tool line still
+    appends (so a proactive turn can still reach the MCP tools)."""
+    received: dict[str, Any] = {}
+
+    async def handle(request: web.Request) -> web.Response:
+        received["payload"] = await request.json()
+        return web.json_response(
+            {"choices": [{"message": {"role": "assistant", "content": "おかえり"}}]}
+        )
+
+    runner, base_url = await _run_hermes_stub(handle, aiohttp_unused_port)
+    monkeypatch.setenv("HERMES_API_URL", base_url)
+    monkeypatch.setenv("HERMES_VOICE_SYSTEM_PROMPT", "env-prompt。")
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+    try:
+        reply = await ask_hermes("状況テスト", system_prompt="自発プロンプト。")
+    finally:
+        await runner.cleanup()
+
+    assert reply == "おかえり"
+    system = received["payload"]["messages"][0]
+    assert system["content"].startswith("自発プロンプト。")
+    assert "env-prompt。" not in system["content"]
+    assert HERMES_VOICE_TOOLS_LINE in system["content"]
+
+
+@pytest.mark.asyncio
 async def test_ask_hermes_error_status_raises(monkeypatch, aiohttp_unused_port):
     async def handle(request: web.Request) -> web.Response:
         return web.Response(status=500, text="boom")

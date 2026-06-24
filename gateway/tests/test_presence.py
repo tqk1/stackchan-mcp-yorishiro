@@ -555,3 +555,106 @@ async def test_start_uses_longer_presence_retention(tmp_path) -> None:
     monitor.start()  # rotation runs synchronously before the poll loop
     await monitor.stop()
     assert len(log.read_text("utf-8").splitlines()) == 1
+
+
+# ---- state-change observers (proactive hook) -------------------------
+
+
+async def _drain() -> None:
+    """Let the detached _fire_change task(s) run to completion."""
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_register_on_state_change_fires_on_flip() -> None:
+    seen: list[tuple[PresenceState, PresenceState]] = []
+    clock = [0.0]
+    monitor = make_monitor(absent_after_s=120)
+    monitor._monotonic = lambda: clock[0]
+    monitor._now = lambda: dt.time(12, 0)
+    monitor.register_on_state_change(lambda old, new: seen.append((old, new)))
+
+    await monitor._poll_once()  # UNKNOWN -> ACTIVE
+    await _drain()
+    monitor._dispatch = make_dispatch(dict(ABSENT_REG))
+    clock[0] = 130.0
+    await monitor._poll_once()  # ACTIVE -> ABSENT (debounce elapsed)
+    await _drain()
+
+    assert seen == [
+        (PresenceState.UNKNOWN, PresenceState.ACTIVE),
+        (PresenceState.ACTIVE, PresenceState.ABSENT),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_callback_when_state_unchanged() -> None:
+    seen: list[tuple] = []
+    monitor = make_monitor()
+    monitor._now = lambda: dt.time(12, 0)
+    monitor.register_on_state_change(lambda old, new: seen.append((old, new)))
+
+    await monitor._poll_once()  # UNKNOWN -> ACTIVE (one flip)
+    await _drain()
+    await monitor._poll_once()  # ACTIVE -> ACTIVE (no flip)
+    await _drain()
+
+    assert seen == [(PresenceState.UNKNOWN, PresenceState.ACTIVE)]
+
+
+@pytest.mark.asyncio
+async def test_update_config_does_not_notify() -> None:
+    # A dashboard threshold re-tune flips the state but must stay silent —
+    # it is not a real occupancy event (would mis-fire おかえり/おはよう).
+    seen: list[tuple] = []
+    clock = [0.0]
+    monitor = make_monitor(absent_after_s=120)
+    monitor._monotonic = lambda: clock[0]
+    monitor._now = lambda: dt.time(12, 0)
+    await monitor._poll_once()  # ACTIVE, last seen at t=0
+    await _drain()
+    monitor.register_on_state_change(lambda old, new: seen.append((old, new)))
+
+    clock[0] = 200.0  # now well past a shrunken debounce
+    monitor.update_config(absent_after_s=5)  # recomputes -> ABSENT
+    await _drain()
+
+    assert monitor.state is PresenceState.ABSENT
+    assert seen == []  # notify=False: no observer fired
+
+
+@pytest.mark.asyncio
+async def test_callback_exception_does_not_break_others() -> None:
+    seen: list[tuple] = []
+
+    def boom(old, new):
+        raise RuntimeError("observer blew up")
+
+    monitor = make_monitor()
+    monitor._now = lambda: dt.time(12, 0)
+    monitor.register_on_state_change(boom)
+    monitor.register_on_state_change(lambda old, new: seen.append((old, new)))
+
+    await monitor._poll_once()  # UNKNOWN -> ACTIVE
+    await _drain()
+
+    # The raising observer is swallowed; the second one still runs.
+    assert seen == [(PresenceState.UNKNOWN, PresenceState.ACTIVE)]
+
+
+@pytest.mark.asyncio
+async def test_async_callback_is_awaited() -> None:
+    seen: list[tuple] = []
+
+    async def record(old, new):
+        seen.append((old, new))
+
+    monitor = make_monitor()
+    monitor._now = lambda: dt.time(12, 0)
+    monitor.register_on_state_change(record)
+
+    await monitor._poll_once()
+    await _drain()
+
+    assert seen == [(PresenceState.UNKNOWN, PresenceState.ACTIVE)]

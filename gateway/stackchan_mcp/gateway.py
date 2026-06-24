@@ -19,6 +19,7 @@ from .heartbeat import HeartbeatRunner
 from .mdns_advertiser import MdnsAdvertiser
 from .multiturn import MultiturnSession
 from .presence import PresenceMonitor
+from .proactive import ProactiveSpeaker
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,11 @@ class Gateway:
         # and gates the heartbeat (never greet an empty room). Opt-in via
         # STACKCHAN_PRESENCE_POLL_SEC; from_env returns None when unset.
         self._presence: PresenceMonitor | None = None
+        # Phase D core (yorishiro fork): the Hermes 自発判断層. Subscribes
+        # to presence transitions and speaks one Hermes-authored line on a
+        # meaningful flip (returning resident / morning wake). Opt-in via
+        # STACKCHAN_PROACTIVE; from_env returns None when unset.
+        self._proactive: ProactiveSpeaker | None = None
         # Phase E (yorishiro fork): monotonic timestamp of the last
         # human-initiated interaction (voice turn or touch). The
         # heartbeat's speak cooldown reads this so a proactive
@@ -252,7 +258,16 @@ class Gateway:
         # Phase D presence monitor (yorishiro fork): opt-in via
         # STACKCHAN_PRESENCE_POLL_SEC; gates the heartbeat on room occupancy.
         self._presence = PresenceMonitor.from_env(self)
+        # Phase D core: the proactive speaker rides on the presence
+        # monitor's transitions, so it is only meaningful when presence is
+        # enabled. Wire the callback before start() so no early flip is
+        # missed.
+        self._proactive = ProactiveSpeaker.from_env(self)
         if self._presence is not None:
+            if self._proactive is not None:
+                self._presence.register_on_state_change(
+                    self._proactive.on_state_change
+                )
             self._presence.start()
 
         self._running = True
@@ -270,6 +285,9 @@ class Gateway:
         if self._presence is not None:
             await self._presence.stop()
             self._presence = None
+        # The proactive speaker owns no task (it lives on the presence
+        # callback), so dropping the reference is the whole teardown.
+        self._proactive = None
         if self._mdns_advertiser:
             try:
                 await self._mdns_advertiser.stop()
