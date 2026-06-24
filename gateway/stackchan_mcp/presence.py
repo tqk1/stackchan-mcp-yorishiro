@@ -69,7 +69,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import sensors
+from . import presence_report, sensors
 from .event_log import rotate_old_entries
 from .heartbeat import is_quiet, parse_quiet_hours
 
@@ -106,6 +106,11 @@ DEFAULT_SLEEP_WINDOW = "22:00-06:30"
 #: derived state) so we can later reconstruct occupancy gaps and tune the
 #: absent debounce from real data rather than a guess.
 DEFAULT_LOG_PATH = "~/.stackchan/presence_log.jsonl"
+
+#: Default directory for the daily self-diagnostic reports — one
+#: Markdown + JSON pair per day. Like the log, opt-out via the env
+#: (``STACKCHAN_PRESENCE_REPORT=off``).
+DEFAULT_REPORT_DIR = "~/.stackchan/presence_reports"
 
 #: Presence log retention (days). Longer than the event-log default
 #: (``event_log.RETENTION_DAYS`` = 7) because occupancy tuning wants
@@ -152,6 +157,36 @@ def _resolve_log_path() -> Path | None:
     if not stripped or stripped.lower() == "off":
         return None
     return Path(stripped).expanduser()
+
+
+def _resolve_report_dir() -> Path | None:
+    """Resolve the daily-report directory, or None when disabled.
+
+    Three-value like :func:`_resolve_log_path`: unset -> default dir,
+    empty/``"off"`` -> None (disabled), any other value -> that dir. The
+    caller additionally gates this on the log being enabled (a report
+    without a log has no data to aggregate).
+    """
+    raw = os.getenv("STACKCHAN_PRESENCE_REPORT")
+    if raw is None:
+        return Path(DEFAULT_REPORT_DIR).expanduser()
+    stripped = raw.strip()
+    if not stripped or stripped.lower() == "off":
+        return None
+    return Path(stripped).expanduser()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically (write-temp + os.replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            fp.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def _clamp_absent_after(value: Any) -> int:
@@ -235,6 +270,7 @@ class PresenceMonitor:
         absent_after_s: int = DEFAULT_ABSENT_AFTER_S,
         sleep_window: str = DEFAULT_SLEEP_WINDOW,
         log_path: Path | None = None,
+        report_dir: Path | None = None,
     ):
         self._gateway = gateway
         self._dispatch = dispatch
@@ -242,6 +278,10 @@ class PresenceMonitor:
         self._absent_after_s = _clamp_absent_after(absent_after_s)
         self._sleep_window = _valid_window(sleep_window) or DEFAULT_SLEEP_WINDOW
         self._log_path = log_path
+        self._report_dir = report_dir
+        #: Date (ISO) whose daily report was already attempted this run, so
+        #: the once-a-day write is not re-evaluated on every poll.
+        self._last_report_date: str | None = None
         self._quiet = parse_quiet_hours(self._sleep_window)
         self._state = PresenceState.UNKNOWN
         self._last_present_mono: float | None = None
@@ -282,13 +322,16 @@ class PresenceMonitor:
             return await _dispatch_mcp_tool(name, arguments, gateway)
 
         config = load_config()
+        log_path = _resolve_log_path()
         return cls(
             gateway,
             dispatch=dispatch,
             poll_sec=poll_sec,
             absent_after_s=config["absent_after_s"],
             sleep_window=config["sleep_window"],
-            log_path=_resolve_log_path(),
+            log_path=log_path,
+            # A daily report needs the log to aggregate; gate it on logging.
+            report_dir=_resolve_report_dir() if log_path is not None else None,
         )
 
     def start(self) -> None:
@@ -399,6 +442,96 @@ class PresenceMonitor:
                 "sleep_window": self._sleep_window,
             },
         }
+
+    # ---- self-diagnostic report -----------------------------------
+
+    def _read_recent_records(self, *, days: int) -> list[dict[str, Any]]:
+        """Read the last ``days`` of presence-log records (ts_unix filter).
+
+        Mirrors :func:`event_log.rotate_old_entries`' keep logic: malformed
+        lines, non-dicts and rows without a usable ``ts_unix`` are dropped.
+        A disabled log (``_log_path`` None) or a missing file yields ``[]``.
+        Disk errors are logged at WARNING and swallowed (the report degrades
+        to empty rather than taking a request down).
+        """
+        path = self._log_path
+        if path is None or not path.exists():
+            return []
+        cutoff = self._wall_clock() - days * 86400
+        out: list[dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for raw in f:
+                    stripped = raw.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        obj = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    ts = obj.get("ts_unix")
+                    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                        continue
+                    if ts >= cutoff:
+                        out.append(obj)
+        except (OSError, PermissionError) as exc:
+            logger.warning("presence: cannot read log %s for report (%s)", path, exc)
+        return out
+
+    def build_report(self, *, days: int = 7) -> dict[str, Any]:
+        """Aggregate the last ``days`` of presence log into a health report.
+
+        Blocking (reads the JSONL log); the HTTP route runs it via
+        ``asyncio.to_thread``. The current absent debounce is passed so the
+        recommendation can compare against the live threshold. An empty /
+        disabled log yields ``{"empty": True}``.
+        """
+        records = self._read_recent_records(days=days)
+        return presence_report.build_report(
+            records,
+            now=self._wall_clock(),
+            current_absent_after_s=self._absent_after_s,
+        )
+
+    def _today(self) -> _dt.date:
+        """Current JST date (the report-boundary axis); split out for tests.
+
+        JST-explicit so the day boundary follows the resident's clock
+        regardless of the server timezone.
+        """
+        return _dt.datetime.now(presence_report.JST).date()
+
+    def _maybe_write_daily_report(self) -> None:
+        """Write today's diagnostic report once per day (poll-driven).
+
+        Idempotent and restart-safe: the in-memory ``_last_report_date``
+        skips the rebuild on every poll within a day, and an existing file
+        skips a re-run after a restart. The report covers the last 24 h
+        (``days=1``) and is named by the generation date. Fire-and-forget:
+        a disabled report (``_report_dir`` None) is a no-op and any disk
+        error is logged at WARNING and swallowed so the poll never dies.
+        """
+        if self._report_dir is None:
+            return
+        today = self._today().isoformat()
+        if today == self._last_report_date:
+            return
+        self._last_report_date = today  # mark attempted regardless of outcome
+        md_path = self._report_dir / f"{today}.md"
+        if md_path.exists():
+            return  # already written today (survives a restart)
+        try:
+            report = self.build_report(days=1)
+            _atomic_write_text(md_path, presence_report.render_markdown(report))
+            _atomic_write_text(
+                self._report_dir / f"{today}.json",
+                json.dumps(report, ensure_ascii=False, indent=2),
+            )
+            logger.info("presence: wrote daily report %s", md_path)
+        except (OSError, PermissionError) as exc:
+            logger.warning("presence: cannot write daily report %s (%s)", md_path, exc)
 
     # ---- internals -------------------------------------------------
 
@@ -544,6 +677,7 @@ class PresenceMonitor:
         self._update_sleep_latch()
         self._set_state(self._derive_state())
         self._append_log(snap, self._state)
+        self._maybe_write_daily_report()
 
     async def _loop(self) -> None:
         while True:

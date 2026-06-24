@@ -681,7 +681,7 @@ class FakePresenceMonitor:
     update_config call and its result -> status-code mapping).
     """
 
-    def __init__(self, snapshot=None, *, config_result=None) -> None:
+    def __init__(self, snapshot=None, *, config_result=None, report=None) -> None:
         self._snapshot = (
             snapshot
             if snapshot is not None
@@ -696,10 +696,27 @@ class FakePresenceMonitor:
             }
         )
         self._config_result = config_result
+        self._report = (
+            report
+            if report is not None
+            else {
+                "empty": False,
+                "basic": {"samples": 42},
+                "recommendation": {
+                    "recommended_absent_after_s": 540,
+                    "auto_apply": False,
+                },
+            }
+        )
         self.update_calls: list[tuple] = []
+        self.report_calls: list[int] = []
 
     def snapshot(self) -> dict:
         return self._snapshot
+
+    def build_report(self, *, days: int = 7) -> dict:
+        self.report_calls.append(days)
+        return self._report
 
     def update_config(self, *, absent_after_s=None, sleep_window=None) -> dict:
         self.update_calls.append((absent_after_s, sleep_window))
@@ -1859,6 +1876,43 @@ async def test_control_presence_reports_snapshot() -> None:
     assert body["enabled"] is True
     assert body["state"] == "active"
     assert body["config"]["absent_after_s"] == 120
+
+
+@pytest.mark.asyncio
+async def test_control_presence_report_returns_payload() -> None:
+    monitor = FakePresenceMonitor()
+    gateway = ControlFakeGateway(presence=monitor)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/presence/report")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["basic"]["samples"] == 42
+    assert body["recommendation"]["auto_apply"] is False
+    assert monitor.report_calls == [7]  # default days
+
+
+@pytest.mark.asyncio
+async def test_control_presence_report_days_query() -> None:
+    monitor = FakePresenceMonitor()
+    gateway = ControlFakeGateway(presence=monitor)
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        await client.get("/control/presence/report?days=14")
+        await client.get("/control/presence/report?days=999")  # clamp to 28
+        await client.get("/control/presence/report?days=abc")  # fallback to 7
+    assert monitor.report_calls == [14, 28, 7]
+
+
+@pytest.mark.asyncio
+async def test_control_presence_report_disabled_when_no_monitor() -> None:
+    gateway = ControlFakeGateway()  # presence not opted in
+    app = _build_control_app(gateway)
+    async with _client(app) as client:
+        resp = await client.get("/control/presence/report")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "enabled": False}
 
 
 @pytest.mark.asyncio

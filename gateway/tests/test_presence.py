@@ -557,6 +557,152 @@ async def test_start_uses_longer_presence_retention(tmp_path) -> None:
     assert len(log.read_text("utf-8").splitlines()) == 1
 
 
+# ---- self-diagnostic report ------------------------------------------
+
+
+def test_build_report_reads_recent_days(tmp_path) -> None:
+    log = tmp_path / "presence_log.jsonl"
+    now = 1_000_000.0
+    # One record per day going back 0..9 days; days=7 keeps i in 0..7 (ts at
+    # the cutoff boundary is inclusive), so 8 records survive.
+    lines = [
+        json.dumps(
+            {
+                "ts_unix": now - i * 86400,
+                "state": "active",
+                "present": True,
+                "pres_flag": True,
+                "presence": 800,
+            }
+        )
+        for i in range(10)
+    ]
+    log.write_text("\n".join(lines) + "\n", "utf-8")
+    monitor = make_monitor(log_path=log)
+    monitor._wall_clock = lambda: now
+    report = monitor.build_report(days=7)
+    assert report["empty"] is False
+    assert report["basic"]["samples"] == 8
+    report3 = monitor.build_report(days=3)
+    assert report3["basic"]["samples"] == 4  # i in 0..3
+
+
+def test_build_report_empty_when_log_disabled() -> None:
+    monitor = make_monitor()  # log_path defaults to None
+    assert monitor._log_path is None
+    report = monitor.build_report(days=7)
+    assert report["empty"] is True
+
+
+def test_build_report_passes_current_absent_after_s(tmp_path) -> None:
+    log = tmp_path / "presence_log.jsonl"
+    now = 1_000_000.0
+    # An ACTIVE valley so a recommendation is produced and can be compared.
+    rows = [
+        {"ts_unix": now - 50, "state": "active", "present": True, "pres_flag": True},
+        {"ts_unix": now - 40, "state": "active", "present": False, "pres_flag": False},
+        {"ts_unix": now - 10, "state": "active", "present": True, "pres_flag": True},
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n", "utf-8")
+    monitor = make_monitor(log_path=log, absent_after_s=1080)
+    monitor._wall_clock = lambda: now
+    report = monitor.build_report(days=7)
+    assert report["recommendation"]["current_absent_after_s"] == 1080
+
+
+# ---- daily report writer ---------------------------------------------
+
+
+def test_resolve_report_dir(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("STACKCHAN_PRESENCE_REPORT", raising=False)
+    assert (
+        presence._resolve_report_dir()
+        == Path(presence.DEFAULT_REPORT_DIR).expanduser()
+    )
+    monkeypatch.setenv("STACKCHAN_PRESENCE_REPORT", "off")
+    assert presence._resolve_report_dir() is None
+    monkeypatch.setenv("STACKCHAN_PRESENCE_REPORT", "  ")
+    assert presence._resolve_report_dir() is None
+    target = tmp_path / "rep"
+    monkeypatch.setenv("STACKCHAN_PRESENCE_REPORT", str(target))
+    assert presence._resolve_report_dir() == target
+
+
+def test_from_env_report_gated_on_log(monkeypatch, tmp_path) -> None:
+    # With the log disabled there is nothing to aggregate, so the report
+    # dir is None even when STACKCHAN_PRESENCE_REPORT points somewhere.
+    monkeypatch.setenv("STACKCHAN_PRESENCE_POLL_SEC", "10")
+    monkeypatch.setenv("STACKCHAN_PRESENCE_LOG", "off")
+    monkeypatch.setenv("STACKCHAN_PRESENCE_REPORT", str(tmp_path / "rep"))
+    monitor = PresenceMonitor.from_env(FakeGateway())
+    assert monitor is not None
+    assert monitor._report_dir is None
+
+
+@pytest.mark.asyncio
+async def test_daily_report_written_once_per_day(tmp_path) -> None:
+    log = tmp_path / "presence_log.jsonl"
+    reports = tmp_path / "reports"
+    monitor = make_monitor(log_path=log, report_dir=reports)
+    monitor._now = lambda: dt.time(12, 0)
+    monitor._today = lambda: dt.date(2026, 6, 24)
+    await monitor._poll_once()
+    md = reports / "2026-06-24.md"
+    assert md.exists()
+    assert (reports / "2026-06-24.json").exists()
+    # Same day again: even after deleting the file, the in-memory guard
+    # prevents a rebuild (the once-a-day write does not re-fire).
+    md.unlink()
+    await monitor._poll_once()
+    assert not md.exists()
+    # A new day writes a fresh report.
+    monitor._today = lambda: dt.date(2026, 6, 25)
+    await monitor._poll_once()
+    assert (reports / "2026-06-25.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_daily_report_skips_when_file_exists(tmp_path) -> None:
+    # Restart-safe: an existing file for today is not overwritten.
+    log = tmp_path / "presence_log.jsonl"
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    md = reports / "2026-06-24.md"
+    md.write_text("SENTINEL", "utf-8")
+    monitor = make_monitor(log_path=log, report_dir=reports)
+    monitor._now = lambda: dt.time(12, 0)
+    monitor._today = lambda: dt.date(2026, 6, 24)
+    await monitor._poll_once()
+    assert md.read_text("utf-8") == "SENTINEL"
+
+
+@pytest.mark.asyncio
+async def test_daily_report_noop_when_disabled(tmp_path) -> None:
+    log = tmp_path / "presence_log.jsonl"
+    monitor = make_monitor(log_path=log)  # report_dir defaults to None
+    monitor._now = lambda: dt.time(12, 0)
+    monitor._today = lambda: dt.date(2026, 6, 24)
+    assert monitor._report_dir is None
+    await monitor._poll_once()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_daily_report_write_error_does_not_kill_poll(
+    tmp_path, monkeypatch
+) -> None:
+    log = tmp_path / "presence_log.jsonl"
+    reports = tmp_path / "reports"
+    monitor = make_monitor(log_path=log, report_dir=reports)
+    monitor._now = lambda: dt.time(12, 0)
+    monitor._today = lambda: dt.date(2026, 6, 24)
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(presence, "_atomic_write_text", boom)
+    await monitor._poll_once()  # swallowed; no raise
+
+
 # ---- state-change observers (proactive hook) -------------------------
 
 

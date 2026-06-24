@@ -305,6 +305,15 @@ async def _proximity_status(gateway: Any) -> dict[str, Any] | None:
     return {"mode": mode, "threshold": threshold}
 
 
+def _parse_days(value: Any, *, default: int = 7, lo: int = 1, hi: int = 28) -> int:
+    """Clamp a ``?days=`` query value to [lo, hi]; malformed -> default."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(n, lo), hi)
+
+
 def build_app(
     queue: CommandQueue,
     *,
@@ -395,6 +404,20 @@ def build_app(
             absent_after_s=absent_after_s, sleep_window=sleep_window
         )
         return _control_json(result, status=200 if result.get("ok") else 400)
+
+    async def control_presence_report(request: Request) -> JSONResponse:
+        # Gateway-local: aggregate the presence log into a self-diagnostic
+        # report (occupancy separation, in-room valleys, a recommended
+        # absent_after_s). Read-only — it never applies the recommendation
+        # (human-in-the-loop; closing the loop is Phase 3).
+        monitor = getattr(gateway, "_presence", None)
+        if monitor is None:
+            return JSONResponse({"ok": True, "enabled": False})
+        days = _parse_days(request.query_params.get("days"))
+        # The log read + aggregation can touch many rows; keep it off the
+        # event loop so other control requests / the WebSocket never stall.
+        report = await asyncio.to_thread(monitor.build_report, days=days)
+        return JSONResponse({"ok": True, **report})
 
     async def control_volume(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
@@ -786,6 +809,11 @@ def build_app(
         Route("/control/audio_level", endpoint=control_audio_level, methods=["GET"]),
         Route("/control/conversation", endpoint=control_conversation, methods=["GET"]),
         Route("/control/presence", endpoint=control_presence, methods=["GET"]),
+        Route(
+            "/control/presence/report",
+            endpoint=control_presence_report,
+            methods=["GET"],
+        ),
         Route(
             "/control/presence/config",
             endpoint=control_presence_config,
