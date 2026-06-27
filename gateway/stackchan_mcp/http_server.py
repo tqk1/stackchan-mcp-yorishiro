@@ -11,7 +11,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from urllib.parse import urlparse
 
 import jsonschema
@@ -331,6 +331,33 @@ def _parse_limit(value: Any, *, default: int = 80, lo: int = 1, hi: int = 200) -
 ACTIVITY_JSONL_SOURCES = frozenset({"heartbeat", "proactive", "presence", "home"})
 PRESENCE_REPORT_ENV = "STACKCHAN_PRESENCE_REPORT"
 
+#: Deep-night Obsidian-vault housekeeping crons surfaced in the feed (yorishiro),
+#: as ``(log path, label)``. Each job's log mtime is its last-run time; we emit
+#: one item per job. The hourly Claude-Code token-usage cron (``fetch_usage.py``
+#: → ``~/razer-dashboard/fetch_usage.log``) is deliberately absent: per-hour
+#: entries flood the feed and duplicate the server tab's CC usage (Kenji's call,
+#: 2026-06-27), so leaving it out keeps it hidden.
+CRON_JOBS: Final[tuple[tuple[str, str], ...]] = (
+    ("/tmp/inbox-drain.log", "Inbox 整理"),
+    ("/tmp/build_moc.log", "MOC 構築"),
+    ("/tmp/build_notes_review.log", "ノートレビュー更新"),
+    ("/tmp/weekly-digest.log", "週次ダイジェスト"),
+    ("/tmp/notes-tidy.log", "ノート整理"),
+    ("/tmp/notes-tidy-suggest.log", "整理提案"),
+    ("/tmp/articles-recommend.log", "記事レコメンド"),
+    ("/tmp/self-reflect.log", "自己ふりかえり"),
+)
+#: Lower-cased substrings in a cron log's last line that mark a failed run.
+_CRON_ERROR_MARKERS: Final = (
+    "error",
+    "traceback",
+    "permission denied",
+    "exception",
+    "failed",
+    "not found",
+    "no such file",
+)
+
 
 def _presence_report_dir() -> Path:
     raw = os.environ.get(PRESENCE_REPORT_ENV)
@@ -370,13 +397,72 @@ def _list_presence_reports(limit: int, *, path: Path | None = None) -> list[dict
     return items
 
 
+def _last_log_line(path: Path, *, max_bytes: int = 4096) -> str:
+    """Best-effort last non-empty line of a log, read from the tail (≤200 chars)."""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            tail = f.read()
+    except OSError:
+        return ""
+    for line in reversed(tail.decode("utf-8", "replace").splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped[:200]
+    return ""
+
+
+def _read_cron_runs(
+    jobs: tuple[tuple[str, str], ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Surface deep-night Obsidian housekeeping crons in the feed.
+
+    Each job's log gives its last-run time (file mtime) plus a one-line tail
+    for context; we emit one ``source="cron"`` item per job (its most recent
+    run). Read-only and best-effort: a missing log — e.g. cleared on reboot
+    until the job next runs — simply yields nothing for that job. The hourly
+    token-usage cron is intentionally not in ``jobs``, so it stays hidden.
+
+    ``jobs`` defaults to the module-level :data:`CRON_JOBS` (resolved at call
+    time so tests can monkeypatch it).
+    """
+    items: list[dict[str, Any]] = []
+    for path_str, label in CRON_JOBS if jobs is None else jobs:
+        path = Path(path_str)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        text = _last_log_line(path)
+        status = (
+            "error"
+            if text and any(m in text.lower() for m in _CRON_ERROR_MARKERS)
+            else "ok"
+        )
+        items.append(
+            {
+                "ts_unix": mtime,
+                "source": "cron",
+                "kind": "run",
+                "subtype": label,
+                "status": status,
+                "text": text,
+            }
+        )
+    return items
+
+
 def _gather_activity(limit: int, source: str | None) -> list[dict[str, Any]]:
-    """Merge autonomous-activity JSONL + daily reports, newest first, capped."""
+    """Merge autonomous-activity JSONL + cron runs + daily reports, newest first."""
     items: list[dict[str, Any]] = []
     if source is None or source in ACTIVITY_JSONL_SOURCES:
         items += activity_log.read_recent(
             limit, source=source if source in ACTIVITY_JSONL_SOURCES else None
         )
+    if source is None or source == "cron":
+        items += _read_cron_runs()
     if source is None or source == "report":
         items += _list_presence_reports(14)
     items.sort(key=lambda r: r.get("ts_unix", 0.0), reverse=True)
