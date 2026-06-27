@@ -10,6 +10,7 @@ import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -23,7 +24,7 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from . import control, local_llm, sensors
+from . import activity_log, control, local_llm, sensors
 from .notes import TOOL_NAMES as NOTES_TOOL_NAMES
 from .notify_config import NotifyConfig
 from .queue import CommandQueue, QueueFull, QueueItem, build_queue_full_error
@@ -314,6 +315,74 @@ def _parse_days(value: Any, *, default: int = 7, lo: int = 1, hi: int = 28) -> i
     return min(max(n, lo), hi)
 
 
+def _parse_limit(value: Any, *, default: int = 80, lo: int = 1, hi: int = 200) -> int:
+    """Clamp a ``?limit=`` query value to [lo, hi]; malformed -> default."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(n, lo), hi)
+
+
+# --- activity feed (yorishiro): autonomous-activity JSONL + daily reports ---
+
+#: JSONL-backed activity sources (written by activity_log.append). ``report``
+#: items are merged in from the daily presence reports, not the JSONL.
+ACTIVITY_JSONL_SOURCES = frozenset({"heartbeat", "proactive", "presence", "home"})
+PRESENCE_REPORT_ENV = "STACKCHAN_PRESENCE_REPORT"
+
+
+def _presence_report_dir() -> Path:
+    raw = os.environ.get(PRESENCE_REPORT_ENV)
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".stackchan" / "presence_reports"
+
+
+def _list_presence_reports(limit: int, *, path: Path | None = None) -> list[dict[str, Any]]:
+    """List the most recent daily presence reports as feed link items."""
+    if path is None:
+        path = _presence_report_dir()
+    if limit <= 0 or not path.exists() or not path.is_dir():
+        return []
+    try:
+        files = sorted(path.glob("*.json"))
+    except OSError:
+        return []
+    items: list[dict[str, Any]] = []
+    for f in files[-limit:]:
+        date = f.stem  # YYYY-MM-DD
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        items.append(
+            {
+                "ts_unix": mtime,
+                "source": "report",
+                "kind": "daily_report",
+                "status": "ok",
+                "subtype": date,
+                "text": f"{date} の在室日次レポート",
+                "detail": {"date": date},
+            }
+        )
+    return items
+
+
+def _gather_activity(limit: int, source: str | None) -> list[dict[str, Any]]:
+    """Merge autonomous-activity JSONL + daily reports, newest first, capped."""
+    items: list[dict[str, Any]] = []
+    if source is None or source in ACTIVITY_JSONL_SOURCES:
+        items += activity_log.read_recent(
+            limit, source=source if source in ACTIVITY_JSONL_SOURCES else None
+        )
+    if source is None or source == "report":
+        items += _list_presence_reports(14)
+    items.sort(key=lambda r: r.get("ts_unix", 0.0), reverse=True)
+    return items[:limit]
+
+
 def build_app(
     queue: CommandQueue,
     *,
@@ -418,6 +487,17 @@ def build_app(
         # event loop so other control requests / the WebSocket never stall.
         report = await asyncio.to_thread(monitor.build_report, days=days)
         return JSONResponse({"ok": True, **report})
+
+    async def control_activity(request: Request) -> JSONResponse:
+        # Gateway-local activity feed (yorishiro): merge the autonomous
+        # activity JSONL (heartbeat / proactive / presence / home) with the
+        # daily presence reports into one reverse-chronological list for the
+        # dashboard. Read-only; the disk read + merge runs off the event loop
+        # (cf. control_presence_report).
+        limit = _parse_limit(request.query_params.get("limit"))
+        source = request.query_params.get("source") or None
+        items = await asyncio.to_thread(_gather_activity, limit, source)
+        return JSONResponse({"ok": True, "items": items})
 
     async def control_volume(request: Request) -> JSONResponse:
         body = await _read_json_body(request)
@@ -819,6 +899,7 @@ def build_app(
             endpoint=control_presence_config,
             methods=["POST"],
         ),
+        Route("/control/activity", endpoint=control_activity, methods=["GET"]),
         Route("/control/volume", endpoint=control_volume, methods=["POST"]),
         Route("/control/mic_gain", endpoint=control_mic_gain, methods=["POST"]),
         Route("/control/brightness", endpoint=control_brightness, methods=["POST"]),

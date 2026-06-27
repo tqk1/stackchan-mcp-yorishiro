@@ -74,7 +74,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import multiturn, notes, weather
+from . import activity_log, multiturn, notes, weather
 from .audio_stream import is_recording
 
 if TYPE_CHECKING:
@@ -439,10 +439,22 @@ class HeartbeatRunner:
         if reason is not None:
             logger.info("heartbeat: speak suppressed (%s)", reason)
             return False
-        line = await self._check_weather() or await self._check_memo()
+        line = await self._check_weather()
+        subtype = "weather"
+        if not line:
+            line = await self._check_memo()
+            subtype = "memo"
         if not line:
             return False
+        started = self._monotonic()
         await self._perform_speak(line)
+        activity_log.append(
+            "heartbeat",
+            "speak",
+            subtype=subtype,
+            text=line,
+            duration_ms=int((self._monotonic() - started) * 1000),
+        )
         return True
 
     def _speak_skip_reason(self) -> str | None:
@@ -609,6 +621,10 @@ class HeartbeatRunner:
         gesture = self._rng.choice(gestures)
         logger.info("heartbeat: gesture %s", gesture.__name__)
         await gesture()
+        # subtype is the gesture name minus the _gesture_ prefix (glance / ...).
+        activity_log.append(
+            "heartbeat", "gesture", subtype=gesture.__name__.removeprefix("_gesture_")
+        )
 
     async def _call(self, name: str, args: dict[str, Any]) -> Any:
         """Call an ESP32 device tool, returning result or None on error."""

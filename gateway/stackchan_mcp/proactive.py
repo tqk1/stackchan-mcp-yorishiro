@@ -79,6 +79,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import activity_log
 from .audio_stream import is_recording
 from .heartbeat import is_quiet, parse_quiet_hours
 from .presence import PresenceState
@@ -481,6 +482,7 @@ class ProactiveSpeaker:
         finally:
             await self._set_face("idle")
         self._bump_daily_count()
+        activity_log.append("proactive", "speak", subtype=key, text=text)
 
     async def _set_face(self, face: str) -> None:
         _result, error = await self._gateway.esp32.call_tool(

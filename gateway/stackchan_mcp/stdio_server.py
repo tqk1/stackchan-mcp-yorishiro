@@ -19,7 +19,7 @@ from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
 from mcp.types import Notification, TextContent, Tool
 
-from . import __version__, control, notes, switchbot, web_search
+from . import __version__, activity_log, control, notes, switchbot, web_search
 from .gateway import get_gateway
 from .notify_config import NotifyConfig, load_notify_config
 from .stt import listen_and_transcribe
@@ -379,6 +379,8 @@ async def _dispatch_mcp_tool(
     # Phase C) — they never touch the ESP32, so they are handled before
     # the device_connected guard below.
     if name in switchbot.TOOL_NAMES:
+        sb_device = arguments.get("device_id", "")
+        sb_command = arguments.get("command", "")
         try:
             if name == "switchbot_list_devices":
                 result = await switchbot.list_devices()
@@ -388,12 +390,22 @@ async def _dispatch_mcp_tool(
                 )
             else:  # switchbot_send_command
                 result = await switchbot.send_command(
-                    arguments.get("device_id", ""),
-                    arguments.get("command", ""),
+                    sb_device,
+                    sb_command,
                     arguments.get("parameter", "default"),
                     arguments.get("command_type", "command"),
                 )
         except (ValueError, RuntimeError) as exc:
+            # Only the actuating tool is an "activity"; reads are not logged.
+            if name == "switchbot_send_command":
+                activity_log.append(
+                    "home",
+                    "command",
+                    subtype=sb_device or None,
+                    text=sb_command or None,
+                    status="error",
+                    detail={"error": str(exc)},
+                )
             return [
                 TextContent(
                     type="text",
@@ -401,6 +413,17 @@ async def _dispatch_mcp_tool(
                 )
             ]
         if name == "switchbot_send_command":
+            # SwitchBot signals device-side success via statusCode in the
+            # body (HTTP 200 != applied); surface it for the feed.
+            code = result.get("statusCode") if isinstance(result, dict) else None
+            activity_log.append(
+                "home",
+                "command",
+                subtype=sb_device or None,
+                text=sb_command or None,
+                status="ok" if code in (None, switchbot.SUCCESS_STATUS_CODE) else "error",
+                detail={"statusCode": code} if code is not None else None,
+            )
             result = {"ok": True, "result": result}
         return [TextContent(type="text", text=json.dumps(result))]
 

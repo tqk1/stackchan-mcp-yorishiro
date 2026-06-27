@@ -13,15 +13,31 @@ import time
 
 from aiohttp import web
 
+from . import activity_log
 from .capture_server import create_capture_app, stage_avatar_set
 from .esp32_client import ESP32Manager
 from .heartbeat import HeartbeatRunner
 from .mdns_advertiser import MdnsAdvertiser
 from .multiturn import MultiturnSession
-from .presence import PresenceMonitor
+from .presence import PresenceMonitor, PresenceState
 from .proactive import ProactiveSpeaker
 
 logger = logging.getLogger(__name__)
+
+
+def _record_presence_transition(old: PresenceState, new: PresenceState) -> None:
+    """Activity-feed listener: log a real occupancy flip (e.g. active→quiet).
+
+    Registered alongside the proactive speaker on the presence monitor, so
+    the dashboard feed shows when the room judgement changed. Fires only on
+    genuine poll-driven flips (a dashboard re-tune is ``notify=False``).
+    """
+    activity_log.append(
+        "presence",
+        "transition",
+        subtype=f"{old.value}→{new.value}",
+        detail={"from": old.value, "to": new.value},
+    )
 
 
 class Gateway:
@@ -264,11 +280,18 @@ class Gateway:
         # missed.
         self._proactive = ProactiveSpeaker.from_env(self)
         if self._presence is not None:
+            # Activity feed (yorishiro): record every real occupancy flip,
+            # independent of whether the proactive speaker is enabled.
+            self._presence.register_on_state_change(_record_presence_transition)
             if self._proactive is not None:
                 self._presence.register_on_state_change(
                     self._proactive.on_state_change
                 )
             self._presence.start()
+
+        # Prune the activity feed log once at startup (same discipline as the
+        # event log); a missing / disabled log is a no-op.
+        activity_log.rotate_old_entries()
 
         self._running = True
         logger.info(
