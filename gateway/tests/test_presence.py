@@ -247,6 +247,167 @@ async def test_recovers_after_errors() -> None:
     assert monitor.state is PresenceState.ACTIVE
 
 
+# ---- object_raw static-presence augmentation -------------------------
+
+
+def reg_for(*, present: bool, object_raw: int, presence: int = 0):
+    """Register map for read_tmos with a chosen object_raw (+ pres flag).
+
+    ``present`` sets the embedded PRES flag (so read_tmos' ``present`` is
+    True regardless of the presence value); ``object_raw`` is encoded as a
+    little-endian int16 into TOBJECT.
+    """
+    u_obj = object_raw & 0xFFFF
+    u_pres = presence & 0xFFFF
+    return {
+        (0x5A, sensors.TMOS_WHO_AM_I): [0xD3],
+        (0x5A, sensors.TMOS_FUNC_STATUS): [0x04 if present else 0x00],
+        (0x5A, sensors.TMOS_TPRESENCE_L): [u_pres & 0xFF, (u_pres >> 8) & 0xFF],
+        (0x5A, sensors.TMOS_TMOTION_L): [0x00, 0x00],
+        (0x5A, sensors.TMOS_TOBJECT_L): [u_obj & 0xFF, (u_obj >> 8) & 0xFF],
+        (0x5A, sensors.TMOS_TAMBIENT_L): [0x00, 0x00],
+    }
+
+
+def test_occupancy_cold_start_sets_baseline_no_latch() -> None:
+    monitor = make_monitor()
+    assert monitor._obj_baseline is None
+    # First (empty) reading just seeds the baseline; nothing is occupied.
+    assert monitor._update_occupancy({"present": False, "object_raw": -8700}) is False
+    assert monitor._obj_baseline == -8700.0
+    assert monitor._last_static_present is False
+    assert monitor._obj_armed is False
+
+
+def test_occupancy_static_hold_after_moving_arms() -> None:
+    monitor = make_monitor()
+    # Teach the empty-room baseline first.
+    for _ in range(5):
+        monitor._update_occupancy({"present": False, "object_raw": -8700})
+    assert monitor._obj_baseline == pytest.approx(-8700, abs=1)
+    # Occupant arrives (moving) -> armed + occupied.
+    assert monitor._update_occupancy({"present": True, "object_raw": -8300}) is True
+    assert monitor._obj_armed is True
+    # Goes still: the embedded detector drops (present False) but object_raw
+    # stays high -> the static hold keeps the room occupied.
+    for _ in range(20):
+        assert monitor._update_occupancy({"present": False, "object_raw": -8300}) is True
+        assert monitor._last_static_present is True
+    # Baseline crept up only slowly (slow-up), so the still body is held
+    # well above margin rather than absorbed into the baseline.
+    assert -8700 <= monitor._obj_baseline < -8600
+
+
+def test_occupancy_disarms_on_leave() -> None:
+    monitor = make_monitor()
+    for _ in range(5):
+        monitor._update_occupancy({"present": False, "object_raw": -8700})
+    monitor._update_occupancy({"present": True, "object_raw": -8300})  # arm
+    monitor._update_occupancy({"present": False, "object_raw": -8300})  # static hold
+    # Occupant leaves: object_raw returns to empty -> excess collapses ->
+    # disarm (and the baseline fast-tracks back down toward empty).
+    assert monitor._update_occupancy({"present": False, "object_raw": -8700}) is False
+    assert monitor._obj_armed is False
+    assert monitor._last_static_present is False
+
+
+def test_occupancy_long_still_occupant_is_eventually_released() -> None:
+    # An earlier "freeze while occupied" design latched for days in a log
+    # replay; the slow-up baseline must instead release a persistent high
+    # within ~tens of minutes so a stale reading can never latch forever.
+    monitor = make_monitor()
+    for _ in range(5):
+        monitor._update_occupancy({"present": False, "object_raw": -8700})
+    monitor._update_occupancy({"present": True, "object_raw": -8300})  # arm
+    released_at = None
+    for i in range(1500):  # ~2 h at a 5 s poll
+        occ = monitor._update_occupancy({"present": False, "object_raw": -8300})
+        if not occ and released_at is None:
+            released_at = i  # occupancy released (static signal gave way)
+        if not monitor._obj_armed:
+            break  # baseline has fully absorbed the stale high -> disarmed
+    assert released_at is not None  # never latches forever
+    assert monitor._obj_armed is False  # and fully disarms within the window
+
+
+def test_occupancy_warming_surface_never_latches() -> None:
+    monitor = make_monitor()
+    monitor._update_occupancy({"present": False, "object_raw": -8700})
+    # A surface warms well past the present margin but WITHOUT any moving
+    # detection -> never armed -> never occupied (no false latch).
+    for raw in range(-8700, -8000, 50):
+        assert monitor._update_occupancy({"present": False, "object_raw": raw}) is False
+        assert monitor._last_static_present is False
+    assert monitor._obj_armed is False
+
+
+def test_occupancy_baseline_tracks_ambient_when_empty() -> None:
+    monitor = make_monitor()
+    monitor._update_occupancy({"present": False, "object_raw": -8700})
+    assert monitor._obj_baseline == -8700.0
+    # Ambient drifts the empty object_raw down; the baseline follows it.
+    for _ in range(300):
+        monitor._update_occupancy({"present": False, "object_raw": -9000})
+    assert monitor._obj_baseline == pytest.approx(-9000, abs=5)
+
+
+def test_occupancy_missing_object_raw_falls_back_to_embedded() -> None:
+    monitor = make_monitor()
+    assert monitor._update_occupancy({"present": True}) is True
+    assert monitor._update_occupancy({"present": False}) is False
+    assert monitor._last_static_present is False
+    # A bool must not be treated as a numeric object_raw.
+    assert monitor._update_occupancy({"present": False, "object_raw": True}) is False
+
+
+@pytest.mark.asyncio
+async def test_poll_once_object_raw_holds_still_occupant() -> None:
+    clock = [0.0]
+    monitor = make_monitor(absent_after_s=120)
+    monitor._monotonic = lambda: clock[0]
+    monitor._now = lambda: dt.time(12, 0)
+
+    # 1) Empty room teaches the baseline (never seen anyone -> UNKNOWN).
+    monitor._dispatch = make_dispatch(reg_for(present=False, object_raw=-8700))
+    for _ in range(8):
+        await monitor._poll_once()
+    assert monitor.state is PresenceState.UNKNOWN
+
+    # 2) Occupant arrives (moving) -> ACTIVE + armed.
+    monitor._dispatch = make_dispatch(reg_for(present=True, object_raw=-8300))
+    await monitor._poll_once()
+    assert monitor.state is PresenceState.ACTIVE
+
+    # 3) Occupant goes still well past the debounce: embedded presence is
+    #    gone, but object_raw still holds them -> stays ACTIVE (the fix).
+    monitor._dispatch = make_dispatch(reg_for(present=False, object_raw=-8300))
+    clock[0] = 500.0
+    await monitor._poll_once()
+    assert monitor.state is PresenceState.ACTIVE
+    assert monitor._last_static_present is True
+    assert monitor.allows_heartbeat() is True
+
+    # 4) Occupant leaves: object_raw returns to empty -> disarm, then ABSENT
+    #    once the debounce elapses from the last (static) hold at t=500.
+    monitor._dispatch = make_dispatch(reg_for(present=False, object_raw=-8700))
+    clock[0] = 510.0
+    await monitor._poll_once()
+    assert monitor._obj_armed is False
+    clock[0] = 700.0  # 700 - 500 = 200 > 120
+    await monitor._poll_once()
+    assert monitor.state is PresenceState.ABSENT
+    assert monitor.allows_heartbeat() is False
+
+
+@pytest.mark.asyncio
+async def test_snapshot_includes_occupancy() -> None:
+    monitor = make_monitor()
+    monitor._now = lambda: dt.time(12, 0)
+    await monitor._poll_once()
+    occ = monitor.snapshot()["occupancy"]
+    assert set(occ) == {"obj_baseline", "obj_armed", "static_present"}
+
+
 # ---- update_config ---------------------------------------------------
 
 

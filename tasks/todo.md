@@ -10,7 +10,27 @@
 
 ## 現役タスク（まだやるべき生きた未完了項目）
 
-### ★★ 着手中: おやすみ／つうじょう モード自動切替＋挨拶 2026-06-24 — ブランチ `feature/proactive`
+### ★★ 着手中: 静止在室検知（object_raw 併用＋適応ベースライン） 2026-06-27
+
+**背景**: 1m着座で静止すると、製品の presence アルゴリズムが体を背景吸収し `presence≈0` → デバウンス(1080s)だけで `active` 維持 → 18分で誤 ABSENT。生サーモパイル `object_raw` は静止体を保持していると判明（部屋ウォークスルー計測 2026-06-27）。
+
+**計測結果（同時刻の空室基準比 Δ）**: 自分の席1m=+745 / 恵梨子席=+290 / 立ち=+260 / キッチン=+134 / ソファ=+29(死角) ／ 空室ノイズ sd≈±35。室温 30.9→31.6℃ で空室 object_raw が -8697→-9043（約-510/℃）連動 → **固定しきい値は不可・適応ベースライン必須**を実データで確定。
+
+**設計**: `occupied = moving(presence>200/pres_flag) OR (object_raw − 適応ベースライン > マージン)`。ベースラインは不在判定中のみ object_raw を EMA 追従（室温ドリフト追従）・在室中は凍結（静止体を吸収しない）。`moving` 検知で armed、armed 中のみ static 判定（緩く温まる壁を誤ラッチしない）・disarm 時ベースラインを新鮮な空室値へ resync。劣化しても従来より悪化しない純増分。
+
+- [x] presence.py: 定数・`_update_occupancy()`・`_poll_once` 配線・snapshot/_append_log に観測値(obj_baseline/obj_armed/static_present)追加
+- [x] **設計修正（履歴検証で発覚）**: 当初の「在室中ベースライン凍結」は 9.7日ログ replay で **2.6日連続ラッチ**（古い凍結基準が日内ドリフトに追従できず張り付き）→ **非対称EMA常時追従**へ（下げ=速 alpha0.08/τ60s・上げ=遅 alpha0.004/τ40分）。再 replay: static点灯 53→15.4%・純増 31.7→6.3%・最長run 2.6日→**75.5分**・≥120分 0件・夜間01-04時 2-4%。`scratch`相当の replay.py は scratchpad に。
+- [x] test_presence.py: cold start／arm→静止保持／disarm／空室追従／壁(no moving)非ラッチ／**長時間静止は最終的に解除(アンチラッチ)**（+9ケース）
+- [x] pytest **1071 passed** + ruff clean
+- [x] **実機 E2E green（2026-06-27 15:23 restart）**: 恵梨子席で9分静止→`active`維持・**309秒分救済**（埋め込み消失をstatic保持）/ arm ゲート（接近+186でも動作未確認なら非ラッチ）/ 離脱で即 disarm・再ラッチ0 / 室温30.9→32.3℃を baseline 追従。E2Eログ scratchpad/e2e.jsonl
+- [x] learning-report 要否＝**作る**（ケンジ 2026-06-27）
+- [x] worklog（`docs/worklog/2026-06-27-static-presence.md`）＋ learning-report（`docs/static-presence-report.md`・初学者向け・事件簿形式）作成
+- [ ] commit（feature ブランチ）— ケンジ確認後
+- フォローアップ候補: マージン/alpha のダッシュボード露出（現状は定数）・寒い季節の空室 object_raw を事後検証（τ_upは保持時間↔誤ラッチのトレードオフ）・本命1m席でのE2E（弱め恵梨子席で既にgreen）
+
+---
+
+### （クローズ済み・参考）おやすみ／つうじょう モード自動切替＋挨拶 2026-06-24 — ブランチ `feature/proactive`
 
 **方針確定（ケンジ 2026-06-24）**: presence 遷移に「プリセット適用（モード切替）」を相乗りさせ挨拶と同時に行う。ユーザー作成 `おやすみ`/`つうじょう` プリセットを再利用。単一トグル（🗣️自発会話）で ON/OFF。帰宅でも つうじょう 適用・境界会話中のスキップ許容（確定）。
 

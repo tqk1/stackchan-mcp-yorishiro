@@ -126,6 +126,45 @@ MAX_CONSEC_ERRORS = 3
 MIN_ABSENT_AFTER_S = 5
 MAX_ABSENT_AFTER_S = 3600
 
+# ---- object_raw static-presence augmentation -------------------------
+# The embedded presence algorithm adapts a *motionless* occupant out
+# within ~a minute (TPRESENCE decays to ~0), so a person sitting still at
+# the sensor's working range stops refreshing occupancy and the room
+# wrongly debounces to ABSENT. The raw thermopile (``object_raw``) keeps
+# reading the body's warmth the whole time, but it also drifts with the
+# sensor's ambient temperature, so a *fixed* object_raw threshold is
+# unsafe. We instead track a live baseline of the empty-room object_raw
+# and treat a sustained excess over it as presence. Margins are in raw
+# object_raw LSB; calibrated from a room walk-through (2026-06-27): a 1 m
+# seated occupant read +400..+745 over the contemporaneous empty baseline,
+# while empty-room noise was ~+/-35 (sd). Ambient drift moved the empty
+# baseline ~-510/degC, which is exactly why the comparison is to a live
+# baseline rather than a constant.
+#
+# The baseline tracks **asymmetrically and always** (never frozen): fast
+# DOWN toward any lower reading (a leaving occupant / ambient-driven empty
+# drift), slow UP toward a higher reading (resists absorbing a still body).
+# An early "freeze while occupied" design self-latched for days in a replay
+# over 9.7 days of real log (a stale frozen baseline never caught up to the
+# day/night object_raw swing); the slow-up tau bounds any false hold to
+# ~tens of minutes while still spanning a still occupant's detection gaps.
+
+#: object_raw excess (over baseline) to assert a *static* occupant.
+#: ~4x the empty noise sd; the 1 m seat clears it 3-5x over.
+OBJ_PRESENT_MARGIN = 150
+#: Hysteresis floor: once armed, the static hold clears only when the
+#: excess falls back under this — so a single noisy sample never flaps it.
+OBJ_DISARM_MARGIN = 60
+#: Baseline EMA weight when ``object_raw`` is BELOW the baseline (empty /
+#: leaving / ambient cooling): fast, ~tau = 1/alpha polls -> ~60 s at a 5 s
+#: poll, so a departure is recovered within ~a minute.
+OBJ_BASELINE_ALPHA_DOWN = 0.08
+#: Baseline EMA weight when ``object_raw`` is ABOVE the baseline (a warm
+#: body in view): slow, ~tau ~40 min, so a motionless occupant is held
+#: through detection gaps yet a persistent high is absorbed (no permanent
+#: latch). This single tau is the hold-duration <-> false-latch trade-off.
+OBJ_BASELINE_ALPHA_UP = 0.004
+
 
 class PresenceState(str, Enum):
     """Coarse occupancy/mode derived from TMOS presence + wall clock."""
@@ -294,6 +333,13 @@ class PresenceMonitor:
         self._inited = False
         self._task: asyncio.Task[None] | None = None
         self._on_change: list[StateChangeCb] = []
+        # object_raw static-presence augmentation (see module constants).
+        # Baseline lazily initialised to the first reading; armed only by a
+        # real embedded 'moving' detection so a slowly warming surface is
+        # never latched as presence.
+        self._obj_baseline: float | None = None
+        self._obj_armed = False
+        self._last_static_present = False
 
     @classmethod
     def from_env(cls, gateway: "Gateway") -> "PresenceMonitor | None":
@@ -398,6 +444,18 @@ class PresenceMonitor:
             "config": {
                 "absent_after_s": self._absent_after_s,
                 "sleep_window": self._sleep_window,
+            },
+            # object_raw static-presence augmentation, for tuning/debug:
+            # baseline = current empty-room estimate, static_present = the
+            # raw thermopile is holding a motionless occupant this poll.
+            "occupancy": {
+                "obj_baseline": (
+                    round(self._obj_baseline, 1)
+                    if self._obj_baseline is not None
+                    else None
+                ),
+                "obj_armed": self._obj_armed,
+                "static_present": self._last_static_present,
             },
             "tmos": self._last_snapshot,
         }
@@ -592,6 +650,14 @@ class PresenceMonitor:
             "state": state.value,
             "asleep": self._asleep,
             "last_seen_s_ago": self._last_seen_s_ago(),
+            # object_raw augmentation (lets us tune margins from the log).
+            "obj_baseline": (
+                round(self._obj_baseline, 1)
+                if self._obj_baseline is not None
+                else None
+            ),
+            "obj_armed": self._obj_armed,
+            "static_present": self._last_static_present,
             **snap,
         }
         try:
@@ -641,6 +707,65 @@ class PresenceMonitor:
             return PresenceState.QUIET
         return PresenceState.ABSENT
 
+    def _update_occupancy(self, snap: dict[str, Any]) -> bool:
+        """Decide room occupancy from the embedded signal *and* object_raw.
+
+        Returns True when the room should be treated as occupied this poll
+        (the caller refreshes ``_last_present_mono``). Combines two signals:
+
+        - **moving** — the embedded presence/motion detection
+          (``snap['present']`` = ``pres_flag or presence > 200``). Fires on
+          entry and any body movement; decays to False on a still occupant.
+        - **static** — ``object_raw`` sustained above a slow empty-room
+          baseline. Holds a motionless occupant the embedded signal drops.
+
+        The static signal is gated on an **armed** flag set only by a real
+        ``moving`` detection, so a gradually warming surface (sun on a wall,
+        an appliance) — which never trips the embedded detector — can never
+        latch the room as occupied. The baseline tracks ``object_raw``
+        asymmetrically and always (never frozen): fast DOWN toward a lower
+        reading (a leaving occupant / ambient-driven empty drift), slow UP
+        toward a higher reading (so a motionless body is held through its
+        detection gaps yet a persistent high is eventually absorbed — no
+        permanent latch).
+
+        Cold start: the baseline initialises to the first reading, so an
+        occupant present *and still* at gateway start is held only once they
+        move (which arms the static hold) or once they leave and return
+        (which teaches the true empty baseline) — same as the pre-feature
+        behaviour, never worse.
+        """
+        moving = bool(snap.get("present"))
+        obj = snap.get("object_raw")
+        if isinstance(obj, bool) or not isinstance(obj, (int, float)):
+            # No usable raw signal: fall back to the embedded detection.
+            self._last_static_present = False
+            return moving
+        obj = float(obj)
+        if self._obj_baseline is None:
+            self._obj_baseline = obj
+        if moving:
+            self._obj_armed = True
+        excess = obj - self._obj_baseline
+        if self._obj_armed and not moving and excess <= OBJ_DISARM_MARGIN:
+            # Body signal clearly gone (object_raw fell back to baseline):
+            # disarm so the next warm-but-static surface needs a fresh arming.
+            self._obj_armed = False
+        static_present = self._obj_armed and excess > OBJ_PRESENT_MARGIN
+        self._last_static_present = static_present
+        occupied = moving or static_present
+        # Asymmetric, always-on baseline tracking. Fast toward lower
+        # readings (recover from a departure / follow ambient), slow toward
+        # higher readings (resist absorbing a still occupant, but absorb a
+        # persistent high over ~tens of minutes so it can never latch).
+        alpha = (
+            OBJ_BASELINE_ALPHA_DOWN
+            if obj < self._obj_baseline
+            else OBJ_BASELINE_ALPHA_UP
+        )
+        self._obj_baseline += alpha * (obj - self._obj_baseline)
+        return occupied
+
     async def _poll_once(self) -> None:
         """One poll: read TMOS, update the last-seen timestamp + state.
 
@@ -672,7 +797,7 @@ class PresenceMonitor:
             return
         self._consec_errors = 0
         self._last_snapshot = snap
-        if snap.get("present"):
+        if self._update_occupancy(snap):
             self._last_present_mono = self._monotonic()
         self._update_sleep_latch()
         self._set_state(self._derive_state())
