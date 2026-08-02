@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
@@ -47,8 +48,30 @@ logger = logging.getLogger(__name__)
 
 #: Default engine name when ``voice`` is omitted from the tool call.
 #: VOICEVOX is the canonical default (Issue #70); the concrete engine
-#: ships in PR2 of that Issue.
+#: ships in PR2 of that Issue. This built-in default is intentionally
+#: fixed so existing Japanese operation never changes silently — the
+#: *runtime* default is resolved by :func:`resolve_default_voice`, which
+#: lets an operator override it via ``STACKCHAN_TTS_DEFAULT_VOICE``.
 DEFAULT_VOICE = "voicevox"
+
+#: Environment variable that overrides the runtime default engine.
+#: Set e.g. ``STACKCHAN_TTS_DEFAULT_VOICE=piper`` to make every ``say``
+#: call (including gateway-internal speech: voice replies, heartbeat,
+#: proactive, CO2 alerts) use Piper without threading ``voice="piper"``
+#: through each call site. An explicit ``voice`` argument still wins.
+DEFAULT_VOICE_ENV = "STACKCHAN_TTS_DEFAULT_VOICE"
+
+
+def resolve_default_voice() -> str:
+    """Return the runtime default engine name.
+
+    Reads :data:`DEFAULT_VOICE_ENV`, falling back to :data:`DEFAULT_VOICE`
+    when it is unset or blank. Resolved per call (not cached) so operators
+    can change it by restarting the process with a new env value without a
+    code change.
+    """
+    override = os.getenv(DEFAULT_VOICE_ENV)
+    return override if override and override.strip() else DEFAULT_VOICE
 
 
 async def synthesize_and_send(
@@ -100,8 +123,9 @@ async def synthesize_and_send(
     if not isinstance(text, str) or not text.strip():
         raise ValueError("'text' is required and must be a non-empty string")
 
-    voice_raw = arguments.get("voice", DEFAULT_VOICE)
-    voice = voice_raw if isinstance(voice_raw, str) and voice_raw else DEFAULT_VOICE
+    default_voice = resolve_default_voice()
+    voice_raw = arguments.get("voice", default_voice)
+    voice = voice_raw if isinstance(voice_raw, str) and voice_raw else default_voice
 
     reg = registry if registry is not None else get_registry()
     engine = reg.get(voice)

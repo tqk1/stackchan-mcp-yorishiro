@@ -16,6 +16,7 @@ from stackchan_mcp.tts import (
     get_registry,
     synthesize_and_send,
 )
+from stackchan_mcp.tts.orchestrator import DEFAULT_VOICE_ENV, resolve_default_voice
 
 
 class _FakeEngine(TTSEngine):
@@ -154,6 +155,57 @@ async def test_synthesize_and_send_voice_default_falls_back():
     with pytest.raises(NotImplementedError) as exc_info:
         await synthesize_and_send({"text": "hello", "voice": 123}, registry=reg)
     assert DEFAULT_VOICE in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Runtime default-voice override (STACKCHAN_TTS_DEFAULT_VOICE)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_default_voice_defaults_to_voicevox(monkeypatch):
+    """With the env unset, the runtime default is the built-in DEFAULT_VOICE."""
+    monkeypatch.delenv(DEFAULT_VOICE_ENV, raising=False)
+    assert resolve_default_voice() == DEFAULT_VOICE == "voicevox"
+
+
+def test_resolve_default_voice_honors_env(monkeypatch):
+    """The env var overrides the runtime default engine."""
+    monkeypatch.setenv(DEFAULT_VOICE_ENV, "piper")
+    assert resolve_default_voice() == "piper"
+
+
+def test_resolve_default_voice_blank_env_falls_back(monkeypatch):
+    """A blank/whitespace override is ignored (falls back to the default)."""
+    monkeypatch.setenv(DEFAULT_VOICE_ENV, "   ")
+    assert resolve_default_voice() == DEFAULT_VOICE
+
+
+@pytest.mark.asyncio
+async def test_synthesize_and_send_uses_env_default_voice(monkeypatch):
+    """With no explicit 'voice', the env default drives engine lookup."""
+    monkeypatch.setenv(DEFAULT_VOICE_ENV, "piper")
+    reg = EngineRegistry()  # empty -> lookup for 'piper' fails, naming it
+
+    with pytest.raises(NotImplementedError) as exc_info:
+        await synthesize_and_send({"text": "hello"}, registry=reg)
+
+    assert "piper" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_explicit_voice_wins_over_env_default(monkeypatch):
+    """An explicit 'voice' argument beats the env default."""
+    monkeypatch.setenv(DEFAULT_VOICE_ENV, "piper")
+    reg = EngineRegistry()
+
+    with pytest.raises(NotImplementedError) as exc_info:
+        await synthesize_and_send(
+            {"text": "hello", "voice": "voicevox"}, registry=reg
+        )
+
+    msg = str(exc_info.value)
+    assert "voicevox" in msg
+    assert "piper" not in msg
 
 
 @pytest.mark.asyncio

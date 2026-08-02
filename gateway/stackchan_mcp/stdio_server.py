@@ -1293,8 +1293,10 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         "voice": {
                             "type": "string",
                             "description": (
-                                "Engine identifier (e.g. 'voicevox', 'irodori'). "
-                                "Default 'voicevox'."
+                                "Engine identifier (e.g. 'voicevox' for "
+                                "Japanese, 'piper' for English, 'irodori'). "
+                                "Default 'voicevox' (override the default "
+                                "engine via STACKCHAN_TTS_DEFAULT_VOICE)."
                             ),
                             "default": "voicevox",
                         },

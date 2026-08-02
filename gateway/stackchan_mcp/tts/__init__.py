@@ -48,7 +48,30 @@ def _register_voicevox() -> None:
     get_registry().register(VoicevoxEngine())
 
 
+def _register_piper() -> None:
+    """Register the Piper engine when the ``piper`` package is installed.
+
+    Unlike VOICEVOX — which is reached over HTTP and so always registers,
+    deferring the real check to synthesis time — Piper runs in-process, so
+    the presence of the ``piper`` Python package is a meaningful gate:
+    without it the engine can never synthesise. We probe with
+    ``find_spec`` (no import side effects) and raise ImportError so
+    ``_try_register`` skips registration cleanly, keeping ``piper`` out of
+    the registry — and out of ``get_status`` — until the ``[tts-piper]``
+    extra is installed.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("piper") is None:
+        raise ImportError("piper package is not installed ([tts-piper] extra)")
+
+    from .piper import PiperEngine
+
+    get_registry().register(PiperEngine())
+
+
 _try_register(_register_voicevox, "voicevox")
+_try_register(_register_piper, "piper")
 
 
 __all__ = [

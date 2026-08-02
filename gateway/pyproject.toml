@@ -63,6 +63,22 @@ tts = [
 tts-voicevox = [
     "stackchan-mcp[tts]",
 ]
+# Piper — in-process English (and multilingual) neural TTS (yorishiro
+# fork). Pulls the base `tts` extra (opuslib for the device's Opus
+# decoder) plus `piper-tts`, which brings onnxruntime. Runs fully offline
+# on CPU (ships a win_amd64 wheel); voice models are downloaded
+# separately (see the Piper section of the gateway README).
+#
+# License: the maintained `piper-tts` (OHF-Voice/piper1-gpl) is GPL-3.0
+# (the original rhasspy/piper was MIT but is unmaintained). It is an
+# opt-in, user-installed extra imported only at runtime, so the MIT
+# gateway does not vendor or distribute any GPL code. `>=1.2` covers both
+# the modern chunk-generator API and the legacy raw-stream API that
+# tts/piper.py supports.
+tts-piper = [
+    "stackchan-mcp[tts]",
+    "piper-tts>=1.2",
+]
 
 # Phase 4 STT — see Issue #91.
 # The base `stt` extra carries `opuslib` for decoding the device's
