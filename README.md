@@ -909,6 +909,8 @@ The `gateway/` runs as an independent Python process and only talks to the ESP32
 
 The gateway's `win_amd64` PyPI wheel additionally bundles `opus.dll` built from upstream Opus source by the publish workflow. That native binary ships under the **BSD 3-clause license + Xiph extension**; the notice is shipped in every distribution form as `gateway/LICENSE-THIRD-PARTY`. Non-Windows wheels and the sdist do not contain the binary — they rely on the system `libopus`. See `gateway/stackchan_mcp/_libs/SOURCES.md` for the per-release SHA256 and build provenance.
 
+The optional `tts-piper` extra (English TTS) installs [`piper-tts`](https://pypi.org/project/piper-tts/), which is licensed **GPL-3.0-or-later** — the maintained line lives at [OHF-Voice/piper1-gpl](https://github.com/OHF-Voice/piper1-gpl), the original MIT-licensed `rhasspy/piper` being unmaintained since October 2025. The gateway does **not** bundle or redistribute it: `uv sync --extra tts-piper` (or `pip install 'stackchan-mcp[tts-piper]'`) fetches the package from PyPI onto your own machine, and the gateway merely imports it at runtime once you opt in. The gateway itself therefore remains **MIT**. If a GPL-3.0 dependency is unacceptable for your use, simply do not install that extra — the default VOICEVOX engine is unaffected.
+
 > **Note for direct `idf.py` users with a pre-existing `firmware/sdkconfig`:**
 > ESP-IDF persists Kconfig choices into `firmware/sdkconfig`, and a
 > change to the Kconfig `default` does not retroactively rewrite that

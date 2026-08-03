@@ -852,6 +852,8 @@ X 軸 (yaw、`-90..+90°`) には同等のハードウェア制限はなく — 
 
 `gateway/` は独立した Python プロセスで、ESP32 とはネットワーク経由 (WebSocket) でしか通信しないため、firmware 側のドライバ選択に関わらず **MIT License** のまま利用・派生できます。
 
+オプションの `tts-piper` extra (英語 TTS) は [`piper-tts`](https://pypi.org/project/piper-tts/) を導入します。これは **GPL-3.0-or-later** です (メンテナンスされている系統は [OHF-Voice/piper1-gpl](https://github.com/OHF-Voice/piper1-gpl)。MIT だった元の `rhasspy/piper` は 2025年10月以降メンテナンスされていません)。gateway はこれを**同梱・再配布しません**。`uv sync --extra tts-piper` (または `pip install 'stackchan-mcp[tts-piper]'`) が PyPI から利用者自身のマシンへ取得し、gateway は opt-in したときに実行時 import するだけです。したがって gateway 自体は **MIT** のままです。GPL-3.0 の依存が許容できない用途では、この extra を導入しなければ済みます (既定の VOICEVOX エンジンには影響しません)。
+
 > **既存の `firmware/sdkconfig` を持っている `idf.py` 直叩きユーザーへの注意:**
 > ESP-IDF は Kconfig の選択を `firmware/sdkconfig` に永続化します。
 > Kconfig の `default` 変更はそのファイルを遡及的に書き換えません。
