@@ -12,13 +12,17 @@ exercised with fakes shaped like each.
 from __future__ import annotations
 
 import array
+import threading
 
 import pytest
 
 from stackchan_mcp.tts.audio_utils import DEVICE_SAMPLE_RATE
 from stackchan_mcp.tts.piper import (
+    DEFAULT_TIMEOUT_S,
     PIPER_MODEL_ENV,
+    PIPER_TIMEOUT_ENV,
     PiperEngine,
+    _resolve_timeout_s,
     _voice_to_pcm,
 )
 
@@ -226,3 +230,136 @@ async def test_synthesize_without_model_path_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match=PIPER_MODEL_ENV):
         await engine.synthesize("hello")
+
+
+# ---------------------------------------------------------------------------
+# Warm-up (eager model load at gateway startup)
+# ---------------------------------------------------------------------------
+
+
+def test_warmup_loads_model_eagerly():
+    """warmup() pays the load cost before any synthesize() call."""
+    load_calls: list[str] = []
+
+    def loader(path: str):
+        load_calls.append(path)
+        return _ModernVoice(_int16_bytes([1, 2, 3, 4]), DEVICE_SAMPLE_RATE)
+
+    engine = PiperEngine(model_path="/models/v.onnx", voice_loader=loader)
+    engine.warmup()
+
+    assert load_calls == ["/models/v.onnx"]
+
+
+@pytest.mark.asyncio
+async def test_warmup_then_synthesize_does_not_reload():
+    """A warmed engine reuses the cached voice on the first say()."""
+    load_calls: list[str] = []
+
+    def loader(path: str):
+        load_calls.append(path)
+        return _ModernVoice(_int16_bytes([1, 2, 3, 4]), DEVICE_SAMPLE_RATE)
+
+    engine = PiperEngine(model_path="/models/v.onnx", voice_loader=loader)
+    engine.warmup()
+    await engine.synthesize("hello")
+
+    assert load_calls == ["/models/v.onnx"]  # loaded exactly once
+
+
+def test_warmup_without_model_path_is_noop(monkeypatch):
+    """An unconfigured Piper must not make gateway startup fail.
+
+    The engine registers whenever the ``piper`` package is importable,
+    so a VOICEVOX-only user has it in the registry without ever setting
+    a model path.
+    """
+    monkeypatch.delenv(PIPER_MODEL_ENV, raising=False)
+    engine = PiperEngine(model_path=None)  # real loader, must not be reached
+
+    engine.warmup()  # must not raise
+
+
+def test_warmup_propagates_loader_failure():
+    """A configured-but-broken model surfaces to the caller.
+
+    ``warmup_engines`` is what decides this is non-fatal; the engine
+    itself reports honestly.
+    """
+
+    def loader(path: str):
+        raise RuntimeError("onnxruntime failed to load")
+
+    engine = PiperEngine(model_path="/models/v.onnx", voice_loader=loader)
+
+    with pytest.raises(RuntimeError, match="onnxruntime failed to load"):
+        engine.warmup()
+
+
+# ---------------------------------------------------------------------------
+# Synthesis timeout
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_defaults_when_env_unset(monkeypatch):
+    monkeypatch.delenv(PIPER_TIMEOUT_ENV, raising=False)
+    assert _resolve_timeout_s() == DEFAULT_TIMEOUT_S
+
+
+def test_timeout_env_override(monkeypatch):
+    monkeypatch.setenv(PIPER_TIMEOUT_ENV, "12.5")
+    assert _resolve_timeout_s() == 12.5
+
+
+@pytest.mark.parametrize("raw", ["abc", "0", "-1", "   "])
+def test_timeout_falls_back_on_unusable_value(monkeypatch, raw):
+    """A bad override must not make say() unusable."""
+    monkeypatch.setenv(PIPER_TIMEOUT_ENV, raw)
+    assert _resolve_timeout_s() == DEFAULT_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+async def test_synthesize_times_out_with_actionable_error(monkeypatch):
+    """A wedged model load returns a readable error, not a silent stall.
+
+    This is the regression guard for the Windows report where the first
+    say() hung until the MCP client's own timeout with nothing logged.
+    """
+    monkeypatch.setenv(PIPER_TIMEOUT_ENV, "0.05")
+    release = threading.Event()
+
+    def loader(path: str):
+        release.wait(timeout=5.0)  # stand-in for a stuck native import
+        return _ModernVoice(_int16_bytes([1, 2]), DEVICE_SAMPLE_RATE)
+
+    engine = PiperEngine(model_path="/models/stuck.onnx", voice_loader=loader)
+
+    try:
+        with pytest.raises(RuntimeError, match="timed out"):
+            await engine.synthesize("hello")
+    finally:
+        # Let the worker thread finish; to_thread cannot be cancelled.
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_timeout_error_names_the_model_and_env_var(monkeypatch):
+    """The error has to tell the operator what to look at next."""
+    monkeypatch.setenv(PIPER_TIMEOUT_ENV, "0.05")
+    release = threading.Event()
+
+    def loader(path: str):
+        release.wait(timeout=5.0)
+        return _ModernVoice(_int16_bytes([1, 2]), DEVICE_SAMPLE_RATE)
+
+    engine = PiperEngine(model_path="/models/stuck.onnx", voice_loader=loader)
+
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            await engine.synthesize("hello")
+    finally:
+        release.set()
+
+    message = str(excinfo.value)
+    assert "/models/stuck.onnx" in message
+    assert PIPER_TIMEOUT_ENV in message

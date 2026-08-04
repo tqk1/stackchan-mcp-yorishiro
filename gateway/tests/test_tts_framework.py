@@ -15,6 +15,7 @@ from stackchan_mcp.tts import (
     TTSEngine,
     get_registry,
     synthesize_and_send,
+    warmup_engines,
 )
 from stackchan_mcp.tts.orchestrator import DEFAULT_VOICE_ENV, resolve_default_voice
 
@@ -223,3 +224,61 @@ async def test_synthesize_and_send_lists_available_engines_in_error():
     msg = str(exc_info.value)
     assert "alpha" in msg
     assert "beta" in msg
+
+
+# ---------------------------------------------------------------------------
+# Startup warm-up
+# ---------------------------------------------------------------------------
+
+
+class _WarmupEngine(_FakeEngine):
+    """Engine that records warm-up calls, optionally failing."""
+
+    def __init__(self, name: str, *, fail: bool = False) -> None:
+        super().__init__(name)
+        self._fail = fail
+        self.warmups = 0
+
+    def warmup(self) -> None:
+        self.warmups += 1
+        if self._fail:
+            raise RuntimeError(f"{self.name} model missing")
+
+
+def test_engine_warmup_defaults_to_noop():
+    """Engines with nothing to preload inherit a no-op warm-up."""
+    engine = _FakeEngine(name="http-backed")
+    engine.warmup()  # must not raise
+
+
+def test_warmup_engines_warms_every_registered_engine():
+    reg = EngineRegistry()
+    first = _WarmupEngine("alpha")
+    second = _WarmupEngine("beta")
+    reg.register(first)
+    reg.register(second)
+
+    warmup_engines(reg)
+
+    assert (first.warmups, second.warmups) == (1, 1)
+
+
+def test_warmup_engines_swallows_failure_and_continues():
+    """One broken engine must not stop startup, nor the other engines.
+
+    The gateway is still fully usable for the device connection and
+    every non-TTS tool, so a warm-up failure is logged, not raised.
+    """
+    reg = EngineRegistry()
+    broken = _WarmupEngine("broken", fail=True)
+    healthy = _WarmupEngine("healthy")
+    reg.register(broken)
+    reg.register(healthy)
+
+    warmup_engines(reg)  # must not raise
+
+    assert healthy.warmups == 1
+
+
+def test_warmup_engines_on_empty_registry_is_noop():
+    warmup_engines(EngineRegistry())  # must not raise

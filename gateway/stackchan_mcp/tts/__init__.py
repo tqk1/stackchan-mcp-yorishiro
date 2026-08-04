@@ -74,6 +74,37 @@ _try_register(_register_voicevox, "voicevox")
 _try_register(_register_piper, "piper")
 
 
+def warmup_engines(registry: EngineRegistry | None = None) -> None:
+    """Warm up every registered engine, logging rather than raising.
+
+    Called once from the gateway startup path so that an in-process
+    engine's first-use model load happens here — on the main thread,
+    with the servers already listening — instead of inside the first
+    ``say`` call on a worker thread, where a slow or stuck native import
+    surfaces only as a silent stall.
+
+    A warm-up failure never stops the gateway from starting: the device
+    connection and every non-TTS tool work without it, and the same
+    error is raised again (with the same message) when ``say`` actually
+    reaches the engine. So the failure is reported here and swallowed.
+
+    Args:
+        registry: Registry to warm up. Defaults to the process-wide one;
+            tests inject a fresh registry, the same seam
+            :func:`~stackchan_mcp.tts.orchestrator.synthesize_and_send`
+            uses.
+    """
+    reg = registry if registry is not None else get_registry()
+    for name in reg.names():
+        engine = reg.get(name)
+        if engine is None:  # pragma: no cover - registry mutated mid-iteration
+            continue
+        try:
+            engine.warmup()
+        except Exception as exc:
+            _logger.warning("TTS engine %r warm-up failed: %s", name, exc)
+
+
 __all__ = [
     "DEFAULT_VOICE",
     "EngineRegistry",

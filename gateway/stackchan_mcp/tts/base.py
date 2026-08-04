@@ -47,6 +47,21 @@ class TTSEngine(ABC):
             before pushing to the device.
         """
 
+    def warmup(self) -> None:
+        """Perform costly one-time initialisation up front.
+
+        Called once during gateway startup, on the main thread, before
+        the MCP server starts serving requests. The default is a no-op:
+        engines that reach a service over HTTP (VOICEVOX) have nothing
+        to preload, and an engine that is registered but unconfigured
+        must not make startup fail.
+
+        In-process engines that load a model on first use (Piper)
+        override this so the load cost — and any failure — surfaces in
+        the startup log rather than inside the first ``say`` call, where
+        it would otherwise appear as an unexplained stall.
+        """
+
 
 class EngineRegistry:
     """Tracks available TTS engines by name.

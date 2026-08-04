@@ -48,6 +48,13 @@ Configuration:
         without passing ``voice="piper"`` on every ``say`` call (handled
         in :mod:`stackchan_mcp.tts.orchestrator`). The built-in default
         stays ``voicevox`` so existing Japanese operation is unchanged.
+
+    ``STACKCHAN_PIPER_TIMEOUT_S``
+        Upper bound, in seconds, on one synthesis call (including the
+        one-off model load). Defaults to :data:`DEFAULT_TIMEOUT_S`.
+        Raise it only on very slow hardware; the point of the bound is
+        to fail with a readable error before the MCP client's own
+        timeout turns the call into an unexplained stall.
 """
 
 from __future__ import annotations
@@ -66,6 +73,48 @@ logger = logging.getLogger(__name__)
 
 #: Environment variable naming the Piper ``.onnx`` model file to load.
 PIPER_MODEL_ENV = "STACKCHAN_PIPER_MODEL"
+
+#: Environment variable overriding :data:`DEFAULT_TIMEOUT_S`.
+PIPER_TIMEOUT_ENV = "STACKCHAN_PIPER_TIMEOUT_S"
+
+#: Upper bound, in seconds, on one ``synthesize`` call. Piper runs far
+#: faster than real time even on modest CPUs, and the model load is a
+#: couple of seconds, so 30 s is generous for legitimate work. It sits
+#: below the 60 s timeout MCP clients typically apply, which matters:
+#: without a bound of our own, a wedged native import inside the worker
+#: thread reaches the caller as a silent stall with nothing in the log.
+DEFAULT_TIMEOUT_S = 30.0
+
+
+def _resolve_timeout_s() -> float:
+    """Return the synthesis timeout, falling back on a malformed value.
+
+    A bad :data:`PIPER_TIMEOUT_ENV` must not make ``say`` unusable, so a
+    non-numeric or non-positive setting is logged and ignored rather
+    than raised.
+    """
+    raw = os.getenv(PIPER_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring %s=%r: not a number; using %.0fs",
+            PIPER_TIMEOUT_ENV,
+            raw,
+            DEFAULT_TIMEOUT_S,
+        )
+        return DEFAULT_TIMEOUT_S
+    if value <= 0:
+        logger.warning(
+            "Ignoring %s=%r: must be positive; using %.0fs",
+            PIPER_TIMEOUT_ENV,
+            raw,
+            DEFAULT_TIMEOUT_S,
+        )
+        return DEFAULT_TIMEOUT_S
+    return value
 
 
 def _default_voice_loader(model_path: str) -> Any:
@@ -192,9 +241,34 @@ class PiperEngine(TTSEngine):
                     ".onnx voice model, or pass model_path=. Download "
                     "voices from https://huggingface.co/rhasspy/piper-voices."
                 )
+            # Logged *before* the call, not just after it. The loader
+            # performs the first real ``import piper`` — which drags in
+            # onnxruntime and espeak-ng native libraries — and then reads
+            # the model. If any of that stalls, a success-only log line
+            # would leave no trace of how far synthesis got.
+            logger.info("Loading Piper voice model: %s", self._model_path)
             self._voice = self._voice_loader(self._model_path)
             logger.info("Loaded Piper voice model: %s", self._model_path)
             return self._voice
+
+    def warmup(self) -> None:
+        """Load the voice model now, on the calling thread.
+
+        Overrides the no-op :meth:`~stackchan_mcp.tts.base.TTSEngine.warmup`
+        so the gateway pays Piper's first-use cost at startup. Without
+        this the model loads inside the first ``say`` — on a worker
+        thread, mid-conversation — and a native import that is merely
+        slow is indistinguishable from one that is stuck.
+
+        Does nothing when no model is configured: the engine registers
+        whenever the ``piper`` package is importable, so a user running
+        VOICEVOX only would otherwise see a startup failure for an
+        engine they never asked for. ``synthesize`` still reports the
+        missing path when it is actually called.
+        """
+        if not self._model_path:
+            return
+        self._get_voice()
 
     def _blocking_synthesize(self, text: str) -> tuple[int, bytes]:
         """Load (if needed) and synthesise. Runs in a worker thread."""
@@ -213,7 +287,30 @@ class PiperEngine(TTSEngine):
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Piper synthesize: 'text' must be a non-empty string")
 
-        sample_rate, pcm = await asyncio.to_thread(self._blocking_synthesize, text)
+        timeout_s = _resolve_timeout_s()
+        try:
+            sample_rate, pcm = await asyncio.wait_for(
+                asyncio.to_thread(self._blocking_synthesize, text),
+                timeout=timeout_s,
+            )
+        except TimeoutError as exc:
+            # ``asyncio.to_thread`` cannot be cancelled, so the worker
+            # thread keeps running (and keeps holding ``_load_lock`` if
+            # it stalled inside the model load). That is deliberate:
+            # there is no safe way to kill a thread stuck in a native
+            # call, and returning a readable error beats leaving the
+            # caller to hit its own timeout with nothing to go on. A
+            # repeat call will time out the same way until the stuck
+            # load finishes or the gateway restarts.
+            raise RuntimeError(
+                f"Piper synthesis timed out after {timeout_s:.0f}s "
+                f"(model={self._model_path!r}). If the log shows "
+                f"'Loading Piper voice model' without a matching "
+                f"'Loaded', the model load itself is stuck — check the "
+                f"model file and that piper's native dependencies "
+                f"(onnxruntime, espeak-ng) import on this machine. "
+                f"Raise {PIPER_TIMEOUT_ENV} if the hardware is simply slow."
+            ) from exc
 
         if sample_rate != DEVICE_SAMPLE_RATE:
             pcm = resample_pcm16_linear(pcm, sample_rate, DEVICE_SAMPLE_RATE)

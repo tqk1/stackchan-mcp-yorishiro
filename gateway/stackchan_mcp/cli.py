@@ -699,6 +699,7 @@ async def _run(*, advertise_mdns: bool = True) -> None:
     from .gateway import get_gateway
     from .notify_config import load_notify_config
     from .stdio_server import run_stdio_server
+    from .tts import warmup_engines
 
     notify_config = load_notify_config()
     gateway = get_gateway()
@@ -724,6 +725,15 @@ async def _run(*, advertise_mdns: bool = True) -> None:
         rotate_old_entries(path=notify_config.jsonl_path)
 
     await gateway.start(advertise_mdns=advertise_mdns)
+
+    # Load TTS models before serving MCP. An in-process engine (Piper)
+    # otherwise loads its model inside the first say() — on a worker
+    # thread, with the caller already waiting — so a slow or wedged
+    # native import shows up as an unexplained stall instead of a
+    # startup log line. Runs after gateway.start() so the WebSocket
+    # server is already accepting while this happens, and never raises.
+    warmup_engines()
+
     logger.info("Gateway started, waiting for ESP32 connections...")
 
     try:
@@ -836,6 +846,7 @@ async def _run_streamable_http_daemon(
     from .notify_config import load_notify_config
     from .http_server import build_app, make_dispatch_fn
     from .queue import CommandQueue
+    from .tts import warmup_engines
 
     notify_config = load_notify_config()
     if notify_config.jsonl_enabled:
@@ -867,6 +878,11 @@ async def _run_streamable_http_daemon(
     server = uvicorn.Server(config)
 
     await gateway.start(advertise_mdns=advertise_mdns)
+
+    # Same reasoning as the stdio path: pay the in-process TTS model
+    # load here, not inside the first say().
+    warmup_engines()
+
     logger.info(
         "Streamable HTTP MCP daemon starting on http://%s:%d/mcp",
         host,
