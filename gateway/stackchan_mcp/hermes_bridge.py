@@ -371,6 +371,10 @@ async def _run_voice_turn(
     ``hermes_session_id`` is the Phase 2 per-conversation Hermes context
     id threaded into the brain call.
     """
+    # Lazy like the caller's own imports, so capture-only deployments
+    # stay free of the stt extra.
+    from .stt.orchestrator import resolve_default_language
+
     if (request.content_length or 0) > MAX_OGG_BYTES:
         return web.json_response(
             {"ok": False, "error": "payload too large"}, status=413
@@ -428,7 +432,14 @@ async def _run_voice_turn(
     # Phase 2 LED: show the "listening" colour through STT (self-
     # contained; on_listen_started already set it for device listens).
     await control.apply_led_state(gateway, "listening")
-    stt_result: dict[str, Any] = await engine.transcribe(pcm, language="ja")
+    # The device-driven turn passes no language of its own, so it takes
+    # the runtime default. This used to be a hardcoded "ja", which left
+    # a non-Japanese speaker with no way to reach their own language:
+    # tap-to-talk is the one STT path that never goes through the MCP
+    # tool's arguments.
+    stt_result: dict[str, Any] = await engine.transcribe(
+        pcm, language=resolve_default_language()
+    )
     transcript = stt_result.get("text", "").strip()
     t_stt = time.monotonic()
 

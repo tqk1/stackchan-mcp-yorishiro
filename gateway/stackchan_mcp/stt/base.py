@@ -54,6 +54,23 @@ class STTEngine(ABC):
             available for future extensions.
         """
 
+    async def warmup(self) -> None:
+        """Perform costly one-time initialisation up front.
+
+        Called once during gateway startup, before the MCP server starts
+        serving. The default is a no-op: an engine that reaches a remote
+        API has nothing to preload.
+
+        Local engines that load (and on first ever run, download) a
+        model override this, so the cost lands in the startup log rather
+        than inside a voice turn — where the caller is already waiting
+        and the delay reads as a failure.
+
+        Async, unlike the TTS counterpart, because these loaders are
+        already coroutines: they hold an :class:`asyncio.Lock` and
+        off-load the blocking init with :func:`asyncio.to_thread`.
+        """
+
 
 class EngineRegistry:
     """Tracks available STT engines by name.

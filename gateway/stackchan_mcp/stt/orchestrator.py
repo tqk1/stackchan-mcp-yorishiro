@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -51,6 +52,40 @@ logger = logging.getLogger(__name__)
 #: faster-whisper runs locally and matches the "works offline out of
 #: the box" stance (Issue #91).
 DEFAULT_ENGINE = "faster-whisper"
+
+#: Built-in recognition language when none is requested. Kept at
+#: Japanese so existing operation never changes silently; the *runtime*
+#: default comes from :func:`resolve_default_language`.
+DEFAULT_LANGUAGE = "ja"
+
+#: Environment variable overriding the runtime default language.
+#: The mirror of ``STACKCHAN_TTS_DEFAULT_VOICE`` on the speaking side —
+#: without it, an English speaker had no way to change the language of
+#: the device-driven voice turn, which passes no explicit argument.
+DEFAULT_LANGUAGE_ENV = "STACKCHAN_STT_LANGUAGE"
+
+#: Value of :data:`DEFAULT_LANGUAGE_ENV` that selects autodetection.
+#: The engines already accept ``None`` for "detect it", but nothing
+#: could reach that through configuration alone.
+LANGUAGE_AUTO = "auto"
+
+
+def resolve_default_language() -> str | None:
+    """Return the runtime default recognition language.
+
+    Reads :data:`DEFAULT_LANGUAGE_ENV`, falling back to
+    :data:`DEFAULT_LANGUAGE` when unset or blank. ``"auto"`` resolves to
+    ``None``, which the engines treat as language autodetection.
+
+    Resolved per call rather than cached, matching
+    :func:`~stackchan_mcp.tts.orchestrator.resolve_default_voice`, so a
+    restart with a new value is enough to change it.
+    """
+    override = os.getenv(DEFAULT_LANGUAGE_ENV)
+    if not override or not override.strip():
+        return DEFAULT_LANGUAGE
+    value = override.strip()
+    return None if value.lower() == LANGUAGE_AUTO else value
 
 #: Minimum capture window. Below this Whisper has too little signal to
 #: produce anything useful, and the listen() round-trip starts to be
@@ -379,7 +414,7 @@ async def listen_and_transcribe(
     lock_ctx = listen_lock if listen_lock is not None else nullcontext()
 
     duration_ms = int(duration_raw)
-    language = arguments.get("language", "ja")
+    language = arguments.get("language", resolve_default_language())
     model = arguments.get("model")
 
     frame_count = 0

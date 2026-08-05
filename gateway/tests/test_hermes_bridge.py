@@ -922,3 +922,83 @@ async def test_multiturn_continuation_skips_display_clear(monkeypatch):
     # きいてるよ → 考え中, but NO trailing clear (would blank the re-listen).
     assert control.STATUS_CLEAR not in seen
     assert seen == [control.STATUS_LISTENING, control.STATUS_THINKING]
+
+
+# ---------------------------------------------------------------------------
+# Recognition language on the device-driven turn
+# ---------------------------------------------------------------------------
+
+
+def _capture_stt_language(monkeypatch, seen: list, *, transcript: str = "hello"):
+    """Re-stub the STT registry to record the language the turn requests.
+
+    Applied after :func:`_patch_voice_pipeline`, whose own stub engine
+    discards its arguments; the later monkeypatch wins.
+    """
+    import stackchan_mcp.stt as stt_mod
+
+    class _RecordingEngine:
+        async def transcribe(self, pcm, language=None):
+            seen.append(language)
+            return {"text": transcript}
+
+    class _Registry:
+        def get(self, name):
+            return _RecordingEngine()
+
+    monkeypatch.setattr(stt_mod, "get_registry", lambda: _Registry())
+
+
+@pytest.mark.asyncio
+async def test_voice_turn_defaults_to_japanese(monkeypatch):
+    """Unset env keeps the existing behaviour exactly."""
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    monkeypatch.delenv("STACKCHAN_STT_LANGUAGE", raising=False)
+    seen: list = []
+    _patch_voice_pipeline(monkeypatch, transcript="おはよう", reply="やあ")
+    _capture_stt_language(monkeypatch, seen, transcript="おはよう")
+
+    response = await hermes_bridge.handle_voice_turn(
+        _make_voice_request(_StubGateway())
+    )
+
+    assert response.status == 200
+    assert seen == ["ja"]
+
+
+@pytest.mark.asyncio
+async def test_voice_turn_follows_configured_language(monkeypatch):
+    """Tap-to-talk is the one STT path with no arguments of its own.
+
+    It used to hardcode "ja", so a non-Japanese speaker had no way to be
+    understood no matter what they configured.
+    """
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    monkeypatch.setenv("STACKCHAN_STT_LANGUAGE", "en")
+    seen: list = []
+    _patch_voice_pipeline(monkeypatch, transcript="hello", reply="hi")
+    _capture_stt_language(monkeypatch, seen)
+
+    response = await hermes_bridge.handle_voice_turn(
+        _make_voice_request(_StubGateway())
+    )
+
+    assert response.status == 200
+    assert seen == ["en"]
+
+
+@pytest.mark.asyncio
+async def test_voice_turn_language_auto_requests_autodetect(monkeypatch):
+    """``auto`` reaches the engines' None = detect path."""
+    monkeypatch.setenv("STACKCHAN_AUDIO_HOOK_TOKEN", "turn-token")
+    monkeypatch.setenv("STACKCHAN_STT_LANGUAGE", "auto")
+    seen: list = []
+    _patch_voice_pipeline(monkeypatch, transcript="hello", reply="hi")
+    _capture_stt_language(monkeypatch, seen)
+
+    response = await hermes_bridge.handle_voice_turn(
+        _make_voice_request(_StubGateway())
+    )
+
+    assert response.status == 200
+    assert seen == [None]

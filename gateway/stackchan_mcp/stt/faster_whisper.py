@@ -150,6 +150,18 @@ class FasterWhisperEngine(STTEngine):
             )
             return self._model
 
+    async def warmup(self) -> None:
+        """Load the model now, before the first voice turn.
+
+        Overrides the no-op
+        :meth:`~stackchan_mcp.stt.base.STTEngine.warmup`. The load is
+        cheap from cache but downloads the weights (about 140 MB for
+        ``base``) the first time a machine ever runs it — far longer
+        than the audio-push timeout, so paid inside a voice turn it
+        looks like the turn failed.
+        """
+        await self._load_model()
+
     async def transcribe(self, pcm: bytes, **opts: Any) -> dict[str, Any]:
         """Transcribe PCM via faster-whisper.
 
@@ -180,14 +192,19 @@ class FasterWhisperEngine(STTEngine):
 
         model = await self._load_model()
 
-        language_raw = opts.get("language", "ja")
+        # Engine-level fallback for direct callers that pass no
+        # language; the orchestrator normally resolves it first.
+        from .orchestrator import resolve_default_language
+
+        default_language = resolve_default_language()
+        language_raw = opts.get("language", default_language)
         language: str | None
         if language_raw is None:
             language = None
         elif isinstance(language_raw, str) and language_raw:
             language = language_raw
         else:
-            language = "ja"
+            language = default_language
 
         wav_bytes = _pcm_to_wav_bytes(pcm, DEVICE_SAMPLE_RATE)
 

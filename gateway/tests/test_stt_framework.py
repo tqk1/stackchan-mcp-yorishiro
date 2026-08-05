@@ -17,6 +17,12 @@ from stackchan_mcp.stt import (
     STTEngine,
     get_registry,
     listen_and_transcribe,
+    warmup_engines,
+)
+from stackchan_mcp.stt.orchestrator import (
+    DEFAULT_LANGUAGE,
+    DEFAULT_LANGUAGE_ENV,
+    resolve_default_language,
 )
 
 
@@ -193,3 +199,98 @@ async def test_listen_lists_available_engines_in_error():
     msg = str(exc_info.value)
     assert "alpha" in msg
     assert "beta" in msg
+
+
+# ---------------------------------------------------------------------------
+# Default recognition language
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_default_language_defaults_to_japanese(monkeypatch):
+    """The built-in default never changes silently."""
+    monkeypatch.delenv(DEFAULT_LANGUAGE_ENV, raising=False)
+    assert resolve_default_language() == DEFAULT_LANGUAGE
+
+
+def test_resolve_default_language_honors_env(monkeypatch):
+    monkeypatch.setenv(DEFAULT_LANGUAGE_ENV, "en")
+    assert resolve_default_language() == "en"
+
+
+def test_resolve_default_language_blank_env_falls_back(monkeypatch):
+    monkeypatch.setenv(DEFAULT_LANGUAGE_ENV, "   ")
+    assert resolve_default_language() == DEFAULT_LANGUAGE
+
+
+def test_resolve_default_language_auto_means_autodetect(monkeypatch):
+    """``auto`` reaches the engines' existing None = detect behaviour."""
+    monkeypatch.setenv(DEFAULT_LANGUAGE_ENV, "auto")
+    assert resolve_default_language() is None
+
+
+def test_resolve_default_language_auto_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv(DEFAULT_LANGUAGE_ENV, "AUTO")
+    assert resolve_default_language() is None
+
+
+def test_resolve_default_language_strips_whitespace(monkeypatch):
+    monkeypatch.setenv(DEFAULT_LANGUAGE_ENV, "  en  ")
+    assert resolve_default_language() == "en"
+
+
+# ---------------------------------------------------------------------------
+# Startup warm-up
+# ---------------------------------------------------------------------------
+
+
+class _WarmupEngine(_FakeEngine):
+    """Engine that records warm-up calls, optionally failing."""
+
+    def __init__(self, name: str, *, fail: bool = False) -> None:
+        super().__init__(name)
+        self._fail = fail
+        self.warmups = 0
+
+    async def warmup(self) -> None:
+        self.warmups += 1
+        if self._fail:
+            raise RuntimeError(f"{self.name} model unavailable")
+
+
+@pytest.mark.asyncio
+async def test_engine_warmup_defaults_to_noop():
+    """Engines with nothing to preload inherit a no-op warm-up."""
+    engine = _FakeEngine(name="remote-api")
+    await engine.warmup()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_warmup_engines_warms_every_registered_engine():
+    reg = EngineRegistry()
+    first = _WarmupEngine("alpha")
+    second = _WarmupEngine("beta")
+    reg.register(first)
+    reg.register(second)
+
+    await warmup_engines(reg)
+
+    assert (first.warmups, second.warmups) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_warmup_engines_swallows_failure_and_continues():
+    """A model that cannot load must not stop the gateway from starting."""
+    reg = EngineRegistry()
+    broken = _WarmupEngine("broken", fail=True)
+    healthy = _WarmupEngine("healthy")
+    reg.register(broken)
+    reg.register(healthy)
+
+    await warmup_engines(reg)  # must not raise
+
+    assert healthy.warmups == 1
+
+
+@pytest.mark.asyncio
+async def test_warmup_engines_on_empty_registry_is_noop():
+    await warmup_engines(EngineRegistry())  # must not raise

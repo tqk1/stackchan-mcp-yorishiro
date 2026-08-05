@@ -53,10 +53,39 @@ _try_register(_register_faster_whisper, "faster-whisper")
 _try_register(_register_openai_whisper, "openai-whisper")
 
 
+async def warmup_engines(registry: EngineRegistry | None = None) -> None:
+    """Warm up every registered engine, logging rather than raising.
+
+    Called once from the gateway startup path so a local model loads
+    here instead of inside the first voice turn. On a first ever run
+    that load also downloads the weights, which takes long enough that
+    the audio-push side times out and the turn looks broken; doing it at
+    startup turns that into a visible one-off wait.
+
+    A warm-up failure never stops the gateway from starting — an engine
+    that cannot load is reported here and raises again, with the same
+    error, if a transcription is actually attempted.
+
+    Args:
+        registry: Registry to warm up. Defaults to the process-wide one;
+            tests inject a fresh registry.
+    """
+    reg = registry if registry is not None else get_registry()
+    for name in reg.names():
+        engine = reg.get(name)
+        if engine is None:  # pragma: no cover - registry mutated mid-iteration
+            continue
+        try:
+            await engine.warmup()
+        except Exception as exc:
+            _logger.warning("STT engine %r warm-up failed: %s", name, exc)
+
+
 __all__ = [
     "DEFAULT_ENGINE",
     "EngineRegistry",
     "STTEngine",
     "get_registry",
     "listen_and_transcribe",
+    "warmup_engines",
 ]
