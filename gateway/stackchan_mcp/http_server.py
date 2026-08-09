@@ -28,7 +28,7 @@ from . import activity_log, control, local_llm, sensors
 from .notes import TOOL_NAMES as NOTES_TOOL_NAMES
 from .notify_config import NotifyConfig
 from .queue import CommandQueue, QueueFull, QueueItem, build_queue_full_error
-from .stdio_server import _dispatch_mcp_tool, create_server
+from .stdio_server import _dispatch_mcp_tool, create_server, log_mcp_tool_call
 from .switchbot import TOOL_NAMES as SWITCHBOT_TOOL_NAMES
 from .web_search import TOOL_NAMES as WEB_SEARCH_TOOL_NAMES
 
@@ -1060,6 +1060,7 @@ def _install_queue_tool_handler(
     async def handler(req: CallToolRequest) -> ServerResult | ErrorData:
         tool_name = req.params.name
         arguments = req.params.arguments or {}
+        log_mcp_tool_call(tool_name, arguments)
         tool = await server._get_cached_tool_definition(tool_name)
         if tool is not None:
             try:

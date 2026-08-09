@@ -807,6 +807,95 @@ The `action` value is forwarded in the event metadata, so keep it
 stable if a downstream consumer keys off it. See `notify.example.yml`
 for the full annotated reference.
 
+### 7. Optional: tap-to-talk voice loop (yorishiro fork)
+
+Sections 4 and 5 give the robot a voice and ears, but each one still
+has to be driven by an MCP client calling `say` or `listen`. This
+section closes the loop so you can simply **tap the LCD and talk**:
+
+```
+tap → firmware records → POST /voice_turn → STT
+    → OpenAI-compatible chat endpoint → TTS → device speaker
+```
+
+There is deliberately no wake word and no always-on VAD — the
+microphone opens only on an explicit trigger. See "Design principles".
+
+**Prerequisites:** a TTS extra (section 4), an STT extra (section 5),
+and a chat endpoint to think with (below).
+
+#### The switch: `STACKCHAN_AUDIO_HOOK_URL`
+
+This one variable turns the loop on. Point it at the gateway's own
+`/voice_turn` endpoint, on the same port as `CAPTURE_PORT`:
+
+```bash
+STACKCHAN_AUDIO_HOOK_URL=http://127.0.0.1:8766/voice_turn
+```
+
+> **If you skip this, tapping the screen looks broken but silent.**
+> The firmware still wakes the microphone and streams audio up; the
+> gateway just drops the frames, and it says so only at `DEBUG` level.
+> No error, no warning, no reply.
+
+#### The brain: an OpenAI-compatible chat endpoint
+
+The gateway POSTs the transcript to `HERMES_API_URL` +
+`/v1/chat/completions` and speaks whatever comes back. This fork is
+built around [Hermes Agent](https://github.com/NousResearch/hermes-agent),
+which ships an OpenAI-compatible API server adapter:
+
+```bash
+HERMES_API_URL=http://127.0.0.1:8642   # default
+HERMES_API_KEY=                        # see the note on memory below
+```
+
+Two things about Hermes that are easy to miss:
+
+- **The API server is opt-in.** Hermes only binds port 8642 when it is
+  started with `API_SERVER_ENABLED=true`. Running Hermes in interactive
+  chat mode does *not* open it, and the gateway then fails every turn
+  with `Cannot connect to host 127.0.0.1:8642` behind a `502`. Verify
+  with `curl http://127.0.0.1:8642/health` before blaming the gateway.
+- **Conversation memory is gated on the API key.** Hermes keeps context
+  per `X-Hermes-Session-Id`, and the gateway only sends that header when
+  `HERMES_API_KEY` is set. Without a key every turn is stateless — the
+  robot answers each sentence with no memory of the previous one. Set
+  Hermes' `API_SERVER_KEY` and the gateway's `HERMES_API_KEY` to the
+  same value.
+
+#### Language
+
+The default spoken-reply system prompt is written in Japanese, and the
+tap-to-talk path never passes a language argument to the recogniser.
+For an English-speaking robot, set all three:
+
+```bash
+STACKCHAN_STT_LANGUAGE=en
+STACKCHAN_PIPER_MODEL=voices/en_US-lessac-medium.onnx   # see section 4
+HERMES_VOICE_SYSTEM_PROMPT="You are a small desktop robot. Reply in
+English, in one to three short spoken sentences, without markdown."
+```
+
+#### Verify
+
+Restart the gateway and look for these lines at startup:
+
+```
+Device-driven listen capture enabled (audio hook http://127.0.0.1:8766/voice_turn)
+Loading faster-whisper model=base device=cpu compute_type=int8
+```
+
+Then tap the screen, speak, and tap again to stop.
+
+| Symptom | Cause |
+|---|---|
+| Tap does nothing, no log lines at all | `STACKCHAN_AUDIO_HOOK_URL` unset |
+| Transcript appears, then `status=502` | Chat endpoint unreachable — is the Hermes API server enabled? |
+| Transcript is empty or nonsense | STT extra missing, or wrong `STACKCHAN_STT_LANGUAGE` |
+| Reply text in the log but no sound | TTS engine unreachable (VOICEVOX not running / Piper model path wrong) |
+| Robot forgets the previous sentence | `HERMES_API_KEY` unset — see above |
+
 ## About the avatar images
 
 `firmware/main/boards/stackchan/avatar_images.cc` is a **pure black RGB565 placeholder**. The firmware builds and runs, but the screen will display nothing.

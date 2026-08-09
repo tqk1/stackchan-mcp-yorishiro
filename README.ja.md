@@ -750,6 +750,96 @@ messages:
 がそれを key にしている場合は安定させておいてください。詳細な注釈
 付きリファレンスは `notify.example.yml` を参照してください。
 
+### 7. オプション: タップ会話ループ (yorishiro fork)
+
+セクション 4・5 で声と耳は付きますが、どちらも MCP クライアントが
+`say` / `listen` を呼んで初めて動きます。ここではその輪を閉じて、
+**画面をタップして話しかけるだけ**で会話が成立する状態にします。
+
+```
+タップ → ファームが録音 → POST /voice_turn → STT
+    → OpenAI 互換チャットエンドポイント → TTS → 本体スピーカー
+```
+
+ウェイクワードも常時 VAD も意図的に持ちません。マイクは明示的な
+トリガーでのみ開きます（「設計原則」参照）。
+
+**前提:** TTS extras（セクション 4）、STT extras（セクション 5）、
+そして考えるためのチャットエンドポイント（後述）。
+
+#### スイッチ: `STACKCHAN_AUDIO_HOOK_URL`
+
+この 1 個でループが有効になります。`CAPTURE_PORT` と同じポートで、
+gateway 自身の `/voice_turn` に向けてください。
+
+```bash
+STACKCHAN_AUDIO_HOOK_URL=http://127.0.0.1:8766/voice_turn
+```
+
+> **未設定だと、タップは「無言で壊れている」ように見えます。**
+> ファームはマイクを開いて音声を送ってきますが、gateway はフレームを
+> 捨てるだけで、しかもそれを `DEBUG` レベルでしか記録しません。
+> エラーも警告も応答も出ません。
+
+#### 頭脳: OpenAI 互換チャットエンドポイント
+
+gateway は転写結果を `HERMES_API_URL` + `/v1/chat/completions` へ POST
+し、返ってきたテキストをそのまま喋ります。本フォークは
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) を前提に
+設計されており、Hermes には OpenAI 互換の API サーバーアダプタが同梱
+されています。
+
+```bash
+HERMES_API_URL=http://127.0.0.1:8642   # 既定値
+HERMES_API_KEY=                        # 記憶についての注記は下記
+```
+
+Hermes 側で見落としやすい点が 2 つあります。
+
+- **API サーバーは opt-in。** Hermes が 8642 を bind するのは
+  `API_SERVER_ENABLED=true` で起動したときだけです。対話チャットモード
+  では開きません。この状態だと gateway は毎回
+  `Cannot connect to host 127.0.0.1:8642` で `502` になります。
+  gateway を疑う前に `curl http://127.0.0.1:8642/health` で確認を。
+- **会話の記憶は API キーに紐付いている。** Hermes は
+  `X-Hermes-Session-Id` 単位で文脈を保持しますが、gateway がこの
+  ヘッダを送るのは `HERMES_API_KEY` が設定されているときだけです。
+  未設定だと毎ターンがステートレスになり、直前の発言を覚えていない
+  応答になります。Hermes の `API_SERVER_KEY` と gateway の
+  `HERMES_API_KEY` に同じ値を設定してください。
+
+#### 言語
+
+既定の発話用システムプロンプトは日本語で書かれており、タップ会話の
+経路は認識エンジンに language 引数を渡しません。英語で喋らせる場合は
+3 つとも設定してください。
+
+```bash
+STACKCHAN_STT_LANGUAGE=en
+STACKCHAN_PIPER_MODEL=voices/en_US-lessac-medium.onnx   # セクション 4 参照
+HERMES_VOICE_SYSTEM_PROMPT="You are a small desktop robot. Reply in
+English, in one to three short spoken sentences, without markdown."
+```
+
+#### 動作確認
+
+gateway を再起動し、起動ログに次の行が出ることを確認します。
+
+```
+Device-driven listen capture enabled (audio hook http://127.0.0.1:8766/voice_turn)
+Loading faster-whisper model=base device=cpu compute_type=int8
+```
+
+あとは画面をタップして話し、もう一度タップして止めます。
+
+| 症状 | 原因 |
+|---|---|
+| タップしても無反応・ログにも何も出ない | `STACKCHAN_AUDIO_HOOK_URL` 未設定 |
+| 転写までは出るが `status=502` | チャットエンドポイントに到達できない（Hermes の API サーバーは有効か） |
+| 転写が空 or 意味不明 | STT extras 未導入、または `STACKCHAN_STT_LANGUAGE` が不一致 |
+| 応答テキストはログに出るが音が出ない | TTS エンジンに到達できない（VOICEVOX 未起動 / Piper のモデルパス誤り） |
+| 直前の発言を覚えていない | `HERMES_API_KEY` 未設定（上記参照） |
+
 ## アバター画像について
 
 `firmware/main/boards/stackchan/avatar_images.cc` は **真っ黒 RGB565 のプレースホルダ** です。ビルドは通りますが、画面には何も表示されません。

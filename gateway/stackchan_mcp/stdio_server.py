@@ -332,6 +332,23 @@ def _resolve_speed_dps(speed: Any) -> int | None:
     )
 
 
+def log_mcp_tool_call(name: str, arguments: dict[str, Any]) -> None:
+    """Record that an MCP *client* asked for a tool.
+
+    Otherwise this is invisible: the transports only log a generic
+    ``CallToolRequest``, so "did the model call ``set_led``?" could not be
+    answered after the fact. Call this from the transport entry points
+    rather than from :func:`_dispatch_mcp_tool` — that one is also the
+    gateway's own internal dispatcher (presence polling, the dashboard
+    sensor tab) and would drown the log in traffic no client made.
+
+    Argument *keys* go to INFO; values can carry spoken text and note
+    bodies, so they stay at DEBUG.
+    """
+    logger.info("MCP tool call: %s(%s)", name, ", ".join(sorted(arguments)))
+    logger.debug("MCP tool call args: %s=%r", name, arguments)
+
+
 async def _dispatch_mcp_tool(
     name: str,
     arguments: dict[str, Any],
@@ -1790,6 +1807,7 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
     async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
         """Handle a tool call by relaying to ESP32."""
         arguments = arguments or {}
+        log_mcp_tool_call(name, arguments)
         return await _dispatch_mcp_tool(name, arguments, get_gateway())
 
     return server
