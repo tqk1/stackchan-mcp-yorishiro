@@ -28,6 +28,9 @@ Environment variables:
   rotation and use this value as a fixed id, as before.
 - ``HERMES_VOICE_SYSTEM_PROMPT`` — overrides the default system prompt
   that keeps spoken replies short.
+- ``HERMES_VOICE_TOOLS_PROMPT`` — overrides the tool-routing paragraph
+  appended to that prompt. Both defaults are Japanese, so a non-Japanese
+  deployment has to override both to get replies in its own language.
 - ``STACKCHAN_AUDIO_HOOK_TOKEN`` — shared bearer token; when set, the
   ``/voice_turn`` endpoint rejects requests without it (the sender side
   in :mod:`audio_input_hook` attaches the same token).
@@ -163,12 +166,18 @@ async def ask_hermes(
             "HERMES_SESSION_ID", DEFAULT_HERMES_SESSION_ID
         )
 
+    # Appended unconditionally, so it also decides the reply language in
+    # practice — an English HERMES_VOICE_SYSTEM_PROMPT with a Japanese
+    # paragraph glued to it still tends to draw Japanese answers. Hence
+    # the override: overriding the prompt alone was not enough.
+    tools_line = os.getenv("HERMES_VOICE_TOOLS_PROMPT", HERMES_VOICE_TOOLS_LINE)
+
     payload = {
         "model": "hermes-agent",
         "messages": [
             {
                 "role": "system",
-                "content": system_prompt + HERMES_VOICE_TOOLS_LINE,
+                "content": system_prompt + tools_line,
             },
             {"role": "user", "content": text},
         ],

@@ -65,6 +65,7 @@ async def test_ask_hermes_system_prompt_carries_tool_guidance(
     monkeypatch.setenv("HERMES_API_URL", base_url)
     monkeypatch.delenv("HERMES_API_KEY", raising=False)
     monkeypatch.delenv("HERMES_VOICE_SYSTEM_PROMPT", raising=False)
+    monkeypatch.delenv("HERMES_VOICE_TOOLS_PROMPT", raising=False)
     try:
         reply = await ask_hermes("メモして")
     finally:
@@ -97,6 +98,7 @@ async def test_ask_hermes_custom_prompt_still_gets_tool_guidance(
     monkeypatch.setenv("HERMES_API_URL", base_url)
     monkeypatch.setenv("HERMES_VOICE_SYSTEM_PROMPT", "カスタム。")
     monkeypatch.delenv("HERMES_API_KEY", raising=False)
+    monkeypatch.delenv("HERMES_VOICE_TOOLS_PROMPT", raising=False)
     try:
         await ask_hermes("こんにちは")
     finally:
@@ -105,6 +107,38 @@ async def test_ask_hermes_custom_prompt_still_gets_tool_guidance(
     system = received["payload"]["messages"][0]
     assert system["content"].startswith("カスタム。")
     assert HERMES_VOICE_TOOLS_LINE in system["content"]
+
+
+@pytest.mark.asyncio
+async def test_ask_hermes_tools_prompt_env_override(
+    monkeypatch, aiohttp_unused_port
+):
+    """The tool-routing paragraph must be overridable on its own.
+
+    It is appended to every turn, so a deployment speaking another
+    language has to replace it too — overriding only the system prompt
+    leaves a Japanese paragraph that drags the replies back."""
+    received: dict[str, Any] = {}
+
+    async def handle(request: web.Request) -> web.Response:
+        received["payload"] = await request.json()
+        return web.json_response(
+            {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        )
+
+    runner, base_url = await _run_hermes_stub(handle, aiohttp_unused_port)
+    monkeypatch.setenv("HERMES_API_URL", base_url)
+    monkeypatch.setenv("HERMES_VOICE_SYSTEM_PROMPT", "Speak English.")
+    monkeypatch.setenv("HERMES_VOICE_TOOLS_PROMPT", " Use web_search.")
+    monkeypatch.delenv("HERMES_API_KEY", raising=False)
+    try:
+        await ask_hermes("hello")
+    finally:
+        await runner.cleanup()
+
+    system = received["payload"]["messages"][0]
+    assert system["content"] == "Speak English. Use web_search."
+    assert HERMES_VOICE_TOOLS_LINE not in system["content"]
 
 
 @pytest.mark.asyncio

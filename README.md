@@ -866,16 +866,23 @@ Two things about Hermes that are easy to miss:
 
 #### Language
 
-The default spoken-reply system prompt is written in Japanese, and the
+The default spoken-reply prompts are written in Japanese, and the
 tap-to-talk path never passes a language argument to the recogniser.
-For an English-speaking robot, set all three:
+For an English-speaking robot, set all four:
 
 ```bash
 STACKCHAN_STT_LANGUAGE=en
 STACKCHAN_PIPER_MODEL=voices/en_US-lessac-medium.onnx   # see section 4
 HERMES_VOICE_SYSTEM_PROMPT="You are a small desktop robot. Reply in
 English, in one to three short spoken sentences, without markdown."
+HERMES_VOICE_TOOLS_PROMPT="Use the web_search tool for anything you
+need to look up, and write_note / read_note / list_notes for notes.
+Never claim you did something without actually calling the tool."
 ```
+
+The last one is easy to miss: that paragraph is appended to the system
+prompt on every turn, so leaving it at its Japanese default tends to
+pull the replies back into Japanese even when the rest is English.
 
 #### Verify
 

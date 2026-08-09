@@ -810,16 +810,23 @@ Hermes 側で見落としやすい点が 2 つあります。
 
 #### 言語
 
-既定の発話用システムプロンプトは日本語で書かれており、タップ会話の
-経路は認識エンジンに language 引数を渡しません。英語で喋らせる場合は
-3 つとも設定してください。
+既定の発話用プロンプトは日本語で書かれており、タップ会話の経路は
+認識エンジンに language 引数を渡しません。英語で喋らせる場合は
+4 つとも設定してください。
 
 ```bash
 STACKCHAN_STT_LANGUAGE=en
 STACKCHAN_PIPER_MODEL=voices/en_US-lessac-medium.onnx   # セクション 4 参照
 HERMES_VOICE_SYSTEM_PROMPT="You are a small desktop robot. Reply in
 English, in one to three short spoken sentences, without markdown."
+HERMES_VOICE_TOOLS_PROMPT="Use the web_search tool for anything you
+need to look up, and write_note / read_note / list_notes for notes.
+Never claim you did something without actually calling the tool."
 ```
+
+最後の 1 つは見落としがちです。この段落は毎ターン、システム
+プロンプトの末尾に連結されます。既定の日本語のままにしておくと、
+他が英語でも応答が日本語に引き戻される傾向があります。
 
 #### 動作確認
 
