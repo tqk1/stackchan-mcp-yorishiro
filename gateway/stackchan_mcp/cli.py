@@ -725,7 +725,7 @@ async def _run(*, advertise_mdns: bool = True) -> None:
     if notify_config.jsonl_enabled:
         rotate_old_entries(path=notify_config.jsonl_path)
 
-    await gateway.start(advertise_mdns=advertise_mdns)
+    await _start_gateway_or_exit(gateway, advertise_mdns=advertise_mdns)
 
     # Load speech models before serving MCP. Either side otherwise loads
     # its model inside the first call — with the caller already waiting —
@@ -745,6 +745,48 @@ async def _run(*, advertise_mdns: bool = True) -> None:
         logger.info("Received termination signal, shutting down...")
     finally:
         await gateway.stop()
+
+
+async def _start_gateway_or_exit(gateway: object, *, advertise_mdns: bool) -> None:
+    """Start the gateway, turning a port clash into an actionable error.
+
+    Every gateway process binds the ESP32 WebSocket port and the capture
+    port, and a stdio MCP server *is* a gateway — so registering this
+    server over stdio while a gateway already runs fails here, before the
+    MCP handshake has happened. The client is left showing "connecting"
+    forever with the real cause buried in a traceback it may not surface
+    at all. Say plainly what happened and how to attach several clients
+    to one gateway instead.
+    """
+    try:
+        await gateway.start(advertise_mdns=advertise_mdns)
+    except OSError as exc:
+        ws_port = os.getenv("WS_PORT", os.getenv("PORT", "8765"))
+        capture_port = os.getenv("CAPTURE_PORT", "8766")
+        mcp_port = os.getenv("MCP_HTTP_PORT", "8767")
+        lines = [f"stackchan-mcp: could not start the gateway: {exc}"]
+        if exc.errno == errno.EADDRINUSE:
+            lines += [
+                "",
+                f"Port {ws_port} (WS_PORT) or {capture_port} (CAPTURE_PORT) is "
+                "already taken, which usually means another gateway is "
+                "already running. Only one process can own them.",
+                "",
+                "A stdio MCP server starts a gateway of its own, so adding "
+                "this server over stdio while a gateway is running will "
+                "always fail this way. To let several MCP clients share one "
+                "gateway, start it once with:",
+                "",
+                "    stackchan-mcp serve --transport streamable-http",
+                "",
+                f"and point the clients at http://127.0.0.1:{mcp_port}/mcp "
+                "instead of stdio.",
+            ]
+        message = "\n".join(lines)
+        logger.error("%s", message)
+        # stdout carries the MCP stream in stdio mode — never write there.
+        print(message, file=sys.stderr)
+        raise SystemExit(1) from exc
 
 
 def _configure_gateway_startup() -> None:
@@ -784,7 +826,23 @@ def _acquire_startup_lock(
                 started_by=started_by,
             )
     except OwnershipError as exc:
+        # Refusing is correct — one device, one gateway. But when the
+        # refused process is a stdio MCP server it dies before the MCP
+        # handshake, so the client reports only "connecting" and this
+        # message is all the user ever gets. Make it say what to do
+        # instead of just what went wrong.
+        mcp_port = os.getenv("MCP_HTTP_PORT", "8767")
         print(str(exc), file=sys.stderr)
+        if mode == _STDIO_TRANSPORT:
+            print(
+                "\nA stdio MCP server runs a gateway of its own, so it "
+                "cannot start while one is already running.\nTo let several "
+                "MCP clients share the running gateway, start that one "
+                "with:\n\n    stackchan-mcp serve --transport "
+                "streamable-http\n\nand register the clients against "
+                f"http://127.0.0.1:{mcp_port}/mcp instead of stdio.",
+                file=sys.stderr,
+            )
         sys.exit(1)
 
     try:
@@ -880,7 +938,7 @@ async def _run_streamable_http_daemon(
     )
     server = uvicorn.Server(config)
 
-    await gateway.start(advertise_mdns=advertise_mdns)
+    await _start_gateway_or_exit(gateway, advertise_mdns=advertise_mdns)
 
     # Same reasoning as the stdio path: pay the speech model loads here,
     # not inside the first say() / voice turn.

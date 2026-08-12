@@ -8,6 +8,7 @@ covered by ``test_stdio_server.py`` and ``test_gateway.py``.
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import signal
 import socket
@@ -1179,3 +1180,88 @@ def test_ensure_libopus_findable_handles_missing_homebrew(
     cli._ensure_libopus_findable()
 
     assert "DYLD_LIBRARY_PATH" not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_or_exit_explains_port_clash(capsys):
+    """A busy port must name the cause and the way out.
+
+    A stdio MCP server *is* a gateway, so this fires before the MCP
+    handshake — the client would otherwise sit at "connecting" forever
+    with the real reason buried in a traceback it may never show.
+    """
+
+    class _BusyGateway:
+        async def start(self, *, advertise_mdns: bool) -> None:
+            raise OSError(errno.EADDRINUSE, "Address already in use")
+
+    with pytest.raises(SystemExit) as excinfo:
+        await cli._start_gateway_or_exit(_BusyGateway(), advertise_mdns=False)
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "8765" in captured.err
+    assert "--transport streamable-http" in captured.err
+    assert "/mcp" in captured.err
+    # stdout carries the MCP stream in stdio mode; it must stay clean.
+    assert captured.out == ""
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_or_exit_reraises_other_oserrors(capsys):
+    """A non-EADDRINUSE failure must not claim a second gateway is running."""
+
+    class _BrokenGateway:
+        async def start(self, *, advertise_mdns: bool) -> None:
+            raise OSError(errno.EACCES, "Permission denied")
+
+    with pytest.raises(SystemExit):
+        await cli._start_gateway_or_exit(_BrokenGateway(), advertise_mdns=False)
+
+    err = capsys.readouterr().err
+    assert "Permission denied" in err
+    assert "streamable-http" not in err
+
+
+def test_startup_lock_refusal_points_stdio_users_at_http(monkeypatch, capsys):
+    """A refused stdio start must explain how to share the running gateway.
+
+    The refused process dies before the MCP handshake, so its client only
+    ever shows "connecting" — this stderr text is the user's sole clue.
+    """
+    from stackchan_mcp import ownership
+
+    def _refuse(*args, **kwargs):
+        raise ownership.OwnershipError(
+            "stackchan-mcp: device already owned by other (pid 1, since now)"
+        )
+
+    monkeypatch.setattr(ownership, "acquire_lock", _refuse)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli._acquire_startup_lock()
+
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "already owned by other" in err
+    assert "--transport streamable-http" in err
+    assert "http://127.0.0.1:8767/mcp" in err
+
+
+def test_startup_lock_refusal_stays_terse_for_the_daemon(monkeypatch, capsys):
+    """The stdio-specific advice must not appear for the daemon transport."""
+    from stackchan_mcp import ownership
+
+    def _refuse(*args, **kwargs):
+        raise ownership.OwnershipError("stackchan-mcp: device already owned by other")
+
+    monkeypatch.setattr(ownership, "acquire_lock", _refuse)
+
+    with pytest.raises(SystemExit):
+        cli._acquire_startup_lock(
+            mode="streamable-http", http_endpoint="http://127.0.0.1:8767/mcp"
+        )
+
+    err = capsys.readouterr().err
+    assert "already owned by other" in err
+    assert "streamable-http" not in err.split("already owned by other", 1)[1]

@@ -387,6 +387,57 @@ callback 設定を [`docs/remote-access.md`](docs/remote-access.md) にまとめ
 
 詳細は `gateway/README.md` 参照。
 
+#### gateway は 1 つ、クライアントは複数 — Streamable HTTP を使う
+
+上記の stdio 形式が正しいのは、MCP クライアントが**唯一**ロボットと
+話す場合です。クライアントがサーバーを起動し、そのサーバープロセス
+**そのものが gateway** になります。クライアントが生きている間、ESP32 の
+WebSocket ポート (8765) と capture ポート (8766) を占有し続けます。
+
+2 つ目のクライアントが現れた瞬間にこれは破綻します。stdio 登録は
+それぞれが別の gateway を起動しますが、1 台のデバイスに gateway は
+1 つだけだからです。2 つ目は起動を拒否されます。
+
+```
+stackchan-mcp: device already owned by stackchan-mcp-… (pid …, since …)
+```
+
+拒否すること自体は正しい動作です。しかしそれは **MCP ハンドシェイクの
+前**に起き、メッセージは stderr に出ます。stderr を表示しない MCP
+クライアントは少なくないため、**gateway 自体は健全に見えるのに
+クライアントだけが「connecting」のまま**という症状になります。
+
+クライアントが 1 つで収まらない構成では、デーモン形式を使います。
+gateway を 1 つだけ起動してください。
+
+```bash
+stackchan-mcp serve --transport streamable-http
+```
+
+この 1 プロセスが 3 つの役割をすべて担います。
+
+| ポート | 役割 |
+|---|---|
+| 8765 | ESP32 WebSocket |
+| 8766 | 写真アップロード / `/voice_turn` |
+| 8767 | Streamable HTTP 上の MCP (`/mcp`) |
+
+クライアントは自前で起動するのではなく、稼働中の gateway に対して
+登録します。Claude Code の場合:
+
+```bash
+claude mcp add --transport http stackchan http://127.0.0.1:8767/mcp
+```
+
+他の MCP クライアントも、HTTP の MCP エンドポイントを受け付ける箇所に
+同じ URL を指定します。デーモンが loopback に閉じている限りトークンは
+不要です（外部アドレスに bind する場合は必要。`stackchan-mcp --help` の
+`MCP_HTTP_*` を参照）。
+
+**タップ会話ループ（セクション 7）は常にこの形式が必要です。** gateway は
+会話と会話の間も動き続ける必要があり、動き続けている以上、その隣で
+stdio 登録が成功することはありません。
+
 ### 4. オプション: TTS セットアップ (VOICEVOX)
 
 デバイスを喋らせるには、`[tts]` extras をインストールして

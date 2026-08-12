@@ -439,6 +439,57 @@ If you installed from source via `uv`:
 
 See `gateway/README.md` for details.
 
+#### One gateway, several clients — use Streamable HTTP
+
+The stdio form above is right when the MCP client is the *only* thing
+talking to the robot: the client launches the server, and that server
+process **is** the gateway. It binds the ESP32 WebSocket port (8765) and
+the capture port (8766) for as long as the client lives.
+
+That breaks down as soon as a second client appears, because each stdio
+registration starts another gateway, and one device can only have one.
+The second refuses to start:
+
+```
+stackchan-mcp: device already owned by stackchan-mcp-… (pid …, since …)
+```
+
+Refusing is the correct behaviour, but it happens *before* the MCP
+handshake, and that message goes to stderr — which many MCP clients do
+not show. So the visible symptom is a client stuck on "connecting"
+forever, while the gateway itself looks perfectly healthy.
+
+Anything beyond a single client needs the daemon form instead. Start one
+gateway:
+
+```bash
+stackchan-mcp serve --transport streamable-http
+```
+
+That single process serves all three roles:
+
+| Port | Role |
+|---|---|
+| 8765 | ESP32 WebSocket |
+| 8766 | photo capture / `/voice_turn` |
+| 8767 | MCP over Streamable HTTP (`/mcp`) |
+
+Then register clients against the running gateway instead of spawning
+their own — for Claude Code:
+
+```bash
+claude mcp add --transport http stackchan http://127.0.0.1:8767/mcp
+```
+
+Other MCP clients take the same URL wherever they accept an HTTP MCP
+endpoint. No token is needed while the daemon stays on loopback; binding
+it to a routable address requires one (see `MCP_HTTP_*` in
+`stackchan-mcp --help`).
+
+**The tap-to-talk voice loop (section 7) always needs this form**, since
+the gateway has to keep running between conversations — and once it is
+running, no stdio registration can succeed alongside it.
+
 ### 4. Optional: TTS setup (VOICEVOX)
 
 To make the device speak, install the `[tts]` extra and run a
