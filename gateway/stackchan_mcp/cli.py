@@ -950,6 +950,18 @@ async def _run_streamable_http_daemon(
         host,
         port,
     )
+    # A token set for the firmware also guards /mcp, loopback or not. An
+    # unauthenticated client gets a 401, which most MCP clients report as
+    # a bare connection failure after fruitlessly hunting for OAuth — so
+    # say up front which header the endpoint wants.
+    if token:
+        logger.info(
+            "  /mcp requires 'Authorization: Bearer <STACKCHAN_TOKEN>' "
+            "(register clients with that header, e.g. claude mcp add "
+            "--header)"
+        )
+    else:
+        logger.info("  /mcp is unauthenticated (no STACKCHAN_TOKEN set)")
     try:
         await server.serve()
     finally:

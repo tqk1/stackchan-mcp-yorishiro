@@ -482,8 +482,25 @@ claude mcp add --transport http stackchan http://127.0.0.1:8767/mcp
 ```
 
 Other MCP clients take the same URL wherever they accept an HTTP MCP
-endpoint. No token is needed while the daemon stays on loopback; binding
-it to a routable address requires one (see `MCP_HTTP_*` in
+endpoint.
+
+**If `STACKCHAN_TOKEN` (or `BEARER_TOKEN`) is set — and it usually is,
+since the firmware connection uses it — then `/mcp` requires that same
+token, loopback or not.** Register the client with a header:
+
+```bash
+claude mcp add --transport http stackchan http://127.0.0.1:8767/mcp \
+  --header "Authorization: Bearer $STACKCHAN_TOKEN"
+```
+
+Without the header the gateway answers `401 Unauthorized: missing or
+invalid bearer token`. Most MCP clients read that 401 as "this server
+wants OAuth", go looking for `/.well-known/oauth-*` and `/register`,
+find nothing there, and report a bare connection failure — so check the
+gateway log for the 401 rather than trusting the client's error text.
+
+Leaving the token unset is only an option on loopback; binding to a
+routable address without one is refused at startup (see `MCP_HTTP_*` in
 `stackchan-mcp --help`).
 
 **The tap-to-talk voice loop (section 7) always needs this form**, since

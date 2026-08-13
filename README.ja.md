@@ -430,9 +430,28 @@ claude mcp add --transport http stackchan http://127.0.0.1:8767/mcp
 ```
 
 他の MCP クライアントも、HTTP の MCP エンドポイントを受け付ける箇所に
-同じ URL を指定します。デーモンが loopback に閉じている限りトークンは
-不要です（外部アドレスに bind する場合は必要。`stackchan-mcp --help` の
-`MCP_HTTP_*` を参照）。
+同じ URL を指定します。
+
+**`STACKCHAN_TOKEN`（または `BEARER_TOKEN`）を設定している場合 —
+ファームウェア接続で使うため通常は設定しています — `/mcp` は loopback
+であっても同じトークンを要求します。** クライアント登録時にヘッダーを
+渡してください。
+
+```bash
+claude mcp add --transport http stackchan http://127.0.0.1:8767/mcp \
+  --header "Authorization: Bearer $STACKCHAN_TOKEN"
+```
+
+ヘッダーが無い場合、gateway は `401 Unauthorized: missing or invalid
+bearer token` を返します。多くの MCP クライアントはこの 401 を
+「OAuth が必要」と解釈して `/.well-known/oauth-*` や `/register` を
+探しに行き、そこには何も無いため単なる接続失敗として報告します。
+クライアントのエラー文言よりも、**gateway のログに出る 401** を見て
+ください。
+
+トークン未設定で運用できるのは loopback の場合だけです（外部アドレスに
+bind する場合、トークン無しは起動時に拒否されます。`stackchan-mcp --help`
+の `MCP_HTTP_*` を参照）。
 
 **タップ会話ループ（セクション 7）は常にこの形式が必要です。** gateway は
 会話と会話の間も動き続ける必要があり、動き続けている以上、その隣で
