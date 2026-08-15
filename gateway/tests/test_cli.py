@@ -12,6 +12,9 @@ import errno
 import os
 import signal
 import socket
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -411,6 +414,55 @@ def test_streamable_http_releases_lock_after_daemon_exit(
         }
     ]
     assert released == [info]
+
+
+def test_streamable_http_loads_dotenv_before_importing_engines() -> None:
+    """``.env`` must reach ``os.environ`` before the TTS/STT engines exist.
+
+    ``.http_server`` transitively imports ``.tts`` and ``.stt``, whose
+    engines are constructed at module level and read their configuration
+    (``STACKCHAN_PIPER_MODEL``, ``STACKCHAN_VOICEVOX_URL``, the
+    ``STACKCHAN_FASTER_WHISPER_*`` trio) from the environment exactly
+    once. If that import happens before ``_configure_gateway_startup()``,
+    every value that lives only in ``gateway/.env`` is permanently lost
+    for the process — the failure a Windows user hit as "Piper model path
+    is not configured" with a correct path in ``.env``.
+
+    Runs in a fresh interpreter on purpose: within the test session
+    ``stackchan_mcp.tts`` is already in ``sys.modules`` from other
+    modules, so an in-process check could never observe the ordering.
+    The spy stops start-up at the first step, so no ``.env`` is read, no
+    ownership lock is taken and no port is bound.
+    """
+    script = textwrap.dedent(
+        """
+        import sys
+        from stackchan_mcp import cli
+
+        seen = {}
+
+        def spy() -> None:
+            seen["tts"] = "stackchan_mcp.tts" in sys.modules
+            seen["stt"] = "stackchan_mcp.stt" in sys.modules
+            raise SystemExit(0)
+
+        cli._configure_gateway_startup = spy
+        try:
+            cli._run_streamable_http_placeholder(advertise_mdns=False)
+        except SystemExit:
+            pass
+        print("IMPORTED_EARLY", seen.get("tts"), seen.get("stt"))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "IMPORTED_EARLY False False" in result.stdout, result.stdout
 
 
 def test_format_port_status_available() -> None:

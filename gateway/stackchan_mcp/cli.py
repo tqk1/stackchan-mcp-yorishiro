@@ -970,13 +970,26 @@ async def _run_streamable_http_daemon(
 
 def _run_streamable_http_placeholder(*, advertise_mdns: bool = True) -> None:
     """Run the Streamable HTTP MCP daemon."""
+    # Load ``.env`` *before* the first ``.http_server`` import — the order
+    # here is load-bearing, not cosmetic. That import pulls in
+    # ``.stdio_server`` -> ``.tts`` / ``.stt``, whose engines are
+    # constructed at module level and read their configuration
+    # (``STACKCHAN_PIPER_MODEL``, ``STACKCHAN_VOICEVOX_URL`` and the
+    # ``STACKCHAN_FASTER_WHISPER_*`` trio) from ``os.environ`` exactly
+    # once, at construction. Importing first bakes in the pre-``.env``
+    # values for the life of the process: reported from a Windows install
+    # where every ``say`` failed with "Piper model path is not
+    # configured" while ``gateway/.env`` held the correct path. The stdio
+    # path is unaffected because it imports ``.stdio_server`` lazily,
+    # after this same call.
+    _configure_gateway_startup()
+
     from .ownership import release_lock_if_owner
     from .http_server import (
         get_configured_token,
         validate_bind_safety,
     )
 
-    _configure_gateway_startup()
     host, port = _resolve_mcp_http_endpoint()
     token = get_configured_token()
     try:
