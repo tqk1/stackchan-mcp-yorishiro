@@ -907,11 +907,22 @@ Device-driven listen capture enabled (audio hook http://127.0.0.1:8766/voice_tur
 Loading faster-whisper model=base device=cpu compute_type=int8
 ```
 
+無効側も必ず出るので、設定が届いていないことも起動ログで分かります。
+
+```
+Device-driven listen capture disabled (STACKCHAN_AUDIO_HOOK_URL not set): ...
+```
+
+この行が出ていたら、gateway が変数を読めていません。`.env` は
+**gateway を起動したディレクトリから上に辿って**探されるため、
+リポジトリのルートから起動すると `gateway/.env` は見えません。
+`stackchan-mcp --preflight` で実際に見えている値を確認できます。
+
 あとは画面をタップして話し、もう一度タップして止めます。
 
 | 症状 | 原因 |
 |---|---|
-| タップしても無反応・ログにも何も出ない | `STACKCHAN_AUDIO_HOOK_URL` 未設定 |
+| 起動ログが listen capture 無効と言う | `STACKCHAN_AUDIO_HOOK_URL` 未設定、または設定した `.env` に届いていない |
 | 転写までは出るが `status=502` | チャットエンドポイントに到達できない（Hermes の API サーバーは有効か） |
 | 転写が空 or 意味不明 | STT extras 未導入、または `STACKCHAN_STT_LANGUAGE` が不一致 |
 | 応答テキストはログに出るが音が出ない | TTS エンジンに到達できない（VOICEVOX 未起動 / Piper のモデルパス誤り） |

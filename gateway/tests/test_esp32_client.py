@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import json
+import logging
 
 import pytest
 import pytest_asyncio
@@ -777,6 +778,31 @@ async def _complete_handshake(ws, tools=None):
 
 
 # --- Device-driven listen capture --------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "hook_url, expected",
+    [
+        ("http://test/hook", "Device-driven listen capture enabled"),
+        ("", "Device-driven listen capture disabled"),
+    ],
+)
+async def test_start_states_audio_hook_either_way(caplog, hook_url, expected):
+    """Startup names the tap-to-talk switch whichever way it is set.
+
+    The disabled half is the one that matters: an unset
+    ``STACKCHAN_AUDIO_HOOK_URL`` drops every device-initiated capture,
+    and it used to do so without a word at INFO level, which is
+    indistinguishable from a dead microphone from the outside.
+    """
+    mgr = ESP32Manager()
+    with caplog.at_level(logging.INFO, logger="stackchan_mcp.esp32_client"):
+        await mgr.start("127.0.0.1", 0, audio_hook_url=hook_url)
+    try:
+        assert any(expected in record.getMessage() for record in caplog.records)
+    finally:
+        await mgr.stop()
 
 
 @pytest_asyncio.fixture

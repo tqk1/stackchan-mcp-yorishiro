@@ -493,6 +493,19 @@ class ESP32Manager:
                 "Device-driven listen capture enabled (audio hook %s)",
                 audio_hook_url,
             )
+        else:
+            # Say the "off" case out loud too. Unset, this switch is
+            # completely silent: the firmware still opens the microphone
+            # on a tap, the gateway drops the frames, and the only trace
+            # is a DEBUG line nobody sees at the default INFO level. Two
+            # separate installs have reported that as "tapping the
+            # screen does nothing", with no log to tell them apart from
+            # a broken microphone.
+            logger.info(
+                "Device-driven listen capture disabled "
+                "(STACKCHAN_AUDIO_HOOK_URL not set): screen taps and the "
+                "wake word are ignored. The listen() tool is unaffected."
+            )
         logger.info("ESP32 WebSocket server starting on ws://%s:%d", host, port)
         self._server = await websockets.serve(
             self._handler,

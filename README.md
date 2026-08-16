@@ -961,11 +961,23 @@ Device-driven listen capture enabled (audio hook http://127.0.0.1:8766/voice_tur
 Loading faster-whisper model=base device=cpu compute_type=int8
 ```
 
+The gateway states the switch either way, so the "off" case is visible
+too:
+
+```
+Device-driven listen capture disabled (STACKCHAN_AUDIO_HOOK_URL not set): ...
+```
+
+If you see that line, the gateway is not reading the variable. `.env` is
+found by walking *up* from the directory you start the gateway in —
+`gateway/.env` is invisible from the repository root. `stackchan-mcp
+--preflight` prints the value it can actually see.
+
 Then tap the screen, speak, and tap again to stop.
 
 | Symptom | Cause |
 |---|---|
-| Tap does nothing, no log lines at all | `STACKCHAN_AUDIO_HOOK_URL` unset |
+| Startup says listen capture is disabled | `STACKCHAN_AUDIO_HOOK_URL` unset, or the `.env` holding it is out of reach |
 | Transcript appears, then `status=502` | Chat endpoint unreachable — is the Hermes API server enabled? |
 | Transcript is empty or nonsense | STT extra missing, or wrong `STACKCHAN_STT_LANGUAGE` |
 | Reply text in the log but no sound | TTS engine unreachable (VOICEVOX not running / Piper model path wrong) |
