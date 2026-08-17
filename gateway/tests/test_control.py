@@ -433,6 +433,63 @@ async def test_set_subtitle_swallows_device_error():
     assert gw.esp32.calls  # it tried
 
 
+# ---- device text sanitising ------------------------------------------
+#
+# The firmware renders these strings with an unbounded
+# lv_label_set_text + a synchronous lv_refr_now() on the calling task.
+# A wedged flush there holds the LVGL lock, which stops the redraw and
+# the touch panel together, and the task watchdog does not reboot it.
+# The device cannot defend itself, so these are load-bearing.
+
+
+def test_sanitize_keeps_ordinary_text_untouched():
+    assert control._sanitize_device_text("こんにちは", 200) == "こんにちは"
+
+
+def test_sanitize_keeps_empty_empty():
+    # "" is how both callers clear the label; it must survive as "".
+    assert control._sanitize_device_text("", 200) == ""
+
+
+def test_sanitize_flattens_newlines_and_control_chars():
+    # The labels wrap on their own; stray newlines only push text past
+    # the clip height, and other control characters have no glyph.
+    assert control._sanitize_device_text("a\nb\tc\x00d", 200) == "a b c d"
+
+
+def test_sanitize_collapses_whitespace_runs():
+    assert control._sanitize_device_text("a  \n\n  b", 200) == "a b"
+
+
+def test_sanitize_truncates_past_the_limit():
+    result = control._sanitize_device_text("あ" * 300, 200)
+    assert len(result) == 200
+    assert result.endswith("…")
+
+
+def test_sanitize_drops_unencodable_characters():
+    # Lone surrogates reach us through the JSON layer and would blow up
+    # on the way out to the device.
+    assert control._sanitize_device_text("ok\ud800fine", 200) == "okfine"
+
+
+@pytest.mark.asyncio
+async def test_set_subtitle_caps_an_overlong_reply():
+    gw = FakeGateway()
+    await control.set_device_subtitle(gw, "x" * 5000)
+    (_name, args) = gw.esp32.calls[0]
+    assert len(args["text"]) == control.MAX_SUBTITLE_CHARS
+
+
+@pytest.mark.asyncio
+async def test_set_status_text_caps_and_flattens():
+    gw = FakeGateway()
+    await control.set_device_status_text(gw, "long\nstatus " + "y" * 200)
+    (_name, args) = gw.esp32.calls[0]
+    assert len(args["text"]) == control.MAX_STATUS_CHARS
+    assert "\n" not in args["text"]
+
+
 @pytest.mark.asyncio
 async def test_set_route_badge_sends():
     gw = FakeGateway()

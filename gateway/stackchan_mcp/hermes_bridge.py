@@ -490,7 +490,13 @@ async def _run_voice_turn(
         )
     t_llm = time.monotonic()
 
-    logger.info("voice_turn: reply=%r session=%s", reply[:120], session_id)
+    # The reply is logged truncated, so log its real length too: a reply
+    # that misbehaves downstream (an overlong monologue, or a model
+    # leaking raw tool-call markup into the text) is invisible in a
+    # 120-character excerpt, and that excerpt is the only record we keep.
+    logger.info(
+        "voice_turn: reply=%r len=%d session=%s", reply[:120], len(reply), session_id
+    )
     # Phase F: show the reply as a subtitle while it plays, and — only
     # for Hermes-routed turns — light the "H" badge + the Hermes LED
     # colour. Local-LLM turns stay badge-free and keep the listening

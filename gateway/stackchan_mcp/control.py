@@ -153,6 +153,46 @@ _LED_INDICATOR_TOOL = "self.led.set_indicator"
 #: full-name mapping in stdio_server's dispatch table).
 _SET_PROXIMITY_TOOL = "self.touch.set_proximity_config"
 
+#: Upper bounds for text pushed to the device's screen.
+#:
+#: These are not cosmetic. The firmware renders both strings with an
+#: unbounded ``lv_label_set_text`` followed by a *synchronous*
+#: ``lv_refr_now()`` on the calling task (``stackchan.cc``
+#: SetStatusText / SetSubtitleText). If that flush wedges, the task
+#: keeps the LVGL lock, the LVGL port task then fails its
+#: non-blocking ``lvgl_port_lock(0)`` forever, and touch input dies
+#: with the redraw — a black, unresponsive screen that the task
+#: watchdog does not reboot (idle-task-only subscription, PANIC off).
+#: The device cannot defend itself here, so the gateway must not send
+#: anything it would choke on.
+#:
+#: The sizes are set by what is even visible: the subtitle box is
+#: 300 px wide and clipped at 78 px high, so a couple of lines is all
+#: that ever renders; the status line is a single line under the
+#: avatar.
+MAX_SUBTITLE_CHARS = 200
+MAX_STATUS_CHARS = 64
+
+
+def _sanitize_device_text(text: str, limit: int) -> str:
+    """Make ``text`` safe to render on the device, and short enough.
+
+    Drops anything that cannot survive a UTF-8 round trip (lone
+    surrogates reach us through the JSON layer) and flattens control
+    characters — newlines included, since both labels wrap on their
+    own and stray newlines only push the text past the clip height.
+    Runs of whitespace collapse to one space, then the result is
+    truncated to ``limit`` characters with an ellipsis.
+
+    An empty string stays empty: both callers use "" to clear.
+    """
+    clean = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    clean = "".join(" " if ch < " " or ch == "\x7f" else ch for ch in clean)
+    clean = " ".join(clean.split())
+    if len(clean) > limit:
+        clean = clean[: limit - 1].rstrip() + "…"
+    return clean
+
 #: How long to wait before re-applying the persisted volume on connect,
 #: and how many times to retry. The codec init can swallow a set_volume
 #: issued too early, so we give it a beat and one retry.
@@ -509,11 +549,17 @@ async def unmute(gateway: "Gateway") -> dict[str, Any]:
 async def apply_persisted_volume(gateway: "Gateway") -> None:
     """Re-apply the saved volume after a device (re)connects.
 
-    The firmware does not persist the user's chosen volume, so the
-    gateway restores it on connect. The codec init can drop a
-    set_volume issued the instant the device appears, so this waits a
-    beat and retries once. A muted state restores to 0. Errors are
-    swallowed to WARN — a failed restore must not take anything down.
+    Unlike the mic gain, the firmware *does* keep the volume across
+    reboots on its own (``AudioCodec::SetOutputVolume`` writes it to
+    NVS and ``Start()`` reads it back). This restore still matters:
+    the gateway's state is what the dashboard and the mute toggle
+    work from, so a reconnect re-asserts the level the user last
+    chose *here* rather than whatever the device happens to hold.
+
+    The codec init can drop a set_volume issued the instant the
+    device appears, so this waits a beat and retries once. A muted
+    state restores to 0. Errors are swallowed to WARN — a failed
+    restore must not take anything down.
     """
     state = load_state()
     target = 0 if state["muted"] else state["volume"]
@@ -914,7 +960,8 @@ async def set_device_status_text(gateway: "Gateway", text: str) -> None:
         return
     try:
         _result, error = await gateway.esp32.call_tool(
-            _STATUS_TEXT_TOOL, {"text": text}
+            _STATUS_TEXT_TOOL,
+            {"text": _sanitize_device_text(text, MAX_STATUS_CHARS)},
         )
         if error:
             logger.warning("control: set_status_text failed: %s", error)
@@ -945,10 +992,15 @@ async def _best_effort_device_call(
 async def set_device_subtitle(gateway: "Gateway", text: str) -> None:
     """Show the spoken reply as a subtitle on the device (empty = clear).
 
-    Best-effort cosmetic; see :func:`_best_effort_device_call`.
+    Best-effort cosmetic; see :func:`_best_effort_device_call`. The
+    text is sanitised and capped first — see
+    :data:`MAX_SUBTITLE_CHARS` for why that part is not cosmetic.
     """
     await _best_effort_device_call(
-        gateway, _SUBTITLE_TOOL, {"text": text}, "set_subtitle"
+        gateway,
+        _SUBTITLE_TOOL,
+        {"text": _sanitize_device_text(text, MAX_SUBTITLE_CHARS)},
+        "set_subtitle",
     )
 
 
