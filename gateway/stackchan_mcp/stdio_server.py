@@ -1564,8 +1564,17 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "raw RGB565 file on the gateway host: layered mode = "
                     "14 frames (face 6 + eyes 3 + mouth 5) totalling "
                     "537,600 bytes; matrix mode = 90 frames (6 × 3 × 5) "
-                    "totalling 3,456,000 bytes. Returns ok / checksum / "
-                    "bytes_transferred / error."
+                    "totalling 3,456,000 bytes. Frames are 160x120 "
+                    "RGB565 (38,400 bytes each) and are identified by "
+                    "byte offset alone — the payload carries no names, "
+                    "so the order IS the mapping. Layered order: 0 idle, "
+                    "1 happy, 2 thinking, 3 sad, 4 surprised, "
+                    "5 embarrassed, 6 eyes-open, 7 eyes-half, "
+                    "8 eyes-closed, 9 mouth-closed, 10 mouth-half, "
+                    "11 mouth-open, 12 mouth-e, 13 mouth-u. A set packed "
+                    "in a different order loads and verifies fine, then "
+                    "shows the wrong face for every expression. Returns "
+                    "ok / checksum / bytes_transferred / error."
                 ),
                 inputSchema={
                     "type": "object",

@@ -601,7 +601,15 @@ prerequisite as the `[tts]` extra).
 | `STACKCHAN_FASTER_WHISPER_MODEL` | `base` | Model identifier — `tiny` / `base` / `small` / `medium` / `large-v3`. Larger models are more accurate but slower and use more memory. |
 | `STACKCHAN_FASTER_WHISPER_DEVICE` | `cpu` | `cpu` / `cuda` / `auto`. |
 | `STACKCHAN_FASTER_WHISPER_COMPUTE_TYPE` | `int8` | `int8` / `float16` / `float32`. |
+| `STACKCHAN_FASTER_WHISPER_HOTWORDS` | *(unset)* | Free-text vocabulary hint. A small model mishears the words it has no prior for — the robot's name, the names of the people talking to it. Listing them here biases recognition towards them. |
+| `STACKCHAN_FASTER_WHISPER_BEAM_SIZE` | `1` | Beam width. `1` is greedy and fastest; Whisper's own default is `5`, which costs latency and buys accuracy on that same class of word. |
 | `STACKCHAN_OPENAI_WHISPER_MODEL` | `whisper-1` | OpenAI Whisper model identifier (only `whisper-1` is currently exposed by the API). |
+
+The startup log names all of these, including the ones left unset:
+
+```
+Loading faster-whisper model=base device=cpu compute_type=int8 beam_size=1 hotwords=not set
+```
 
 #### Try it
 
@@ -936,21 +944,34 @@ Two things about Hermes that are easy to miss:
 
 The default spoken-reply prompts are written in Japanese, and the
 tap-to-talk path never passes a language argument to the recogniser.
-For an English-speaking robot, set all four:
+For an English-speaking robot, set all five:
 
 ```bash
 STACKCHAN_STT_LANGUAGE=en
-STACKCHAN_PIPER_MODEL=voices/en_US-lessac-medium.onnx   # see section 4
+STACKCHAN_PIPER_MODEL=voices/en_US-lessac-low.onnx   # see section 4
 HERMES_VOICE_SYSTEM_PROMPT="You are a small desktop robot. Reply in
 English, in one to three short spoken sentences, without markdown."
 HERMES_VOICE_TOOLS_PROMPT="Use the web_search tool for anything you
 need to look up, and write_note / read_note / list_notes for notes.
 Never claim you did something without actually calling the tool."
+STACKCHAN_SEARCH_REGION=ca-en   # keyless DuckDuckGo fallback; default jp-jp
 ```
 
-The last one is easy to miss: that paragraph is appended to the system
+The fourth one is easy to miss: that paragraph is appended to the system
 prompt on every turn, so leaving it at its Japanese default tends to
-pull the replies back into Japanese even when the rest is English.
+pull the replies back into Japanese even when the rest is English. It
+also carries the "never claim you did something without calling the
+tool" instruction, which some models need in order not to report
+actions they never took.
+
+Two of these are worth a second look if replies feel slow. A `low`
+Piper voice is natively 16 kHz — the rate the device plays at — so it
+synthesises faster than a `medium` voice *and* skips the resampling
+step, which is also what makes `medium` sound rough on s/sh sounds.
+And the whole reply is synthesised before the robot says a word, so
+the "one to three sentences" instruction is a latency setting as much
+as a style one — a model that ignores it because the instruction is in
+the wrong language will keep the room waiting.
 
 #### Verify
 

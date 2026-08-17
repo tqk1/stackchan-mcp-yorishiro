@@ -551,7 +551,15 @@ export OPENAI_API_KEY=sk-...
 | `STACKCHAN_FASTER_WHISPER_MODEL` | `base` | モデル識別子 — `tiny` / `base` / `small` / `medium` / `large-v3`。大きいモデルほど精度は上がるが、メモリ消費と推論時間も増える |
 | `STACKCHAN_FASTER_WHISPER_DEVICE` | `cpu` | `cpu` / `cuda` / `auto` |
 | `STACKCHAN_FASTER_WHISPER_COMPUTE_TYPE` | `int8` | `int8` / `float16` / `float32` |
+| `STACKCHAN_FASTER_WHISPER_HOTWORDS` | *(未設定)* | 語彙ヒント（自由文）。小さいモデルが最も間違えるのは、事前知識を持たない語＝ロボットの名前や話し相手の名前。ここに列挙すると認識がその語に寄る |
+| `STACKCHAN_FASTER_WHISPER_BEAM_SIZE` | `1` | ビーム幅。`1` は貪欲法で最速。Whisper 本来のデフォルトは `5` で、レイテンシと引き換えに上記と同じ種類の語の精度が上がる |
 | `STACKCHAN_OPENAI_WHISPER_MODEL` | `whisper-1` | OpenAI Whisper モデル識別子（公式 API では現状 `whisper-1` のみ） |
+
+起動ログは、未設定のものも含めてこれらを必ず名乗る:
+
+```
+Loading faster-whisper model=base device=cpu compute_type=int8 beam_size=1 hotwords=not set
+```
 
 #### 試す
 
@@ -882,21 +890,32 @@ Hermes 側で見落としやすい点が 2 つあります。
 
 既定の発話用プロンプトは日本語で書かれており、タップ会話の経路は
 認識エンジンに language 引数を渡しません。英語で喋らせる場合は
-4 つとも設定してください。
+5 つとも設定してください。
 
 ```bash
 STACKCHAN_STT_LANGUAGE=en
-STACKCHAN_PIPER_MODEL=voices/en_US-lessac-medium.onnx   # セクション 4 参照
+STACKCHAN_PIPER_MODEL=voices/en_US-lessac-low.onnx   # セクション 4 参照
 HERMES_VOICE_SYSTEM_PROMPT="You are a small desktop robot. Reply in
 English, in one to three short spoken sentences, without markdown."
 HERMES_VOICE_TOOLS_PROMPT="Use the web_search tool for anything you
 need to look up, and write_note / read_note / list_notes for notes.
 Never claim you did something without actually calling the tool."
+STACKCHAN_SEARCH_REGION=ca-en   # DuckDuckGo フォールバック用。既定は jp-jp
 ```
 
-最後の 1 つは見落としがちです。この段落は毎ターン、システム
-プロンプトの末尾に連結されます。既定の日本語のままにしておくと、
-他が英語でも応答が日本語に引き戻される傾向があります。
+4 つ目は見落としがちです。この段落は毎ターン、システムプロンプトの
+末尾に連結されます。既定の日本語のままにしておくと、他が英語でも
+応答が日本語に引き戻される傾向があります。「ツールを呼ばずに
+やったと言うな」という一文もここにあり、モデルによっては
+これが無いと実際には行っていない操作を報告します。
+
+このうち 2 つは応答が遅いと感じたときにも効きます。Piper の `low`
+ボイスはネイティブ 16kHz ＝ デバイスの再生レートそのものなので、
+`medium` より合成が軽く、さらにリサンプル処理を通りません
+（`medium` の s/sh 音がざらつくのはこのリサンプルが原因）。
+また**応答は全文を合成し終えてから喋り始める**ため、「1〜3 文で」
+という指示は文体ではなくレイテンシの設定です。プロンプトの言語が
+噛み合わずこの指示が無視されると、その分だけ長く待たされます。
 
 #### 動作確認
 

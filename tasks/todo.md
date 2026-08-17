@@ -10,6 +10,32 @@
 
 ## 現役タスク（まだやるべき生きた未完了項目）
 
+### ★★ 着手中: 応答テキストの無検査送出でデバイスが固まる 2026-08-17 — ブランチ `feature/tts-piper`
+
+**背景**: 外部環境からの報告で、web_search を伴う質問（英語圏の天気）への応答後に **画面真っ黒・LED青点灯・タッチ無反応・自動リブートせず** の固着が発生。数日前の同じ質問（ツール未使用で短文即答）では起きていない。
+
+**原因の筋書き（gateway/firmware 双方の調査が一致）**:
+Hermes の `reply` を **長さも文字種も検査せず** `set_subtitle` と TTS に渡す（`hermes_bridge.py:501,506`）
+→ firmware `SetSubtitleText` は上限なしで `lv_label_set_text` → その場で `lv_refr_now()` を同期実行（`stackchan.cc:4925-4949`）
+→ そこで固まると Application タスクが LVGL ロックを保持したまま居座る
+→ LVGL 専用タスクは `lvgl_port_lock(0)` の非ブロッキング試行に失敗し続け、`lv_indev_read`（タッチ）と `lv_timer_handler`（再描画）が同時停止
+→ LED は表示更新の**前**に確定するため青が残る（`application.cc:943`→`:945`）
+→ TWDT はアイドルタスクのみ購読＋PANIC 無効のため**リブートしない**（`sdkconfig:1605-1610`）
+＝ 観測4点（黒画面/青LED/無反応/リブートせず）が全て説明できる。
+
+**方針**: firmware の LVGL ロック構造（上流由来・`DisplayLockGuard` が Lock 失敗時に素通り: `display.h:66-73`）は**今回は触らない**（再 flash が必要・実害は gateway 側で塞げる）。gateway が不正な入力を送らないようにする。
+
+- [x] (A) **出口でガード**（`control.py`）: 送り先は `set_device_status_text` / `set_device_subtitle` の2つだけなので、そこで `_sanitize_device_text()`（制御文字除去・エンコード不能文字除去・空白圧縮・上限 200/64 字）を適用＝全呼び出し元が守られる。＋ `hermes_bridge.py` に `len(reply)` ログ（現状 `reply[:120]` のみで**長文が来ても証拠が残らなかった**）
+- [x] (B) `stt/faster_whisper.py`: `STACKCHAN_FASTER_WHISPER_HOTWORDS` / `_BEAM_SIZE` を追加（固有名詞の誤認識対策。`beam_size=1` 固定・語彙ヒント手段なしだった。faster-whisper 1.2.1 の実ソースで `hotwords` が `prefix` 未指定なら `sot_prev` 注入・**VAD 非依存**と確認）。起動ログで**未設定も含めて名乗る**
+- [x] (C) `web_search.py`: `region="jp-jp"` ハードコード → `STACKCHAN_SEARCH_REGION`（既定は現行維持）
+- [x] (D) `.env.example` / README 両言語: Piper 推奨例を `medium`→**`low`**（ネイティブ16kHz＝リサンプル素通し・軽い・既知の歪みも解消）、英語運用「4つ」→「5つ」、**「1〜3文で」はレイテンシ設定**と明記、ツール指示に「呼ばずにやったと言うな」
+- [x] (E) `control.py` の事実誤認コメント訂正: 「firmware は音量を永続化しない」→ **実際は NVS に永続化**（`audio_codec.cc:29-46` で裏取り）。mic gain 側は `SetInputGain` に NVS 書き込み無しでコメントは正しい
+- [x] (F) `stdio_server.py` の `load_avatar_set` 説明に**14スロットの並び順**を明記（照れ顔報告の調査で判明: ペイロードは**バイトオフセットのみで解釈**され名前を持たないため**順序＝マッピング**。順序が違ってもチェックサムは通り、全表情が別の絵になる）
+- [x] (V) 検証: **pytest 1166 passed**（基準1147→+19）/ **ruff check clean**
+- [x] (Z1) worklog `docs/worklog/2026-08-17-unchecked-reply-text.md`
+- [ ] (Z2) commit → push → 返信
+- **未着手（返信で切り分けを依頼）**: レイテンシが正式な懸念として提起された（時計計測で単純質問30秒・ツール呼び出し60秒）。TTS フレームは**デバイスの消費レートに合わせた実時間送出**（`tts/orchestrator.py:364-376`）なので `timings.tts` は「合成＋喋っている時間」。**喋り始めるまでが遅いのか、やり取り全体が長いのか**で処方が変わる → 該当ターンの `timings_ms=` と切り分けを依頼する。構造的な答えは**文単位のストリーミング合成**（現状は全文合成してから送出開始）
+
 ### ★★ 着手中: 静止在室検知（object_raw 併用＋適応ベースライン） 2026-06-27
 
 **背景**: 1m着座で静止すると、製品の presence アルゴリズムが体を背景吸収し `presence≈0` → デバウンス(1080s)だけで `active` 維持 → 18分で誤 ABSENT。生サーモパイル `object_raw` は静止体を保持していると判明（部屋ウォークスルー計測 2026-06-27）。
