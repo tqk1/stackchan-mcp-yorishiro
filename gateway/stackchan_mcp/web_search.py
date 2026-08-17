@@ -21,6 +21,8 @@ Environment variables:
   search goes straight to DuckDuckGo.
 - ``TAVILY_API_URL`` — API base URL override (tests / proxies).
   Defaults to ``https://api.tavily.com``.
+- ``STACKCHAN_SEARCH_REGION`` — DuckDuckGo region for the fallback
+  backend. Defaults to ``jp-jp``; set e.g. ``ca-en`` outside Japan.
 
 Both backends normalise to the same shape::
 
@@ -48,6 +50,24 @@ SEARCH_TIMEOUT_S = 15.0
 
 DEFAULT_MAX_RESULTS = 5
 MAX_RESULTS_CAP = 10
+
+#: DuckDuckGo region for the keyless fallback. Japanese by default —
+#: this fork's own deployment — but a robot answering "what's the
+#: weather here?" outside Japan wants its own region, so it is
+#: overridable via ``STACKCHAN_SEARCH_REGION`` (e.g. ``ca-en``,
+#: ``us-en``, or ``wt-wt`` for no regional bias).
+DEFAULT_SEARCH_REGION = "jp-jp"
+
+
+def resolve_search_region() -> str:
+    """Return the DuckDuckGo region for the fallback backend.
+
+    Resolved per call rather than cached, matching
+    :func:`~stackchan_mcp.stt.orchestrator.resolve_default_language`,
+    so a restart with a new value is enough to change it.
+    """
+    override = os.getenv("STACKCHAN_SEARCH_REGION", "").strip()
+    return override or DEFAULT_SEARCH_REGION
 
 #: MCP tool names backed by this module (kept in sync with the HTTP
 #: daemon's BYPASS_TOOLS — these never touch the ESP32).
@@ -128,8 +148,9 @@ def _ddgs_text_sync(query: str, max_results: int) -> list[dict[str, Any]]:
                 "DuckDuckGo backend unavailable — install "
                 "stackchan-mcp[search] (ddgs package)"
             ) from exc
+    region = resolve_search_region()
     with DDGS() as ddgs:
-        return list(ddgs.text(query, region="jp-jp", max_results=max_results))
+        return list(ddgs.text(query, region=region, max_results=max_results))
 
 
 async def _search_ddgs(query: str, max_results: int) -> dict[str, Any]:

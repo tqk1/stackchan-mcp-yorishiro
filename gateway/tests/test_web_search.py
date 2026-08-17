@@ -60,6 +60,17 @@ def test_clamp_max_results():
     assert web_search._clamp_max_results(3) == 3
 
 
+def test_resolve_search_region(monkeypatch):
+    # Japanese by default (this fork's own deployment), but a robot
+    # asked "what's the weather here?" outside Japan needs its own.
+    monkeypatch.delenv("STACKCHAN_SEARCH_REGION", raising=False)
+    assert web_search.resolve_search_region() == web_search.DEFAULT_SEARCH_REGION
+    monkeypatch.setenv("STACKCHAN_SEARCH_REGION", "   ")
+    assert web_search.resolve_search_region() == web_search.DEFAULT_SEARCH_REGION
+    monkeypatch.setenv("STACKCHAN_SEARCH_REGION", "ca-en")
+    assert web_search.resolve_search_region() == "ca-en"
+
+
 @pytest.mark.asyncio
 async def test_empty_query_raises():
     with pytest.raises(ValueError):
