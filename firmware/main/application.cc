@@ -12,12 +12,23 @@
 
 #include <cstring>
 #include <esp_log.h>
+#include <esp_task_wdt.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
 
 #define TAG "Application"
+
+// Task-watchdog budget for the main event loop (see Application::Run).
+// Generous on purpose: this loop legitimately does slow work — flushing
+// the display, writing NVS, talking to the codec over I2C — and a reboot
+// is a worse outcome than a slow turn. 30 s is well past anything healthy
+// and well short of the user giving up and pulling the power.
+#define MAIN_LOOP_WDT_TIMEOUT_MS 30000
+// How long the loop is allowed to sit idle before it wakes to feed the
+// watchdog. Must stay comfortably below the timeout above.
+#define MAIN_LOOP_WDT_FEED_INTERVAL_MS 5000
 
 
 Application::Application() {
@@ -166,6 +177,29 @@ void Application::Run() {
     // Set the priority of the main task to 10
     vTaskPrioritySet(nullptr, 10);
 
+    // Task watchdog on this loop, and on this loop only.
+    //
+    // Every MCP tool call runs here (McpServer::DoToolCall schedules it
+    // onto this task), as does the display tick, the audio pump and every
+    // reply we send back. One blocking call anywhere in that set takes the
+    // whole device with it: black screen, dead touch, no answer to the
+    // gateway — and nothing recovers it, because this task was never
+    // watched and the watchdog was configured not to panic. A hang here is
+    // indistinguishable from a dead device, and only the power button ends
+    // it.
+    //
+    // idle_core_mask = 0 deliberately drops the idle-task subscription the
+    // sdkconfig asks for. Idle starvation is a different (and far more
+    // false-positive-prone) failure than this one, and it must not become
+    // a reboot now that the panic handler is armed.
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = MAIN_LOOP_WDT_TIMEOUT_MS,
+        .idle_core_mask = 0,
+        .trigger_panic = true,
+    };
+    esp_task_wdt_reconfigure(&wdt_config);
+    esp_task_wdt_add(nullptr);
+
     const EventBits_t ALL_EVENTS = 
         MAIN_EVENT_SCHEDULE |
         MAIN_EVENT_SEND_AUDIO |
@@ -182,7 +216,14 @@ void Application::Run() {
         MAIN_EVENT_STATE_CHANGED;
 
     while (true) {
-        auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
+        // Bounded wait so an idle device still feeds the watchdog. A plain
+        // portMAX_DELAY would starve it whenever nothing is happening,
+        // which is most of the time, and reboot a perfectly healthy robot.
+        // bits == 0 means "woke up on the timeout": every branch below is
+        // a bit test, so the loop simply falls through and waits again.
+        auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE,
+                                        pdMS_TO_TICKS(MAIN_LOOP_WDT_FEED_INTERVAL_MS));
+        esp_task_wdt_reset();
 
         if (bits & MAIN_EVENT_ERROR) {
             SetDeviceState(kDeviceStateIdle);
