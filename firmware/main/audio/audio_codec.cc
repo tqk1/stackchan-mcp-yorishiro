@@ -38,9 +38,21 @@ void AudioCodec::Start() {
 }
 
 void AudioCodec::SetOutputVolume(int volume) {
+    // Persist only when the level actually changed. Writing NVS opens a
+    // flash transaction and commits it synchronously (Settings' destructor
+    // calls nvs_commit), and this runs on the Application main task — the
+    // single serial loop that also drives the display, audio and every MCP
+    // reply. An agent that re-sends the same volume (a retry after a
+    // timeout, or "set it to 100" twice) would otherwise hit the flash on
+    // every call for no gain at all.
+    bool changed = (output_volume_ != volume);
     output_volume_ = volume;
-    ESP_LOGI(TAG, "Set output volume to %d", output_volume_);
-    
+    ESP_LOGI(TAG, "Set output volume to %d%s", output_volume_,
+             changed ? "" : " (unchanged, not persisted)");
+
+    if (!changed) {
+        return;
+    }
     Settings settings("audio", true);
     settings.SetInt("output_volume", output_volume_);
 }
