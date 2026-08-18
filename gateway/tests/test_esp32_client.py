@@ -1066,3 +1066,49 @@ async def test_device_driven_listen_fires_listen_started(manager_with_hook):
                 break
         assert is_recording()
         assert fired.is_set(), "on_listen_started did not fire at record start"
+
+
+# ---- diagnosing a device that stops answering ------------------------
+#
+# Both of these exist because a wedged firmware once left no trace in the
+# log at all: success was silent, and so was the timeout, so "no line for
+# this request" was equally consistent with a healthy call and a dead
+# device. The absence of evidence was being read as evidence.
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_logged(monkeypatch, caplog):
+    from stackchan_mcp import esp32_client
+
+    monkeypatch.setattr(esp32_client, "RESPONSE_TIMEOUT", 0.01)
+    ws = _FakeWebSocket()
+    conn = ESP32Connection(ws, session_id="session-timeout")  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.WARNING):
+        result, error = await conn.call_tool("self.audio_speaker.set_volume", {"volume": 100})
+
+    assert result is None
+    assert error is not None
+    assert "did not respond" in caplog.text
+    assert "set_volume" in caplog.text or "tools/call" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_late_reply_is_not_reported_as_a_notification(monkeypatch, caplog):
+    from stackchan_mcp import esp32_client
+
+    monkeypatch.setattr(esp32_client, "RESPONSE_TIMEOUT", 0.01)
+    ws = _FakeWebSocket()
+    conn = ESP32Connection(ws, session_id="session-late")  # type: ignore[arg-type]
+
+    await conn.call_tool("self.audio_speaker.set_volume", {"volume": 100})
+    sent_id = json.loads(ws.sent[0])["payload"]["id"]
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        # The device answers, just far too late to be waited on.
+        conn.handle_response({"jsonrpc": "2.0", "id": sent_id, "result": {}})
+
+    assert "after the" in caplog.text
+    # A slow device and a chatty one are different diagnoses.
+    assert "ESP32 notification" not in caplog.text

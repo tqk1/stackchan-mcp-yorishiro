@@ -130,6 +130,18 @@ class ESP32Connection:
             raise
         except asyncio.TimeoutError:
             self._pending.pop(req_id, None)
+            # Say so. The device going quiet is the single most useful
+            # fact when diagnosing a wedged firmware, and until now it
+            # left no trace at all: success is silent here too, so an
+            # absent log line meant nothing either way and the two were
+            # impossible to tell apart after the fact.
+            logger.warning(
+                "ESP32 did not respond within %.0fs: method=%s id=%s "
+                "(device may be wedged)",
+                RESPONSE_TIMEOUT,
+                method,
+                req_id,
+            )
             return None, {"code": -32000, "message": f"Timeout waiting for ESP32 response (method={method})"}
         except Exception as exc:
             self._pending.pop(req_id, None)
@@ -255,6 +267,18 @@ class ESP32Connection:
             future = self._pending.pop(req_id)
             if not future.done():
                 future.set_result(payload)
+        elif req_id is not None:
+            # An id we are no longer waiting on: the reply arrived after
+            # send_mcp_request gave up. Worth its own line — it means the
+            # device was slow rather than dead, which is a different
+            # diagnosis. Previously this fell through to the branch below
+            # and printed "ESP32 notification: " with an empty method,
+            # which reads like a device quirk rather than a late answer.
+            logger.warning(
+                "ESP32 replied to id=%s after the %.0fs timeout had passed",
+                req_id,
+                RESPONSE_TIMEOUT,
+            )
         else:
             # Notification (no id) — log and discard for now
             method = payload.get("method", "")
