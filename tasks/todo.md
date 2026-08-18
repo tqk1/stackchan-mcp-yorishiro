@@ -34,7 +34,27 @@ Hermes の `reply` を **長さも文字種も検査せず** `set_subtitle` と 
 - [x] (V) 検証: **pytest 1166 passed**（基準1147→+19）/ **ruff check clean**
 - [x] (Z1) worklog `docs/worklog/2026-08-17-unchecked-reply-text.md`
 - [x] (Z2) commit（`ef6d7f6` / `08d2f8b` / `1d07755` / `3da84a0`）→ origin push 済み
-- [ ] (Z3) 返信送信（作成済み・ケンジさん確認待ち）
+- [x] (Z3) 返信送信済み（2026-08-18）
+
+### ★★ 着手中: 固着の再発 — 詰まっていたのは「単一直列ループ」だった 2026-08-19 — ブランチ `feature/tts-piper`
+
+**背景**: 上の (A) キャップを適用済みの環境で**同一症状が再発**（黒画面・タッチ無反応・自動リブートせず・電源長押しで復帰）。ただし**今回は字幕を1文字も送っていない**＝キャップは一度も働いていない。トリガーは `set_volume(volume=100)` で、その送信直後からデバイスが一切応答しなくなった。
+
+**真因（前回の判断が誤りだった）**: `mcp_server.cc:604`「Use main thread to call the tool」＝**全 MCP ツールが Application メインタスク（`application.cc:165-259`）で実行される**。このタスクは画面ティック・音声ポンプ・**ACK 送信**も処理する**単一の直列イベントループ**で、**どこか1箇所でブロックすると全部が同時に止まる**。LED は表示更新の前に確定済み・TWDT は**メインタスク未登録**かつ PANIC 無効 → **リブートしない**。
+⇒ **前回の「長すぎる字幕」も同じ場所で止まっていた**（`set_subtitle` も MCP ツール＝同じタスクで `lv_refr_now()` を同期実行）。**入口が違うだけで詰まった場所は同じ。** gateway 側で塞いだのは入口の1つにすぎず、「実害は gateway で塞げる」という前回の前提が崩れた。
+⇒ `set_volume` が名指しされる理由: **このターンで唯一 NVS に書く呼び出し**。`AudioCodec::SetOutputVolume` は**値が変わっていなくても無条件に**書き、`Settings` のデストラクタが `nvs_commit()` を同期実行する。
+
+**ログ側の発見**: gateway は**成功応答もタイムアウトも一切ログに出さない**（`esp32_client.py:124-133`）⇒「応答が記録されていない」は無応答の証拠にならない。id=28 が見えたのは**エラー（Unknown tool）だったから**。**また 8/17 報告の「set_volume に60秒」は `RESPONSE_TIMEOUT=10.0` の再試行の繰り返しで説明でき、この不具合は当時から断続的に起きていた。**
+
+- [x] (A) firmware `audio_codec.cc`: 値が変わらなければ NVS 書き込みをスキップ（再試行が毎回フラッシュを叩くのを止める）
+- [x] (B) firmware `application.cc`: メインループを **TWDT 監視下**へ（`esp_task_wdt_reconfigure` で `timeout_ms=30000` / `idle_core_mask=0`＝アイドル監視は意図的に外す / `trigger_panic=true`）＋ `xEventGroupWaitBits` を `portMAX_DELAY` → 5秒に変えて feed（**アイドル時の誤発火を防ぐため必須**）
+- [x] (C) gateway `esp32_client.py`: **タイムアウトを WARNING で記録**（診断不能の解消）＋ タイムアウト後の遅延応答を「空の notification」ではなく専用行に
+- [x] (V1) gateway: **pytest 1168 passed / ruff check clean**
+- [x] (V2) firmware: **Docker ビルド成功**（`releases/v2.2.6_stackchan.zip` 生成・警告なし）。**実機確認は未了＝flash 待ち**
+- [x] (Z1) worklog `docs/worklog/2026-08-19-shared-serial-loop.md`
+- [ ] (Z2) 返信送信（ドラフト `reply-to-dale-2026-08-19.txt` 作成済み・ケンジさん確認待ち）
+- **要フォロー**: 今回の修正は**実機 flash が必要**。Dale さんは未経験・Windows 機・firmware は `bb31fa8` より古い ⇒ **8/8 の「焼き直し不要」を撤回**する。副次的に画面系6ツール（status_text / subtitle / route_badge 等）が復活する。**Windows 向け flash 手順を別便で用意する**
+- **切り分け待ち**: `audio_codec.cc:42` の `Set output volume to %d` は **I2C 完了後・NVS 書き込み前**に出る ⇒ **この行の有無で I2C か NVS かが確定する**。Dale さんに `pyserial` の miniterm で採取を依頼（任意）
 - **未着手（返信で切り分けを依頼）**: レイテンシが正式な懸念として提起された（時計計測で単純質問30秒・ツール呼び出し60秒）。TTS フレームは**デバイスの消費レートに合わせた実時間送出**（`tts/orchestrator.py:364-376`）なので `timings.tts` は「合成＋喋っている時間」。**喋り始めるまでが遅いのか、やり取り全体が長いのか**で処方が変わる → 該当ターンの `timings_ms=` と切り分けを依頼する。構造的な答えは**文単位のストリーミング合成**（現状は全文合成してから送出開始）
 
 ### ★★ 着手中: 静止在室検知（object_raw 併用＋適応ベースライン） 2026-06-27
