@@ -61,19 +61,40 @@ protected:
 };
 
 
+// How long to wait for the display lock before giving up on an update.
+//
+// Short on purpose. Most of these updates run on the Application main
+// task, which is the single serial path for MCP tool calls, the display
+// tick, audio and every reply we send. Waiting here does not delay a
+// redraw — it delays the entire device, and the task watchdog that now
+// guards that loop fires at 30 s. A dropped frame is invisible; thirty
+// seconds of a frozen robot is not.
+#define DISPLAY_LOCK_TIMEOUT_MS 3000
+
 class DisplayLockGuard {
 public:
     DisplayLockGuard(Display *display) : display_(display) {
-        if (!display_->Lock(30000)) {
-            ESP_LOGE("Display", "Failed to lock display");
+        locked_ = display_->Lock(DISPLAY_LOCK_TIMEOUT_MS);
+        if (!locked_) {
+            ESP_LOGE("Display", "Failed to lock display within %d ms; skipping update",
+                     DISPLAY_LOCK_TIMEOUT_MS);
         }
     }
     ~DisplayLockGuard() {
-        display_->Unlock();
+        // Only release what we actually took. Unlocking a lock we never
+        // acquired hands someone else's critical section away.
+        if (locked_) {
+            display_->Unlock();
+        }
     }
+
+    // Callers that touch LVGL directly should check this: without the
+    // lock, doing so races whoever does hold it.
+    bool locked() const { return locked_; }
 
 private:
     Display *display_;
+    bool locked_ = false;
 };
 
 class NoDisplay : public Display {

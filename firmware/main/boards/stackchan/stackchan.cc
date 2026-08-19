@@ -4852,6 +4852,12 @@ private:
         }
         const char* safe = (text != nullptr) ? text : "";
         DisplayLockGuard lock(display_);
+        // Without the lock we would be writing LVGL objects while
+        // whoever holds it is reading them. Skipping the caption is the
+        // cheap outcome here; racing the renderer is not.
+        if (!lock.locked()) {
+            return false;
+        }
         if (!EnsureStatusLabel()) {
             return false;
         }
@@ -4929,6 +4935,12 @@ private:
         }
         const char* safe = (text != nullptr) ? text : "";
         DisplayLockGuard lock(display_);
+        // Without the lock we would be writing LVGL objects while
+        // whoever holds it is reading them. Skipping the caption is the
+        // cheap outcome here; racing the renderer is not.
+        if (!lock.locked()) {
+            return false;
+        }
         if (!EnsureSubtitleLabel()) {
             return false;
         }
