@@ -52,7 +52,10 @@ Hermes の `reply` を **長さも文字種も検査せず** `set_subtitle` と 
 - [x] (V1) gateway: **pytest 1168 passed / ruff check clean**
 - [x] (V2) firmware: **Docker ビルド成功**（`releases/v2.2.6_stackchan.zip` 生成・警告なし）。**実機確認は未了＝flash 待ち**
 - [x] (Z1) worklog `docs/worklog/2026-08-19-shared-serial-loop.md`
-- [ ] (Z2) 返信送信（ドラフト `reply-to-dale-2026-08-19.txt` 作成済み・ケンジさん確認待ち）
+- [x] (Z2) 返信送信済み（2026-08-20。**3通目の報告を受けて `reply-to-dale-2026-08-20.txt` に差し替えて送信**）
+- [x] (F) **3度目の固着**（`set_subtitle`・153文字＝キャップ内・ツール呼び出しなし）を受けて `DisplayLockGuard` も修正（`85d830f`）: Lock タイムアウト **30秒→3秒**（**この待ちはメインタスクを止めるので新設 TWDT の30秒と競合する**）／**取っていないロックを解放しない**（`locked_`）／表示ツール2つは**ロック未取得なら描画を諦めて戻る**。firmware Docker ビルド成功
+- [ ] **(★次) Dale さんの flash 結果待ち** — バイナリ+手順を Google Drive リンクで送付済み（`private-notes/saki-firmware-2026-08-20.zip`＝`xiaozhi.bin` + `generated_assets.bin` + `FLASHING.txt`）。**焼くのは 0x20000 と 0x800000 のみ**（`merged-binary.bin` は 0x0 で **NVS が消える**＝Wi-Fi 再設定が必要になるため使わせない）
+- **★方針（ケンジ判断 2026-08-20）**: **サポートは「固着が止まったら区切る」**。返信で fork を勧めた（「渡す側に回った」という枠組み・**明示的な終了宣言はしていない**）。焼いた後に再発した場合の判断は**結果を見てから**
 - **要フォロー**: 今回の修正は**実機 flash が必要**。Dale さんは未経験・Windows 機・firmware は `bb31fa8` より古い ⇒ **8/8 の「焼き直し不要」を撤回**する。副次的に画面系6ツール（status_text / subtitle / route_badge 等）が復活する。**Windows 向け flash 手順を別便で用意する**
 - **切り分け待ち**: `audio_codec.cc:42` の `Set output volume to %d` は **I2C 完了後・NVS 書き込み前**に出る ⇒ **この行の有無で I2C か NVS かが確定する**。Dale さんに `pyserial` の miniterm で採取を依頼（任意）
 - **未着手（返信で切り分けを依頼）**: レイテンシが正式な懸念として提起された（時計計測で単純質問30秒・ツール呼び出し60秒）。TTS フレームは**デバイスの消費レートに合わせた実時間送出**（`tts/orchestrator.py:364-376`）なので `timings.tts` は「合成＋喋っている時間」。**喋り始めるまでが遅いのか、やり取り全体が長いのか**で処方が変わる → 該当ターンの `timings_ms=` と切り分けを依頼する。構造的な答えは**文単位のストリーミング合成**（現状は全文合成してから送出開始）
